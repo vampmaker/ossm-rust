@@ -1,0 +1,7 @@
+/.vscode
+/.embuild
+/target
+/Cargo.lock
+
+repo.key
+repo.key.pub

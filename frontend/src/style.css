@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: #cbd5e0; /* gray-400 */
+  height: 0.5rem;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 1.25rem;
+  height: 1.25rem;
+  background: #3182ce; /* blue-600 */
+  cursor: pointer;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 1.25rem;
+  height: 1.25rem;
+  background: #3182ce; /* blue-600 */
+  cursor: pointer;
+}

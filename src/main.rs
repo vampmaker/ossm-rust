@@ -29,8 +29,6 @@ use context::AppContext;
 use motion::{MotorController, MotorControllerConfig};
 use motor_57aim30::{Modbus57AIM30Motor, ModbusRTUMaster};
 
-use crate::motor::Motor;
-
 
 const TARGET_BAUD_RATE: u32 = 115200;
 

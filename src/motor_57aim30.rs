@@ -25,20 +25,16 @@ impl<'a> ModbusRTUMaster<'a> {
         ctrl_pin: Option<gpio::AnyOutputPin>,
         device_id: u8,
     ) -> Self {
-        let ctrl_pin_driver = if let Some(ctrl_pin) = ctrl_pin {
-            Some(gpio::PinDriver::output(ctrl_pin).unwrap())
-        } else {
-            None
-        };
+        let ctrl_pin_driver = ctrl_pin.map(|ctrl_pin| gpio::PinDriver::output(ctrl_pin).unwrap());
         let timeout = Self::get_operation_timeout(uart.baudrate().unwrap().into()).unwrap();
-        let result = Self {
+        
+        Self {
             uart,
             ctrl_pin_driver,
             device_id,
             read_timeout: timeout,
             write_timeout: timeout,
-        };
-        result
+        }
     }
 
     fn get_operation_timeout(baudrate: u32) -> Result<TickType_t> {
@@ -208,14 +204,11 @@ impl<'a> Modbus57AIM30Motor<'a> {
             self.client.set_baudrate(baud_rate)?;
             for device_id in 1..=247 {
                 self.client.device_id = device_id;
-                match self.client.read_holding_register(0x00) {
-                    Ok(_) => {
-                        return Ok(ModbusScanResult {
-                            baud_rate,
-                            device_id,
-                        });
-                    }
-                    _ => {}
+                if self.client.read_holding_register(0x00).is_ok() {
+                    return Ok(ModbusScanResult {
+                        baud_rate,
+                        device_id,
+                    });
                 }
             }
         }

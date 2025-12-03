@@ -35,10 +35,10 @@ where
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.read_count >= self.limit {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Request too large"));
+            return Err(std::io::Error::other("Request too large"));
         }
         let max_len = buf.len().min(self.limit - self.read_count);
-        let n = self.inner.read(&mut buf[..max_len]).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+        let n = self.inner.read(&mut buf[..max_len]).map_err(|e| std::io::Error::other(format!("{:?}", e)))?;
         self.read_count += n;
         Ok(n)
     }
@@ -135,10 +135,10 @@ pub fn register_handlers<'a>(
                             config.paused = paused;
                         }
                         if let Some(position) = control.position {
-                            config.paused_position = position.max(0.0).min(1.0);
+                            config.paused_position = position.clamp(0.0, 1.0);
                         }
                         if let Some(adjust) = control.adjust {
-                            config.paused_position = (config.paused_position + adjust).max(0.0).min(1.0);
+                            config.paused_position = (config.paused_position + adjust).clamp(0.0, 1.0);
                         }
 
                         mc.set_config(config.clone()).unwrap();

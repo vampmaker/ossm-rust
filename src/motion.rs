@@ -39,7 +39,7 @@ impl WaveformGenerator for SineWaveform {
         // 2πx = asin((y - 0.5) * 2)
         // x = asin((y - 0.5) * 2) / (2π)
         let normalized = (y - 0.5) * 2.0;
-        let clamped = normalized.max(-1.0).min(1.0);
+        let clamped = normalized.clamp(-1.0, 1.0);
         let angle = f32::asin(clamped);
         let x = angle / (2.0 * std::f32::consts::PI);
         // asin returns [-π/2, π/2], map to [0, 1]
@@ -69,17 +69,17 @@ impl WaveformGenerator for ThrustWaveform {
         
         // Sharpness controls the rise duration [0.01, 0.99]
         // Lower values = sharper thrust (faster rise)
-        let rise_duration = self.sharpness.max(0.01).min(0.99);
+        let rise_duration = self.sharpness.clamp(0.01, 0.99);
         
         // Smootherstep function and its derivative
         // s(t) = 6t^5 - 15t^4 + 10t^3
         // s'(t) = 30t^4 - 60t^3 + 30t^2 = 30 * t^2 * (t-1)^2
         let smootherstep = |t: f32| -> f32 {
-            let t = t.max(0.0).min(1.0);
+            let t = t.clamp(0.0, 1.0);
             t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
         };
         let smootherstep_derivative = |t: f32| -> f32 {
-            let t = t.max(0.0).min(1.0);
+            let t = t.clamp(0.0, 1.0);
             30.0 * t * t * (t - 1.0) * (t - 1.0)
         };
         
@@ -109,7 +109,7 @@ impl WaveformGenerator for ThrustWaveform {
         // Binary search to find x such that evaluate(x, 1.0) ≈ y
         let mut left = 0.0;
         let mut right = 1.0;
-        let target_y = y.max(0.0).min(1.0);
+        let target_y = y.clamp(0.0, 1.0);
         
         for _ in 0..20 {  // 20 iterations should be enough precision
             let mid = (left + right) / 2.0;
@@ -186,7 +186,7 @@ impl SplineWaveform {
             // u is the interpolation factor within the segment, from 0 to 1
             let x_k = p0_index as f32 * segment_width;
             let u = if segment_width > 0.0 { (x - x_k) / segment_width } else { 0.0 };
-            let u = u.max(0.0).min(1.0);
+            let u = u.clamp(0.0, 1.0);
 
             // The tangents (m0, m1) are dy/dx. For the Hermite spline, we need dy/du.
             // dy/du = dy/dx * dx/du = m * segment_width
@@ -451,7 +451,7 @@ impl Shaper {
         let y_in = (y_after_reversal - r) / denominator;
         
         // Clamp to valid range
-        Some(y_in.max(0.0).min(1.0))
+        Some(y_in.clamp(0.0, 1.0))
     }
 }
 
@@ -547,7 +547,7 @@ impl<'a> MotorController<'a> {
 
         // Read current motor position and sync waveform generator
         let position = self.motor.read_position()?;
-        let pos_normalized = (position - self.motor.pos_min()) as f32 / (self.motor.pos_max() - self.motor.pos_min()) as f32;
+        let pos_normalized = (position - self.motor.pos_min()) / (self.motor.pos_max() - self.motor.pos_min());
         
         // Try to unshape the current position to get the waveform y
         match self.shaper.unshape(pos_normalized) {

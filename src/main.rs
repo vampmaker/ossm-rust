@@ -29,6 +29,8 @@ use context::AppContext;
 use motion::{MotorController, MotorControllerConfig};
 use motor_57aim30::{Modbus57AIM30Motor, ModbusRTUMaster};
 
+use crate::motor::Motor;
+
 
 const TARGET_BAUD_RATE: u32 = 115200;
 
@@ -111,6 +113,8 @@ fn run_app() -> anyhow::Result<()> {
         log::error!("Motor task failed: {}", e);
     }
 
+    // motor init/loop returned, linger here to keep command interface running
+    log::info!("Motor task has returned, lingering to keep command interface running");
     loop {
         FreeRtos::delay_ms(1000);
     }
@@ -277,6 +281,7 @@ fn run_motor(app_context: AppContext, uart_peripheral: UART1) -> anyhow::Result<
 
             let mut last_config_check = time::Instant::now();
             let mut last_saved_config_version = app_context.motor_controller.lock().unwrap().as_ref().map_or(0, |mc| mc.get_config_version());
+
             let mut update_counter = 0;
             let mut last_update_counter_reset = time::Instant::now();
 

@@ -162,16 +162,16 @@ impl<'a> ModbusRTUMaster<'a> {
 
 pub struct Modbus57AIM30Motor<'a> {
     client: ModbusRTUMaster<'a>,
-    pos_min: i32,
-    pos_max: i32,
+    pos_min: f32,
+    pos_max: f32,
 }
 
 impl<'a> Modbus57AIM30Motor<'a> {
     pub fn new(modbus_client: ModbusRTUMaster<'a>) -> Self {
         Self {
             client: modbus_client,
-            pos_min: 0,
-            pos_max: 0,
+            pos_min: 0.0,
+            pos_max: 0.0,
         }
     }
 
@@ -181,13 +181,14 @@ impl<'a> Modbus57AIM30Motor<'a> {
         Ok(())
     }
 
-    fn wait_stable_position(&mut self, timeout_ms: u32) -> Result<i32, anyhow::Error> {
+    fn wait_stable_position(&mut self, timeout_ms: u32) -> Result<f32, anyhow::Error> {
         let start_time = time::SystemTime::now();
         let timeout = time::Duration::from_millis(timeout_ms as u64);
         let mut position = self.read_position()?;
+        FreeRtos::delay_ms(100);
         while start_time.elapsed()? < timeout {
             let new_position = self.read_position()?;
-            if (new_position - position).abs() < 10 {
+            if (new_position - position).abs() < 0.002 {
                 return Ok(new_position);
             }
             position = new_position;
@@ -243,72 +244,75 @@ impl<'a> Modbus57AIM30Motor<'a> {
 }
 
 impl<'a> Motor for Modbus57AIM30Motor<'a> {
-    fn read_position(&mut self) -> Result<i32, anyhow::Error> {
+    fn read_position(&mut self) -> Result<f32, anyhow::Error> {
         let mut rsp = [0u16; 2];
         self.client.read_holding_registers(0x16, 2, &mut rsp)?;
         let low = rsp[0];
         let high = rsp[1];
         let position = (high as i32) << 16 | low as i32;
-        Ok(position)
+        Ok(position as f32 / 32768.0 * 2.0 * std::f32::consts::PI)
     }
 
-    fn write_position(&mut self, position: i32, _speed: f32) -> Result<(), anyhow::Error> {
-        if position == 0 {
+    fn write_position(&mut self, position: f32, _speed: f32) -> Result<(), anyhow::Error> {
+        let position_i32 = (position / (2.0 * std::f32::consts::PI) * 32768.0) as i32;
+        if position_i32 == 0 {
             self.write_position_raw(1)
         } else {
-            self.write_position_raw(position)
+            self.write_position_raw(position_i32)
         }
     }
 
-    fn set_max_power(&mut self, power: u16) -> Result<(), anyhow::Error> {
-        self.client.write_holding_register(0x18, power)?;
+    fn set_max_power(&mut self, power: f32) -> Result<(), anyhow::Error> {
+        let power_val = (power * 60.0) as u16 * 10;
+        self.client.write_holding_register(0x18, power_val)?;
         Ok(())
     }
 
-    fn set_acceleration(&mut self, acceleration: u16) -> Result<(), anyhow::Error> {
-        self.client.write_holding_register(0x03, acceleration)?;
+    fn set_acceleration(&mut self, acceleration: f32) -> Result<(), anyhow::Error> {
+        let acceleration_val = (acceleration * 60.0 / (2.0 * std::f32::consts::PI)) as u16;    // rad/s^2 => rpm
+        self.client.write_holding_register(0x03, acceleration_val)?;
         Ok(())
     }
 
-    fn set_position_ring_ratio(&mut self, ratio: u16) -> Result<(), anyhow::Error> {
-        self.client.write_holding_register(0x07, ratio)?;
+    fn set_position_ring_ratio(&mut self, ratio: f32) -> Result<(), anyhow::Error> {
+        self.client.write_holding_register(0x07, ratio as u16)?;
         Ok(())
     }
 
-    fn set_speed_ring_ratio(&mut self, ratio: u16) -> Result<(), anyhow::Error> {
-        self.client.write_holding_register(0x05, ratio)?;
+    fn set_speed_ring_ratio(&mut self, ratio: f32) -> Result<(), anyhow::Error> {
+        self.client.write_holding_register(0x05, ratio as u16)?;
         Ok(())
     }
 
     fn homing(&mut self) -> Result<(), anyhow::Error> {
         assert!(
-            self.pos_min == 0 && self.pos_max == 0,
+            self.pos_min == 0.0 && self.pos_max == 0.0,
             "Motor already homed"
         );
 
-        self.set_max_power(60)?;
-        self.set_acceleration(10000)?;
+        self.set_max_power(0.1)?;
+        self.set_acceleration(1000.0)?;
         self.reset_position()?;
-        self.write_position(-1000000, 0.0)?;
+        self.write_position(-100.0, 0.0)?;
         FreeRtos::delay_ms(5000);
-        self.pos_min = self.wait_stable_position(5000)? + 3000;
+        self.pos_min = self.wait_stable_position(5000)? + 0.1;
 
-        self.write_position(1000000, 0.0)?;
+        self.write_position(100.0, 0.0)?;
         FreeRtos::delay_ms(5000);
-        self.pos_max = self.wait_stable_position(5000)? - 3000;
+        self.pos_max = self.wait_stable_position(5000)? - 0.1;
 
-        self.write_position((self.pos_min + self.pos_max) / 2, 0.0)?;
+        self.write_position((self.pos_min + self.pos_max) / 2.0, 0.0)?;
         FreeRtos::delay_ms(5000);
         self.wait_stable_position(5000)?;
 
         Ok(())
     }
 
-    fn pos_min(&self) -> i32 {
+    fn pos_min(&self) -> f32 {
         self.pos_min
     }
 
-    fn pos_max(&self) -> i32 {
+    fn pos_max(&self) -> f32 {
         self.pos_max
     }
 

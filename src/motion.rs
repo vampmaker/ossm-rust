@@ -459,18 +459,18 @@ impl Shaper {
 // Maps y ∈ [0, 1] to motor position
 
 pub struct PositionGenerator {
-    pos_min: i32,
-    pos_max: i32,
+    pos_min: f32,
+    pos_max: f32,
 }
 
 impl PositionGenerator {
-    pub fn new(pos_min: i32, pos_max: i32) -> Self {
+    pub fn new(pos_min: f32, pos_max: f32) -> Self {
         Self { pos_min, pos_max }
     }
     
-    pub fn generate(&self, y: f32, speed_y: f32) -> (i32, f32) {
-        let pos_range = (self.pos_max - self.pos_min) as f32;
-        let position = (y * pos_range + self.pos_min as f32) as i32;
+    pub fn generate(&self, y: f32, speed_y: f32) -> (f32, f32) {
+        let pos_range = self.pos_max - self.pos_min;
+        let position = y * pos_range + self.pos_min;
         let speed = speed_y * pos_range;
         (position, speed)
     }
@@ -514,7 +514,7 @@ impl<'a> MotorController<'a> {
         };
         
         let shaper = Shaper::new(config.depth, direction, config.reversed);
-        let position_gen = PositionGenerator::new(0, 0); // Will be updated after homing
+        let position_gen = PositionGenerator::new(0.0, 0.0); // Will be updated after homing
         
         let now = time::Instant::now();
         Self {
@@ -532,14 +532,18 @@ impl<'a> MotorController<'a> {
 
     pub fn init_motor(&mut self) -> Result<(), anyhow::Error> {
         self.motor.homing()?;
-        
+        log::info!("Motor homed, pos_min: {}, pos_max: {}", self.motor.pos_min(), self.motor.pos_max());
+
         // Update position generator with actual range
         self.position_gen = PositionGenerator::new(self.motor.pos_min(), self.motor.pos_max());
 
-        self.motor.set_max_power(350)?;
-        self.motor.set_acceleration(40000)?;
-        self.motor.set_position_ring_ratio(3000)?;
-        self.motor.set_speed_ring_ratio(3000)?;
+        // set motor parameters
+        self.motor.set_max_power(0.5)?;
+        self.motor.set_acceleration(4000.0)?;
+        self.motor.set_position_ring_ratio(3000.0)?;
+        self.motor.set_speed_ring_ratio(3000.0)?;
+
+        // pause the motor and set pause position to current position
 
         // Read current motor position and sync waveform generator
         let position = self.motor.read_position()?;
@@ -576,6 +580,9 @@ impl<'a> MotorController<'a> {
                 self.current_paused_y = 0.5;
             }
         }
+
+        self.config.paused = true;
+        self.config.paused_position = self.current_paused_y;
 
         Ok(())
     }
@@ -776,7 +783,7 @@ pub struct StateResponse {
     pub x: f32,              // Phase [0, 1]
     pub y: f32,              // Waveform output [0, 1]
     pub shaped_y: f32,       // After shaping [0, 1]
-    pub position: i32,       // Motor position
+    pub position: f32,       // Motor position
     pub speed: f32,          // Motor speed
 }
 

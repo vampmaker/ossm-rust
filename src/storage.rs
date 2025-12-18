@@ -100,11 +100,11 @@ impl StorageManager {
     }
 
     pub fn set_pin_configuration(&mut self, config: &PinConfiguration) -> Result<()> {
-        self.set_json("pin_configuration", &config)?;
+        self.set_json("pin_conf", &config)?;
         Ok(())
     }
 
     pub fn get_pin_configuration(&self) -> Result<PinConfiguration> {
-        self.get_json("pin_configuration")
+        self.get_json("pin_conf")
     }
 }

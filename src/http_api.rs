@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::motion::MotorControllerConfig;
 use esp_idf_svc::io::{Read, Write};
 use crate::context::AppContext;
+use esp_idf_svc::sys::EspError;
+use crate::motion::MotionCommand;
 
 #[derive(Serialize, Deserialize)]
 pub struct PausedControl {
@@ -174,6 +176,39 @@ pub fn register_handlers<'a>(
                     .write_all("Motor controller not initialized".as_bytes())?;
             }
             Ok(())
+        }).unwrap();
+    }
+
+    {
+        let controller = app_context.motor_controller.clone();
+        server.ws_handler("/ws/command", move |ws| {
+            if !ws.is_new() {
+                return Ok::<(), EspError>(());
+            }
+            let mut frame_data = vec![0u8; 1024];
+            let command_tx = {
+                if let Some(mc) = controller.lock().as_mut().unwrap().as_mut() {
+                    mc.get_command_sender()
+                } else {
+                    log::error!("Motor controller not initialized");
+                    return Ok::<(), EspError>(());
+                }
+            };
+            loop {
+                let (_, size) = ws.recv(frame_data.as_mut())?;
+                if size == 0 {
+                    return Ok::<(), EspError>(());
+                }
+                if let Ok(cmd) = serde_json::from_slice::<MotionCommand>(&frame_data[..size]) {
+                    if let Err(_) = command_tx.lock().unwrap().enqueue(cmd) {
+                        log::error!("Failed to enqueue command");
+                        return Ok::<(), EspError>(());
+                    }
+                } else {
+                    log::error!("Failed to parse command: {}", String::from_utf8_lossy(&frame_data[..size]));
+                    return Ok::<(), EspError>(());
+                }
+            }
         }).unwrap();
     }
 

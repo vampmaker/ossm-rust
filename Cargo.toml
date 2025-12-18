@@ -55,6 +55,11 @@ embedded-svc = "0.28.1"
 as5600 = "0.8.0"
 pid = "4.0.0"
 libm = "0.2.8"
+embedded-cli = "0.2.1"
+embedded-io = "0.6.1"
 
 [build-dependencies]
 embuild = "0.33"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(esp_idf_esp_https_server_enable)'] }

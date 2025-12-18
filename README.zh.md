@@ -79,11 +79,11 @@
 1.  保持 ESP32-C6 连接到您的计算机，并停留在烧录工具页面。如果您已关闭它，可以重新打开：**[https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)**
 2.  如果您未连接，请点击 **"Connect"** 并选择您用于烧录的同一串口。
 3.  控制台位于页面底部。您应该会看到来自设备的日志消息。在输入框中按 `Enter` 以确保连接正常工作。
-4.  要配置 WiFi，逐个输入以下命令，将 `<your_ssid>` 和 `<your_password>` 替换为您实际的 WiFi 网络名称和密码。每条命令后按 `Enter`。
+4.  要配置 WiFi，逐个输入以下命令，将 `<your-ssid>` 和 `<your-password>` 替换为您实际的 WiFi 网络名称和密码。每条命令后按 `Enter`。
 
     ```
-    set_wifi_ssid <your_ssid>
-    set_wifi_password <your_password>
+    set-wifi-ssid <your-ssid>
+    set-wifi-password <your-password>
     ```
 
 6.  设置 SSID 和密码后，您需要重启 ESP32-C6。您可以通过按下开发板上的 `RST` 或 `EN` 按钮来完成，或者拔出并重新插入。
@@ -107,23 +107,24 @@
 
 ```
 help                           - 显示此帮助消息
-set_wifi_ssid <ssid>           - 设置 WiFi SSID
-set_wifi_password <password>   - 设置 WiFi 密码
-get_pin_configuration          - 以 JSON 格式获取引脚配置
-set_pin_modbus_tx <pin>        - 设置 Modbus TX 引脚
-set_pin_modbus_rx <pin>        - 设置 Modbus RX 引脚
-set_pin_modbus_de_re <pin>     - 设置 Modbus DE/RE 引脚
-get_motor_config               - 以 JSON 格式获取电机配置
-set_motor_config <json>        - 从 JSON 字符串设置电机配置
+reset                          - 重启
+set-wifi-ssid <ssid>           - 设置 WiFi SSID
+set-wifi-password <password>   - 设置 WiFi 密码
+get-pin-configuration          - 以 JSON 格式获取引脚配置
+set-pin-modbus-tx <pin>        - 设置 Modbus TX 引脚
+set-pin-modbus-rx <pin>        - 设置 Modbus RX 引脚
+set-pin-modbus-de-re <pin>     - 设置 Modbus DE/RE 引脚
+get-motor-config               - 以 JSON 格式获取电机配置
+set-motor-config <json>        - 从 JSON 字符串设置电机配置
 pause                          - 暂停电机
 start                          - 启动电机
-set_bpm <bpm>                  - 设置电机 BPM
-set_wave <sine|thrust|spline>  - 设置电机波形
-set_paused_position <position> - 设置电机暂停时的位置（0.0 到 1.0）
-set_depth <depth>              - 设置电机行程深度（0.0 到 1.0）
-set_depth_top <true|false>     - 设置深度方向
-set_sharpness <sharpness>      - 设置推力波的锐度（0.01 到 0.99）
-set_spline_points <p1> <p2>... - 设置样条波的点（0.0 到 1.0）
+set-bpm <bpm>                  - 设置电机 BPM
+set-wave <sine|thrust|spline>  - 设置电机波形
+set-paused-position <position> - 设置电机暂停时的位置（0.0 到 1.0）
+set-depth <depth>              - 设置电机行程深度（0.0 到 1.0）
+set-depth-top <true|false>     - 设置深度方向
+set-sharpness <sharpness>      - 设置推力波的锐度（0.01 到 0.99）
+set-spline-points <p1> <p2>... - 设置样条波的点（0.0 到 1.0）
 ```
 
 ### 高级控制：样条波
@@ -134,21 +135,21 @@ set_spline_points <p1> <p2>... - 设置样条波的点（0.0 到 1.0）
 
 **如何使用：**
 
-1.  **设置点：** 使用 `set_spline_points` 命令，后跟一系列用空格分隔的数字，范围从 0.0（完全收缩）到 1.0（完全伸展）。
-2.  **激活波形：** 使用 `set_wave spline` 命令切换到您的自定义模式。
+1.  **设置点：** 使用 `set-spline-points` 命令，后跟一系列用空格分隔的数字，范围从 0.0（完全收缩）到 1.0（完全伸展）。
+2.  **激活波形：** 使用 `set-wave spline` 命令切换到您的自定义模式。
 
 **示例：**
 
 *   **简单行程：** 基本的线性运动。
-    `set_spline_points 0 1`
+    `set-spline-points 0 1`
 *   **推力：** 快速前进运动，然后阶梯式收缩。
-    `set_spline_points 0 0 1 0.8 0.5 0.2`
+    `set-spline-points 0 0 1 0.8 0.5 0.2`
 *   **三角形：** 平滑地上升和下降。
-    `set_spline_points 0 0.2 0.4 0.6 0.8 1.0 0.8 0.6 0.4 0.2`
+    `set-spline-points 0 0.2 0.4 0.6 0.8 1.0 0.8 0.6 0.4 0.2`
 *   **方波：** 在开始处保持，然后立即移动并在结束处保持。
-    `set_spline_points 0 0 0 0 0 1 1 1 1 1`
+    `set-spline-points 0 0 0 0 0 1 1 1 1 1`
 *   **振动：** 抖动、振动的运动。
-    `set_spline_points 0 0.2 0.1 0.4 0.3 0.6 0.5`
+    `set-spline-points 0 0.2 0.1 0.4 0.3 0.6 0.5`
 
 ### HTTP API
 
@@ -164,27 +165,27 @@ set_spline_points <p1> <p2>... - 设置样条波的点（0.0 到 1.0）
 {
   "bpm": 60.0,
   "depth": 1.0,
-  "depth_top": true,
+  "depth-top": true,
   "reversed": false,
-  "wave_func": "sine",
+  "wave-func": "sine",
   "sharpness": 0.5,
-  "spline_points": [0.0, 1.0],
+  "spline-points": [0.0, 1.0],
   "paused": true,
-  "paused_position": 0.5
+  "paused-position": 0.5
 }
 ```
 
 *   `bpm`（数字）：每分钟节拍数。控制运动周期的速度。
 *   `depth`（数字）：行程深度，从 0.0（无运动）到 1.0（全范围）。
-*   `depth_top`（布尔值）：确定行程的方向。
+*   `depth-top`（布尔值）：确定行程的方向。
     *   `true`：行程从完全收缩位置（0.0）移动到指定的 `depth`。例如，深度为 0.8 将在范围 [0.0, 0.8] 内移动。
     *   `false`：行程从 `1.0 - depth` 移动到完全伸展位置（1.0）。例如，深度为 0.8 将在范围 [0.2, 1.0] 内移动。
 *   `reversed`（布尔值）：当为 `true` 时，反转波形的方向。
-*   `wave_func`（字符串）：运动模式。可以是 `"sine"`、`"thrust"` 或 `"spline"`。
+*   `wave-func`（字符串）：运动模式。可以是 `"sine"`、`"thrust"` 或 `"spline"`。
 *   `sharpness`（数字）：仅影响 `"thrust"` 波形。控制推力的持续时间，从 0.01（最锐利）到 0.99（最平滑）。
-*   `spline_points`（数字数组）：定义 `"spline"` 波形的自定义运动路径的点数组（0.0 到 1.0）。
+*   `spline-points`（数字数组）：定义 `"spline"` 波形的自定义运动路径的点数组（0.0 到 1.0）。
 *   `paused`（布尔值）：`true` 暂停电机，`false` 运行电机。
-*   `paused_position`（数字）：电机暂停时将保持的位置（0.0 到 1.0）。
+*   `paused-position`（数字）：电机暂停时将保持的位置（0.0 到 1.0）。
 
 #### `POST /config`
 
@@ -222,18 +223,18 @@ set_spline_points <p1> <p2>... - 设置样条波的点（0.0 到 1.0）
   "config": {
     "bpm": 60.0,
     "depth": 1.0,
-    "depth_top": true,
+    "depth-top": true,
     "reversed": false,
-    "wave_func": "sine",
+    "wave-func": "sine",
     "sharpness": 0.5,
-    "spline_points": [0.0, 1.0],
+    "spline-points": [0.0, 1.0],
     "paused": true,
-    "paused_position": 0.5
+    "paused-position": 0.5
   },
   "t": 123.45,
   "x": 0.5,
   "y": 1.0,
-  "shaped_y": 1.0,
+  "shaped-y": 1.0,
   "position": 10000,
   "speed": 0.0
 }
@@ -243,7 +244,7 @@ set_spline_points <p1> <p2>... - 设置样条波的点（0.0 到 1.0）
 *   `t`：自运动开始以来的时间偏移（秒）。
 *   `x`：波形的当前相位，从 0.0 到 1.0。
 *   `y`：波形生成器的原始输出，从 0.0 到 1.0。
-*   `shaped_y`：应用深度和方向后的波形输出。
+*   `shaped-y`：应用深度和方向后的波形输出。
 *   `position`：电机的当前绝对位置（以其原生单位表示）。
 *   `speed`：电机的当前速度。
 

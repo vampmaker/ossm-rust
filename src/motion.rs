@@ -1,11 +1,15 @@
 use std::time;
+use std::sync::{Arc, Mutex};
 
 use serde::{Serialize, Deserialize};
 use anyhow::Result;
+use heapless::spsc::{Queue, Producer, Consumer};
 
 use crate::motor::Motor;
 
 const SPLINE_RESOLUTION: usize = 1500;
+const COMMAND_QUEUE_SIZE: usize = 64;
+type CommandProducer = Producer<'static, MotionCommand, COMMAND_QUEUE_SIZE>;
 
 // ===== Layer 1: Waveform Generator =====
 // Generates y ∈ [0, 1] given time, handles BPM internally
@@ -288,6 +292,272 @@ impl WaveformGenerator for SplineWaveform {
     }
 }
 
+// ===== Motion Commands =====
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum MotionCommand {
+    Move { target: f32, duration_ms: f32, final_speed: f32 },
+    SetMaxSpeed(f32),
+    SetMaxAccel(f32),
+}
+
+// ===== Motion Source Trait =====
+pub trait MotionSource: Send {
+    // Returns (pos, speed) where pos is normalized [0, 1]
+    fn update(&mut self, dt: f32) -> (f32, f32);
+    
+    // Adjust internal state to match y, used to avoid jumps when switching sources
+    fn follow(&mut self, y: f32);
+
+    // Get current phase info (t, x) for status reporting
+    fn get_phase_info(&self) -> (f32, f32);
+}
+
+// ===== Motion Source Implementations =====
+
+struct WaveformMotionSource {
+    generator: Box<dyn WaveformGenerator>,
+    bpm: f32,
+    t0: time::Instant,
+}
+
+impl WaveformMotionSource {
+    fn new(generator: Box<dyn WaveformGenerator>, bpm: f32) -> Self {
+        Self {
+            generator,
+            bpm,
+            t0: time::Instant::now(),
+        }
+    }
+}
+
+impl MotionSource for WaveformMotionSource {
+    fn update(&mut self, _dt: f32) -> (f32, f32) {
+        let now = time::Instant::now();
+        let elapsed = now.duration_since(self.t0).as_secs_f32();
+        self.generator.evaluate(elapsed, self.bpm)
+    }
+
+    fn follow(&mut self, y: f32) {
+        let phase = self.generator.find_x_for_y(y);
+        let time_offset = phase * 60.0 / self.bpm;
+        self.t0 = time::Instant::now() - time::Duration::from_secs_f32(time_offset);
+    }
+    
+    fn get_phase_info(&self) -> (f32, f32) {
+        let now = time::Instant::now();
+        let elapsed = now.duration_since(self.t0).as_secs_f32();
+        let cycles = elapsed * self.bpm / 60.0;
+        let x = cycles % 1.0;
+        (elapsed, x)
+    }
+}
+
+struct PausedMotionSource {
+    current_y: f32,
+    target_y: f32,
+}
+
+impl PausedMotionSource {
+    fn new(current_y: f32, target_y: f32) -> Self {
+        Self { current_y, target_y }
+    }
+}
+
+impl MotionSource for PausedMotionSource {
+    fn update(&mut self, dt: f32) -> (f32, f32) {
+        let diff = self.target_y - self.current_y;
+        if diff.abs() < TRANSITION_THRESHOLD {
+            self.current_y = self.target_y;
+            (self.current_y, 0.0)
+        } else {
+            let step = PAUSE_SPEED * dt;
+            let speed = if diff > 0.0 {
+                self.current_y = (self.current_y + step).min(self.target_y);
+                PAUSE_SPEED
+            } else {
+                self.current_y = (self.current_y - step).max(self.target_y);
+                -PAUSE_SPEED
+            };
+            (self.current_y, speed)
+        }
+    }
+
+    fn follow(&mut self, y: f32) {
+        self.current_y = y;
+    }
+    
+    fn get_phase_info(&self) -> (f32, f32) {
+        (0.0, 0.0)
+    }
+}
+
+// ===== Streaming Motion Source =====
+// Handles queued moves and respects constraints
+
+struct Trajectory {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    duration: f32,
+    elapsed: f32,
+}
+
+impl Trajectory {
+    // Cubic polynomial: y(t) = at^3 + bt^2 + ct + d
+    fn new(start_y: f32, start_speed: f32, end_y: f32, end_speed: f32, duration: f32) -> Self {
+        if duration <= 1e-6 {
+            // Instant move (avoid division by zero)
+            return Self { a: 0.0, b: 0.0, c: 0.0, d: end_y, duration: 0.0, elapsed: 0.0 };
+        }
+        
+        // Constraints:
+        // y(0) = d = start_y
+        // y'(0) = c = start_speed
+        // y(T) = aT^3 + bT^2 + cT + d = end_y
+        // y'(T) = 3aT^2 + 2bT + c = end_speed
+        
+        let d = start_y;
+        let c = start_speed;
+        
+        let t = duration;
+        let t2 = t * t;
+        let _t3 = t2 * t;
+        
+        // a = (v0 + v1 - 2(y1 - y0)/T) / T^2
+        // b = (3(y1 - y0)/T - 2v0 - v1) / T
+        
+        let dy = end_y - start_y;
+        let a = (start_speed + end_speed - 2.0 * dy / t) / t2;
+        let b = (3.0 * dy / t - 2.0 * start_speed - end_speed) / t;
+        
+        Self { a, b, c, d, duration, elapsed: 0.0 }
+    }
+    
+    fn update(&mut self, dt: f32) -> Option<(f32, f32)> {
+        self.elapsed += dt;
+        if self.elapsed >= self.duration {
+            // Finished
+            return None;
+        }
+        
+        let t = self.elapsed;
+        let t2 = t * t;
+        let t3 = t2 * t;
+        
+        let y = self.a * t3 + self.b * t2 + self.c * t + self.d;
+        let speed = 3.0 * self.a * t2 + 2.0 * self.b * t + self.c;
+        
+        Some((y, speed))
+    }
+    
+    fn end_state(&self) -> (f32, f32) {
+        let t = self.duration;
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let y = self.a * t3 + self.b * t2 + self.c * t + self.d;
+        let speed = 3.0 * self.a * t2 + 2.0 * self.b * t + self.c;
+        (y, speed)
+    }
+}
+
+struct StreamingMotionSource {
+    consumer: Consumer<'static, MotionCommand, COMMAND_QUEUE_SIZE>,
+    current_y: f32,
+    current_speed: f32,
+    max_speed: f32,
+    max_accel: f32,
+    
+    active_trajectory: Option<Trajectory>,
+}
+
+impl StreamingMotionSource {
+    fn new(start_y: f32, consumer: Consumer<'static, MotionCommand, COMMAND_QUEUE_SIZE>) -> Self {
+        Self {
+            consumer,
+            current_y: start_y,
+            current_speed: 0.0,
+            max_speed: 10.0, // Default arbitrary limit
+            max_accel: 20.0, // Default arbitrary limit
+            active_trajectory: None,
+        }
+    }
+}
+
+impl MotionSource for StreamingMotionSource {
+    fn update(&mut self, dt: f32) -> (f32, f32) {
+        // Check if we need to start a new command
+        if self.active_trajectory.is_none() {
+            if let Some(cmd) = self.consumer.dequeue() {
+                match cmd {
+                    MotionCommand::Move { target, duration_ms, final_speed } => {
+                        let duration = duration_ms / 1000.0;
+                        // Create trajectory from current state to target
+                        // We clamp target to [0, 1]
+                        let target_clamped = target.clamp(0.0, 1.0);
+                        self.active_trajectory = Some(Trajectory::new(
+                            self.current_y, 
+                            self.current_speed, 
+                            target_clamped, 
+                            final_speed, 
+                            duration
+                        ));
+                    }
+                    MotionCommand::SetMaxSpeed(s) => self.max_speed = s,
+                    MotionCommand::SetMaxAccel(a) => self.max_accel = a,
+                }
+            }
+        }
+        
+        // Update active trajectory
+        if let Some(traj) = &mut self.active_trajectory {
+            if let Some((y, speed)) = traj.update(dt) {
+                self.current_y = y.clamp(0.0, 1.0);
+                self.current_speed = speed;
+            } else {
+                // Trajectory finished
+                let (end_y, end_speed) = traj.end_state();
+                self.current_y = end_y.clamp(0.0, 1.0);
+                self.current_speed = end_speed;
+                self.active_trajectory = None;
+            }
+        } else {
+            // Idle state: decelerate to zero
+            if self.current_speed.abs() > 1e-4 {
+                let decel = self.max_accel * dt;
+                if self.current_speed > 0.0 {
+                    self.current_speed = (self.current_speed - decel).max(0.0);
+                } else {
+                    self.current_speed = (self.current_speed + decel).min(0.0);
+                }
+                // Update position based on average speed? Or current speed?
+                // Simple integration: pos += speed * dt
+                self.current_y += self.current_speed * dt;
+                self.current_y = self.current_y.clamp(0.0, 1.0);
+            } else {
+                self.current_speed = 0.0;
+            }
+        }
+        
+        (self.current_y, self.current_speed)
+    }
+
+    fn follow(&mut self, y: f32) {
+        // Drain queue?
+        while self.consumer.dequeue().is_some() {}
+        self.active_trajectory = None;
+        self.current_y = y;
+        self.current_speed = 0.0; // Reset speed as we don't know prior speed
+    }
+    
+    fn get_phase_info(&self) -> (f32, f32) {
+        (0.0, 0.0) // No phase concept in streaming
+    }
+}
+
+
+
 // ===== Layer 2: Shaper =====
 // Transforms y ∈ [0, 1] → y ∈ [0, 1] with depth, direction, and reversal
 
@@ -476,35 +746,72 @@ impl PositionGenerator {
     }
 }
 
+fn create_waveform_generator(config: &MotorControllerConfig) -> Box<dyn WaveformGenerator> {
+    match config.wave_func.as_str() {
+        "sine" => Box::new(SineWaveform),
+        "thrust" => Box::new(ThrustWaveform::new(config.sharpness)),
+        "spline" => {
+            match SplineWaveform::from_points(&config.spline_points, SPLINE_RESOLUTION) {
+                Ok(wf) => Box::new(wf),
+                Err(e) => {
+                    log::error!("Error creating spline waveform: {}. Falling back to sine wave.", e);
+                    Box::new(SineWaveform)
+                }
+            }
+        },
+        _ => Box::new(SineWaveform),
+    }
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum MotionMode {
+    Waveform,
+    Paused,
+    Streaming,
+}
+
 pub struct MotorController<'a> {
     motor: Box<dyn Motor + Send + 'a>,
-    waveform: Box<dyn WaveformGenerator>,
+    // Store concrete structs
+    waveform_source: WaveformMotionSource,
+    paused_source: PausedMotionSource,
+    streaming_source: StreamingMotionSource,
+    
+    command_producer: Arc<Mutex<CommandProducer>>,
+
+    active_mode: MotionMode,
+
     shaper: Shaper,
     position_gen: PositionGenerator,
     config: MotorControllerConfig,
     config_version: u32,
-    t0: time::Instant,
     last_cycle: time::Instant,
     
-    // Pause state
-    current_paused_y: f32,   // Current y when paused (for smooth transitions)
+    // Internal state
+    last_y: f32,
+    last_speed: f32,
 }
 
 impl<'a> MotorController<'a> {
     pub fn new(motor: Box<dyn Motor + Send + 'a>, config: MotorControllerConfig) -> Self {
-        let waveform: Box<dyn WaveformGenerator> = match config.wave_func.as_str() {
-            "sine" => Box::new(SineWaveform),
-            "thrust" => Box::new(ThrustWaveform::new(config.sharpness)),
-            "spline" => {
-                match SplineWaveform::from_points(&config.spline_points, SPLINE_RESOLUTION) {
-                    Ok(wf) => Box::new(wf),
-                    Err(e) => {
-                        eprintln!("Error creating spline waveform: {}. Falling back to sine wave.", e);
-                        Box::new(SineWaveform)
-                    }
-                }
-            },
-            _ => Box::new(SineWaveform),
+        let generator = create_waveform_generator(&config);
+        let waveform_source = WaveformMotionSource::new(generator, config.bpm);
+        
+        let paused_source = PausedMotionSource::new(config.paused_position, config.paused_position);
+        
+        // Initialize Queue
+        let queue: &'static mut Queue<MotionCommand, COMMAND_QUEUE_SIZE> = Box::leak(Box::new(Queue::new()));
+        let (producer, consumer) = queue.split();
+        let command_producer = Arc::new(Mutex::new(producer));
+
+        let streaming_source = StreamingMotionSource::new(config.paused_position, consumer);
+        
+        let active_mode = if config.paused {
+            MotionMode::Paused
+        } else if config.streaming {
+            MotionMode::Streaming
+        } else {
+            MotionMode::Waveform
         };
         
         let direction = if config.depth_top {
@@ -519,14 +826,38 @@ impl<'a> MotorController<'a> {
         let now = time::Instant::now();
         Self {
             motor,
-            waveform,
+            waveform_source,
+            paused_source,
+            streaming_source,
+            command_producer,
+            active_mode,
             shaper,
             position_gen,
             config: config.clone(),
             config_version: 0,
-            t0: now,
             last_cycle: now,
-            current_paused_y: config.paused_position,
+            last_y: config.paused_position, // Reasonable default
+            last_speed: 0.0,
+        }
+    }
+
+    pub fn get_command_sender(&self) -> Arc<Mutex<CommandProducer>> {
+        self.command_producer.clone()
+    }
+
+    fn active_source(&self) -> &dyn MotionSource {
+        match self.active_mode {
+            MotionMode::Waveform => &self.waveform_source,
+            MotionMode::Paused => &self.paused_source,
+            MotionMode::Streaming => &self.streaming_source,
+        }
+    }
+
+    fn active_source_mut(&mut self) -> &mut dyn MotionSource {
+        match self.active_mode {
+            MotionMode::Waveform => &mut self.waveform_source,
+            MotionMode::Paused => &mut self.paused_source,
+            MotionMode::Streaming => &mut self.streaming_source,
         }
     }
 
@@ -538,32 +869,25 @@ impl<'a> MotorController<'a> {
         self.position_gen = PositionGenerator::new(self.motor.pos_min(), self.motor.pos_max());
 
         // set motor parameters
-        self.motor.set_max_power(0.5)?;
+        self.motor.set_max_power(0.6)?;
         self.motor.set_acceleration(4000.0)?;
         self.motor.set_position_ring_ratio(3000.0)?;
         self.motor.set_speed_ring_ratio(3000.0)?;
 
         // pause the motor and set pause position to current position
 
-        // Read current motor position and sync waveform generator
+        // Read current motor position and sync source
         let position = self.motor.read_position()?;
         let pos_normalized = (position - self.motor.pos_min()) / (self.motor.pos_max() - self.motor.pos_min());
         
         // Try to unshape the current position to get the waveform y
         match self.shaper.unshape(pos_normalized) {
             Some(waveform_y) => {
-                // Position is within current depth range, sync waveform to match
+                // Position is within current depth range, sync source to match
                 println!("Syncing waveform to current position (y={})", waveform_y);
-                
-                // Find phase that produces this y
-                let phase = self.waveform.find_x_for_y(waveform_y);
-                
-                // Set t0 so waveform starts at this phase
-                let time_offset = phase * 60.0 / self.config.bpm;
-                self.t0 = time::Instant::now() - time::Duration::from_secs_f32(time_offset);
-                
-                // Update paused position tracking
-                self.current_paused_y = waveform_y;
+                self.active_source_mut().follow(waveform_y);
+                self.last_y = waveform_y;
+                self.last_speed = 0.0; // Approximation
             }
             None => {
                 // Position is outside current depth range, trigger transition
@@ -572,17 +896,21 @@ impl<'a> MotorController<'a> {
                 // Set transitioning flag so shaper will move to target depth
                 self.shaper.transitioning = true;
                 
-                // Start waveform at a default phase (middle of cycle)
-                let time_offset = 0.25 * 60.0 / self.config.bpm;  // Start at 0.25 phase (near middle)
-                self.t0 = time::Instant::now() - time::Duration::from_secs_f32(time_offset);
-                
-                // Set paused position to middle as well
-                self.current_paused_y = 0.5;
+                // Start source at a default position (middle)
+                self.active_source_mut().follow(0.5);
+                self.last_y = 0.5;
+                self.last_speed = 0.0;
             }
         }
-
+        
+        // Enforce pause state as per previous logic (initially paused)
         self.config.paused = true;
-        self.config.paused_position = self.current_paused_y;
+        self.config.paused_position = self.last_y;
+        
+        self.active_mode = MotionMode::Paused;
+        // Ensure paused source is synced
+        self.paused_source.follow(self.last_y);
+        self.paused_source = PausedMotionSource::new(self.last_y, self.config.paused_position);
 
         Ok(())
     }
@@ -591,77 +919,65 @@ impl<'a> MotorController<'a> {
         let wave_changed = self.config.wave_func != config.wave_func || self.config.spline_points != config.spline_points;
         let sharpness_changed = (self.config.sharpness - config.sharpness).abs() > 0.001;
         let bpm_changed = (self.config.bpm - config.bpm).abs() > 0.001;
-
-        // Grab current waveform output value before changing anything
-        let last_y_wave = if self.config.paused {
-            self.current_paused_y
-        } else {
-            let elapsed = time::Instant::now().duration_since(self.t0).as_secs_f32();
-            let (y, _) = self.waveform.evaluate(elapsed, self.config.bpm);
-            y
-        };
+        let spline_changed = self.config.spline_points != config.spline_points;
         
-        // Update waveform if wave type or sharpness changed
-        if wave_changed || sharpness_changed {
-            self.waveform = match config.wave_func.as_str() {
-                "sine" => Box::new(SineWaveform),
-                "thrust" => Box::new(ThrustWaveform::new(config.sharpness)),
-                "spline" => match SplineWaveform::from_points(&config.spline_points, SPLINE_RESOLUTION) {
-                    Ok(wf) => Box::new(wf),
-                    Err(e) => {
-                        log::error!("Error creating spline waveform: {}. Falling back to sine wave.", e);
-                        Box::new(SineWaveform)
-                    }
-                },
-                _ => Box::new(SineWaveform),
-            };
-        }
-        
-        // Update shaper (this will trigger smooth transition if depth/direction changed)
+        // Update shaper
         let direction = if config.depth_top {
             DepthDirection::Top
         } else {
             DepthDirection::Bottom
         };
         self.shaper.set_params(config.depth, direction, config.reversed);
+
+        // Determine target mode
+        let target_mode = if config.paused {
+            MotionMode::Paused
+        } else if config.streaming {
+            MotionMode::Streaming
+        } else {
+            MotionMode::Waveform
+        };
         
-        // Handle waveform/timing changes
-        if (wave_changed || sharpness_changed) && !config.paused {
-            // Find phase in new waveform that matches last output of old waveform
-            let target_phase = self.waveform.find_x_for_y(last_y_wave);
-            let time_offset = target_phase * 60.0 / config.bpm;
-            self.t0 = time::Instant::now() - time::Duration::from_secs_f32(time_offset);
+        // 1. Handle Paused Source
+        if target_mode == MotionMode::Paused {
+            if self.active_mode != MotionMode::Paused {
+                // Switching TO paused
+                self.paused_source.follow(self.last_y);
+                self.paused_source = PausedMotionSource::new(self.last_y, config.paused_position);
+            } else {
+                // Staying in paused
+                if (self.config.paused_position - config.paused_position).abs() > 0.001 {
+                    self.paused_source = PausedMotionSource::new(self.last_y, config.paused_position);
+                }
+            }
         }
-        // Handle unpause: adjust t0 so waveform matches current_paused_y
-        else if !config.paused && self.config.paused {
-            // Find phase x that produces current_paused_y
-            let target_phase = self.waveform.find_x_for_y(self.current_paused_y);
-            
-            // Calculate time offset: phase = (t * bpm / 60) % 1
-            // t = phase * 60 / bpm
-            let time_offset = target_phase * 60.0 / config.bpm;
-            self.t0 = time::Instant::now() - time::Duration::from_secs_f32(time_offset);
+
+        // 2. Handle Streaming Source
+        if target_mode == MotionMode::Streaming && self.active_mode != MotionMode::Streaming {
+            self.streaming_source.follow(self.last_y);
+        } else if target_mode != MotionMode::Streaming && self.active_mode == MotionMode::Streaming {
+            // Switching away from streaming - maybe drain queue? or keep it
+            // self.streaming_source.clear(); // Not strictly necessary
         }
-        // Handle BPM change: adjust t0 to maintain current phase
-        else if bpm_changed && !config.paused {
-            // Calculate current phase with old BPM
-            let now = time::Instant::now();
-            let elapsed = now.duration_since(self.t0).as_secs_f32();
-            let current_phase = (elapsed * self.config.bpm / 60.0) % 1.0;
-            
-            // Adjust t0 so same phase is maintained with new BPM
-            let new_elapsed = current_phase * 60.0 / config.bpm;
-            self.t0 = now - time::Duration::from_secs_f32(new_elapsed);
+
+        // 3. Handle Waveform Source
+        if target_mode == MotionMode::Waveform {
+             let need_recreate = self.active_mode != MotionMode::Waveform || // Switching to it
+                                 wave_changed || sharpness_changed || bpm_changed || spline_changed;
+             
+             if need_recreate {
+                 let generator = create_waveform_generator(&config);
+                 let mut new_wf = WaveformMotionSource::new(generator, config.bpm);
+                 new_wf.follow(self.last_y); 
+                 self.waveform_source = new_wf;
+             }
         }
+
+        self.active_mode = target_mode;
         
         // Update config
         self.config = config.clone();
         self.config_version += 1;
-        
-        // Save config to file
-        // if let Err(e) = config.save_to_file(CONFIG_FILE) {
-        //     eprintln!("Warning: Failed to save config to file: {}", e);
-        // }
         
         Ok(())
     }
@@ -681,24 +997,25 @@ impl<'a> MotorController<'a> {
     }
 
     pub fn get_current_state(&self) -> StateResponse {
-        let now = time::Instant::now();
-        let elapsed = now.duration_since(self.t0).as_secs_f32();
+        let (t, x) = self.active_source().get_phase_info();
         
-        // Calculate phase x
-        let cycles = elapsed * self.config.bpm / 60.0;
-        let x = cycles % 1.0;
+        // Get current output without advancing state (assumes query is instantaneous or uses stored last_y)
+        // Since we don't have a peek method, we can use last_y and assume speed 0 for query?
+        // Or we can just return last computed values. 
+        // We track last_y. But we don't track last_speed. 
+        // Ideally we should separate update from query.
+        // For now, let's use last_y and 0 speed or re-evaluate if it was a waveform?
+        // But we can't easily re-evaluate without mutable access or knowing the type.
+        // Let's rely on last_y and recalculate shaping.
         
-        // Calculate waveform y
-        let (y_wave, speed_wave) = if self.config.paused {
-            (self.current_paused_y, 0.0)
-        } else {
-            self.waveform.evaluate(elapsed, self.config.bpm)
-        };
+        let y_wave = self.last_y;
+        let speed_wave = self.last_speed;
         
         // Calculate shaped y
         let (shaped_y, shaped_speed) = {
             let mut temp_shaper = self.shaper.clone();
-            temp_shaper.shape(y_wave, speed_wave, 0.0)
+            // We pass speed_wave because we cached it
+            temp_shaper.shape(y_wave, speed_wave, 0.0) 
         };
         
         // Calculate position
@@ -706,7 +1023,7 @@ impl<'a> MotorController<'a> {
         
         StateResponse {
             config: self.get_config(),
-            t: elapsed,
+            t,
             x,
             y: y_wave,
             shaped_y,
@@ -720,34 +1037,10 @@ impl<'a> MotorController<'a> {
         let dt = now.duration_since(self.last_cycle).as_secs_f32();
         self.last_cycle = now;
         
-        // Layer 1: Generate waveform or smooth to paused position
-        let (y_wave, speed_wave) = if self.config.paused {
-            // Smoothly transition to paused position
-            let target_y = self.config.paused_position;
-            let diff = target_y - self.current_paused_y;
-            
-            let speed = if diff.abs() < TRANSITION_THRESHOLD {
-                self.current_paused_y = target_y;
-                0.0
-            } else {
-                let step = PAUSE_SPEED * dt;
-                if diff > 0.0 {
-                    self.current_paused_y = (self.current_paused_y + step).min(target_y);
-                    PAUSE_SPEED
-                } else {
-                    self.current_paused_y = (self.current_paused_y - step).max(target_y);
-                    -PAUSE_SPEED
-                }
-            };
-            
-            (self.current_paused_y, speed)
-        } else {
-            let elapsed = now.duration_since(self.t0).as_secs_f32();
-            let (y, speed) = self.waveform.evaluate(elapsed, self.config.bpm);
-            // Track current position for smooth pause transition
-            self.current_paused_y = y;
-            (y, speed)
-        };
+        // Layer 1: Motion Source
+        let (y_wave, speed_wave) = self.active_source_mut().update(dt);
+        self.last_y = y_wave;
+        self.last_speed = speed_wave;
         
         // Layer 2: Apply shaping (with smooth transitions)
         let (shaped_y, shaped_speed) = self.shaper.shape(y_wave, speed_wave, dt);
@@ -774,6 +1067,8 @@ pub struct MotorControllerConfig {
     pub spline_points: Vec<f32>,
     pub paused: bool,
     pub paused_position: f32,
+    #[serde(default)]
+    pub streaming: bool,
 }
 
 #[derive(Serialize)]
@@ -799,6 +1094,7 @@ impl MotorControllerConfig {
             spline_points: vec![0.0, 1.0], // Default to a sawtooth wave
             paused: false,
             paused_position: 0.0,
+            streaming: false,
         }
     }
 }

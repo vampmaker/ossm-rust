@@ -13,8 +13,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
 use esp_idf_svc::io::vfs::BlockingStdIo;
 use esp_idf_svc::hal::usb_serial;
-use esp_idf_svc::http::server::EspHttpServer;
-
+use esp_idf_svc::http::server::{EspHttpServer, Configuration as HttpdConfiguration};
 mod command;
 mod context;
 mod http_api;
@@ -90,7 +89,8 @@ fn run_app() -> anyhow::Result<()> {
     // setup stdin command handler
     {
         let app_context = app_context.clone();
-        std::thread::spawn(move || handle_stdin_command(app_context));
+        let builder = std::thread::Builder::new().name("stdin_command".to_string()).stack_size(4096);
+        builder.spawn(move || handle_stdin_command(app_context)).unwrap();
     }
 
     // setup wifi
@@ -104,7 +104,18 @@ fn run_app() -> anyhow::Result<()> {
     }
 
     // setup http api
-    let mut server = EspHttpServer::new(&Default::default())?;
+    let httpd_config =
+    {
+        let mut httpd_config = HttpdConfiguration::default();
+        httpd_config.max_open_sockets = 7;
+        #[cfg(esp_idf_esp_https_server_enable)]
+        {
+            httpd_config.server_certificate = Some(esp_idf_svc::tls::X509::pem_until_nul(include_bytes!("../servercert.pem")));
+            httpd_config.private_key = Some(esp_idf_svc::tls::X509::pem_until_nul(include_bytes!("../prvtkey.pem")));
+        }
+        httpd_config
+    };
+    let mut server = EspHttpServer::new(&httpd_config)?;
     http_api::register_handlers(&mut server, app_context.clone());
 
     if let Err(e) = run_motor(app_context, peripherals.uart1) {

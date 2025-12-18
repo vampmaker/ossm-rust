@@ -79,11 +79,11 @@ After flashing, you need to configure the device to connect to your WiFi network
 1.  Keep the ESP32-C6 connected to your computer and stay on the flashing tool page. If you have closed it, you can open it again: **[https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)**
 2.  If you are not connected, click **"Connect"** and select the same serial port you used for flashing.
 3.  The console is located at the bottom of the page. You should see log messages from the device. Press `Enter` in the input box to make sure the connection is working.
-4.  To configure WiFi, type the following commands one by one, replacing `<your_ssid>` and `<your_password>` with your actual WiFi network name and password. Press `Enter` after each command.
+4.  To configure WiFi, type the following commands one by one, replacing `<your-ssid>` and `<your-password>` with your actual WiFi network name and password. Press `Enter` after each command.
 
     ```
-    set_wifi_ssid <your_ssid>
-    set_wifi_password <your_password>
+    set-wifi-ssid <your-ssid>
+    set-wifi-password <your-password>
     ```
 
 6.  After setting the SSID and password, you need to restart the ESP32-C6. You can do this by pressing the `RST` or `EN` button on the board, or by unplugging and plugging it back in.
@@ -107,23 +107,24 @@ You can also control the motor using the serial monitor. Here is a list of avail
 
 ```
 help                           - Show this help message
-set_wifi_ssid <ssid>           - Set WiFi SSID
-set_wifi_password <password>   - Set WiFi password
-get_pin_configuration          - Get pin configuration in JSON format
-set_pin_modbus_tx <pin>        - Set Modbus TX pin
-set_pin_modbus_rx <pin>        - Set Modbus RX pin
-set_pin_modbus_de_re <pin>     - Set Modbus DE/RE pin
-get_motor_config               - Get motor config in JSON format
-set_motor_config <json>        - Set motor config from a JSON string
+reset                          - Soft reset the MCU
+set-wifi-ssid <ssid>           - Set WiFi SSID
+set-wifi-password <password>   - Set WiFi password
+get-pin-configuration          - Get pin configuration in JSON format
+set-pin-modbus-tx <pin>        - Set Modbus TX pin
+set-pin-modbus-rx <pin>        - Set Modbus RX pin
+set-pin-modbus-de-re <pin>     - Set Modbus DE/RE pin
+get-motor-config               - Get motor config in JSON format
+set-motor-config <json>        - Set motor config from a JSON string
 pause                          - Pause the motor
 start                          - Start the motor
-set_bpm <bpm>                  - Set motor BPM
-set_wave <sine|thrust|spline>  - Set motor waveform
-set_paused_position <position> - Set motor position when paused (0.0 to 1.0)
-set_depth <depth>              - Set motor stroke depth (0.0 to 1.0)
-set_depth_top <true|false>     - Set depth direction
-set_sharpness <sharpness>      - Set sharpness for thrust wave (0.01 to 0.99)
-set_spline_points <p1> <p2>... - Set points for spline wave (0.0 to 1.0)
+set-bpm <bpm>                  - Set motor BPM
+set-wave <sine|thrust|spline>  - Set motor waveform
+set-paused-position <position> - Set motor position when paused (0.0 to 1.0)
+set-depth <depth>              - Set motor stroke depth (0.0 to 1.0)
+set-depth-top <true|false>     - Set depth direction
+set-sharpness <sharpness>      - Set sharpness for thrust wave (0.01 to 0.99)
+set-spline-points <p1> <p2>... - Set points for spline wave (0.0 to 1.0)
 ```
 
 ### Advanced Control: The Spline Wave
@@ -134,21 +135,21 @@ This gives you the creative freedom to design intricate and varied patterns. The
 
 **How to use it:**
 
-1.  **Set the points:** Use the `set_spline_points` command, followed by a space-separated list of numbers between 0.0 (fully retracted) and 1.0 (fully extended).
-2.  **Activate the wave:** Use the `set_wave spline` command to switch to your custom pattern.
+1.  **Set the points:** Use the `set-spline-points` command, followed by a space-separated list of numbers between 0.0 (fully retracted) and 1.0 (fully extended).
+2.  **Activate the wave:** Use the `set-wave spline` command to switch to your custom pattern.
 
 **Examples:**
 
 *   **Simple Stroke:** A basic linear movement.
-    `set_spline_points 0 1`
+    `set-spline-points 0 1`
 *   **Thrust:** A rapid forward motion followed by a stepped retraction.
-    `set_spline_points 0 0 1 0.8 0.5 0.2`
+    `set-spline-points 0 0 1 0.8 0.5 0.2`
 *   **Triangle:** A smooth ramping up and down.
-    `set_spline_points 0 0.2 0.4 0.6 0.8 1.0 0.8 0.6 0.4 0.2`
+    `set-spline-points 0 0.2 0.4 0.6 0.8 1.0 0.8 0.6 0.4 0.2`
 *   **Square Wave:** Holds at the start, then instantly moves and holds at the end.
-    `set_spline_points 0 0 0 0 0 1 1 1 1 1`
+    `set-spline-points 0 0 0 0 0 1 1 1 1 1`
 *   **Vibration:** A jittery, vibrational motion.
-    `set_spline_points 0 0.2 0.1 0.4 0.3 0.6 0.5`
+    `set-spline-points 0 0.2 0.1 0.4 0.3 0.6 0.5`
 
 ### HTTP API
 
@@ -164,27 +165,27 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 {
   "bpm": 60.0,
   "depth": 1.0,
-  "depth_top": true,
+  "depth-top": true,
   "reversed": false,
-  "wave_func": "sine",
+  "wave-func": "sine",
   "sharpness": 0.5,
-  "spline_points": [0.0, 1.0],
+  "spline-points": [0.0, 1.0],
   "paused": true,
-  "paused_position": 0.5
+  "paused-position": 0.5
 }
 ```
 
 *   `bpm` (number): Beats per minute. Controls the speed of the motion cycle.
 *   `depth` (number): The stroke depth, from 0.0 (no movement) to 1.0 (full range).
-*   `depth_top` (boolean): Determines the direction of the stroke.
+*   `depth-top` (boolean): Determines the direction of the stroke.
     *   `true`: The stroke moves from the fully retracted position (0.0) to the specified `depth`. For example, a depth of 0.8 would move in the range [0.0, 0.8].
     *   `false`: The stroke moves from `1.0 - depth` to the fully extended position (1.0). For example, a depth of 0.8 would move in the range [0.2, 1.0].
 *   `reversed` (boolean): When `true`, reverses the direction of the waveform.
-*   `wave_func` (string): The motion pattern. Can be `"sine"`, `"thrust"`, or `"spline"`.
+*   `wave-func` (string): The motion pattern. Can be `"sine"`, `"thrust"`, or `"spline"`.
 *   `sharpness` (number): Only affects the `"thrust"` waveform. Controls the duration of the thrust, from 0.01 (sharpest) to 0.99 (smoothest).
-*   `spline_points` (array of numbers): An array of points (0.0 to 1.0) that define the custom motion path for the `"spline"` waveform.
+*   `spline-points` (array of numbers): An array of points (0.0 to 1.0) that define the custom motion path for the `"spline"` waveform.
 *   `paused` (boolean): `true` to pause the motor, `false` to run it.
-*   `paused_position` (number): The position (0.0 to 1.0) the motor will hold when paused.
+*   `paused-position` (number): The position (0.0 to 1.0) the motor will hold when paused.
 
 #### `POST /config`
 
@@ -222,18 +223,18 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
   "config": {
     "bpm": 60.0,
     "depth": 1.0,
-    "depth_top": true,
+    "depth-top": true,
     "reversed": false,
-    "wave_func": "sine",
+    "wave-func": "sine",
     "sharpness": 0.5,
-    "spline_points": [0.0, 1.0],
+    "spline-points": [0.0, 1.0],
     "paused": true,
-    "paused_position": 0.5
+    "paused-position": 0.5
   },
   "t": 123.45,
   "x": 0.5,
   "y": 1.0,
-  "shaped_y": 1.0,
+  "shaped-y": 1.0,
   "position": 10000,
   "speed": 0.0
 }
@@ -243,6 +244,6 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 *   `t`: Time offset in seconds since the motion started.
 *   `x`: The current phase of the waveform, from 0.0 to 1.0.
 *   `y`: The raw output of the waveform generator, from 0.0 to 1.0.
-*   `shaped_y`: The waveform output after depth and direction have been applied.
+*   `shaped-y`: The waveform output after depth and direction have been applied.
 *   `position`: The current absolute position of the motor in its native units.
 *   `speed`: The current speed of the motor.

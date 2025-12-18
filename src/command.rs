@@ -1,16 +1,113 @@
-use std::io::{self, BufRead};
-use esp_idf_svc::hal::delay::FreeRtos;
-use crate::motion::MotorControllerConfig;
+use std::io::{self, Read, Write as StdWrite};
+
 use crate::context::AppContext;
+use crate::motion::MotorControllerConfig;
+use embedded_cli::cli::CliBuilder;
+use embedded_cli::Command;
+use embedded_io::ErrorType;
+use embedded_io::Write as EmbeddedWrite;
+use esp_idf_svc::hal::delay::FreeRtos;
+
+#[derive(Command, Clone, Debug)]
+#[command(help_title = "ossm-rust")]
+enum BaseCommand<'a> {
+    SetWifiSsid {
+        /// WiFi SSID
+        ssid: &'a str,
+    },
+    SetWifiPassword {
+        /// WiFi password
+        password: &'a str,
+    },
+    SetPinModbusTx {
+        /// Modbus TX pin
+        pin: u32,
+    },
+    SetPinModbusRx {
+        /// Modbus RX pin
+        pin: u32,
+    },
+    SetPinModbusDeRe {
+        /// Modbus DE/RE pin
+        pin: u32,
+    },
+    GetPinConfiguration,
+    SetMotorConfig {
+        /// Motor config in JSON format
+        json: &'a str,
+    },
+    GetMotorConfig,
+    Pause,
+    Start,
+    Reset,
+    SetBpm {
+        /// Motor BPM
+        bpm: f32,
+    },
+    SetWave {
+        /// Motor waveform: sine, thrust, spline
+        wave: &'a str,
+    },
+    SetPausedPosition {
+        /// Motor position when paused (0.0 to 1.0)
+        position: f32,
+    },
+    SetDepth {
+        /// Motor stroke depth (0.0 to 1.0)
+        depth: f32,
+    },
+    SetDepthTop {
+        /// Depth direction: true or false
+        v: bool,
+    },
+    SetSharpness {
+        /// Sharpness for thrust wave (0.01 to 0.99)
+        sharpness: f32,
+    },
+    SetSplinePoints {
+        /// Spline points separated by space (0.0 to 1.0)
+        points: &'a str, // embedded-cli doesn't support Vec<f32> directly as argument, so we parse string manually
+    },
+}
+
+struct StdoutAdapter(std::io::Stdout);
+
+impl ErrorType for StdoutAdapter {
+    type Error = std::io::Error;
+}
+
+impl EmbeddedWrite for StdoutAdapter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        StdWrite::write(&mut self.0, buf)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        StdWrite::flush(&mut self.0)
+    }
+}
 
 pub fn handle_stdin_command(app_context: AppContext) {
     let stdin = io::stdin();
-    loop {
-        let mut handle = stdin.lock();
-        let mut cmdline = String::new();
-        match handle.read_line(&mut cmdline) {
-            Ok(_) => {
+    let mut cli = CliBuilder::default()
+        .writer(StdoutAdapter(std::io::stdout()))
+        .command_buffer([0u8; 256])
+        .history_buffer([0u8; 256])
+        .build()
+        .unwrap();
+    let mut processor = BaseCommand::processor(|_cli, command| {
+        execute_command(command, &app_context);
+        Ok(())
+    });
+    let mut buf = [0u8; 1];
+    let mut handle = stdin.lock();
 
+    loop {
+        match handle.read(&mut buf) {
+            Ok(0) => continue,
+            Ok(_) => {
+                if let Err(e) = cli.process_byte::<BaseCommand<'_>, _>(buf[0], &mut processor) {
+                    log::error!("CLI processing error: {:?}", e);
+                }
             }
             Err(e) => {
                 match e.kind() {
@@ -27,296 +124,244 @@ pub fn handle_stdin_command(app_context: AppContext) {
                 }
             }
         }
+    }
+}
 
-        let cmdline = cmdline.trim();
-
-        log::info!("Command: {}", cmdline);
-
-        // parse and execute command
-        let parts = cmdline.splitn(2, ' ').collect::<Vec<&str>>();
-        let command = parts[0];
-        let args = if parts.len() > 1 { parts[1] } else { "" };
-
-        match command {
-            "set_wifi_ssid" => {
-                app_context.storage_manager.lock().unwrap().set_ssid(args).unwrap();
-                log::info!("SSID saved: {}, restart to apply", args);
-            } ,
-            "set_wifi_password" => {
-                app_context.storage_manager.lock().unwrap().set_password(args).unwrap();
-                log::info!("Password saved: {}, restart to apply", args);
-            } ,
-            "set_pin_modbus_tx" => {
-                match args.parse::<u32>() {
-                    Ok(pin) => {
-                        let mut sm = app_context.storage_manager.lock().unwrap();
-                        let mut config = sm.get_pin_configuration().unwrap_or_default();
-                        config.modbus_tx = pin;
-                        sm.set_pin_configuration(&config).unwrap();
-                        log::info!("Modbus TX pin set to {}, restart to apply", pin);
-                    }
-                    Err(_) => log::error!("Invalid pin value: {}", args),
-                }
-            },
-            "set_pin_modbus_rx" => {
-                match args.parse::<u32>() {
-                    Ok(pin) => {
-                        let mut sm = app_context.storage_manager.lock().unwrap();
-                        let mut config = sm.get_pin_configuration().unwrap_or_default();
-                        config.modbus_rx = pin;
-                        sm.set_pin_configuration(&config).unwrap();
-                        log::info!("Modbus RX pin set to {}, restart to apply", pin);
-                    }
-                    Err(_) => log::error!("Invalid pin value: {}", args),
-                }
-            },
-            "set_pin_modbus_de_re" => {
-                match args.parse::<u32>() {
-                    Ok(pin) => {
-                        let mut sm = app_context.storage_manager.lock().unwrap();
-                        let mut config = sm.get_pin_configuration().unwrap_or_default();
-                        config.modbus_de_re = pin;
-                        sm.set_pin_configuration(&config).unwrap();
-                        log::info!("Modbus DE/RE pin set to {}, restart to apply", pin);
-                    }
-                    Err(_) => log::error!("Invalid pin value: {}", args),
-                }
-            },
-            "get_pin_configuration" => {
-                match app_context.storage_manager.lock().unwrap().get_pin_configuration() {
-                    Ok(config) => {
-                        let json = serde_json::to_string_pretty(&config).unwrap();
-                        println!("{}", json);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to get pin config: {}", e);
-                    }
-                }
-            },
-            "set_motor_config" => {
-                match serde_json::from_str::<MotorControllerConfig>(args) {
-                    Ok(config) => {
-                        let mut mc_opt = app_context.motor_controller.lock().unwrap();
-                        if let Some(mc) = mc_opt.as_mut() {
-                            mc.set_config(config).unwrap();
-                            log::info!("Motor config updated");
-                        } else {
-                            log::error!("Motor controller not initialized");
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to parse motor config: {}", e);
-                    }
-                }
-            } ,
-            "get_motor_config" => {
-                let mut mc_opt = app_context.motor_controller.lock().unwrap();
-                if let Some(mc) = mc_opt.as_mut() {
-                    let config = mc.get_config();
+fn execute_command(command: BaseCommand<'_>, app_context: &AppContext) {
+    match command {
+        BaseCommand::SetWifiSsid { ssid } => {
+            app_context.storage_manager.lock().unwrap().set_ssid(&ssid).unwrap();
+            log::info!("SSID saved: {}, restart to apply", ssid);
+        }
+        BaseCommand::SetWifiPassword { password } => {
+            app_context.storage_manager.lock().unwrap().set_password(&password).unwrap();
+            log::info!("Password saved: {}, restart to apply", password);
+        }
+        BaseCommand::SetPinModbusTx { pin } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            config.modbus_tx = pin;
+            sm.set_pin_configuration(&config).unwrap();
+            log::info!("Modbus TX pin set to {}, restart to apply", pin);
+        }
+        BaseCommand::SetPinModbusRx { pin } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            config.modbus_rx = pin;
+            sm.set_pin_configuration(&config).unwrap();
+            log::info!("Modbus RX pin set to {}, restart to apply", pin);
+        }
+        BaseCommand::SetPinModbusDeRe { pin } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            config.modbus_de_re = pin;
+            sm.set_pin_configuration(&config).unwrap();
+            log::info!("Modbus DE/RE pin set to {}, restart to apply", pin);
+        }
+        BaseCommand::GetPinConfiguration => {
+            match app_context.storage_manager.lock().unwrap().get_pin_configuration() {
+                Ok(config) => {
                     let json = serde_json::to_string_pretty(&config).unwrap();
                     println!("{}", json);
-                } else {
-                    log::error!("Motor controller not initialized");
                 }
-            },
-            "pause" => {
+                Err(e) => {
+                    log::error!("Failed to get pin config: {}", e);
+                }
+            }
+        }
+        BaseCommand::SetMotorConfig { json } => {
+            match serde_json::from_str::<MotorControllerConfig>(json) {
+                Ok(config) => {
+                    let mut mc_opt = app_context.motor_controller.lock().unwrap();
+                    if let Some(mc) = mc_opt.as_mut() {
+                        mc.set_config(config).unwrap();
+                        log::info!("Motor config updated");
+                    } else {
+                        log::error!("Motor controller not initialized");
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to parse motor config: {}", e);
+                }
+            }
+        }
+        BaseCommand::GetMotorConfig => {
+            let mut mc_opt = app_context.motor_controller.lock().unwrap();
+            if let Some(mc) = mc_opt.as_mut() {
+                let config = mc.get_config();
+                let json = serde_json::to_string_pretty(&config).unwrap();
+                println!("{}", json);
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::Pause => {
+            let mut mc_opt = app_context.motor_controller.lock().unwrap();
+            if let Some(mc) = mc_opt.as_mut() {
+                if let Err(e) = mc.update_config(|config| {
+                    config.paused = true;
+                }) {
+                    log::error!("Failed to set motor config: {}", e);
+                } else {
+                    log::info!("Motor paused");
+                }
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::Start => {
+            let mut mc_opt = app_context.motor_controller.lock().unwrap();
+            if let Some(mc) = mc_opt.as_mut() {
+                if let Err(e) = mc.update_config(|config| {
+                    config.paused = false;
+                }) {
+                    log::error!("Failed to set motor config: {}", e);
+                } else {
+                    log::info!("Motor started");
+                }
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::Reset => {
+            log::info!("Restarting device...");
+            FreeRtos::delay_ms(100);
+            esp_idf_svc::hal::reset::restart();
+        }
+        BaseCommand::SetBpm { bpm } => {
+            if bpm <= 0.0 {
+                log::error!("BPM must be greater than 0.0");
+                return
+            }
+            let mut mc_opt = app_context.motor_controller.lock().unwrap();
+            if let Some(mc) = mc_opt.as_mut() {
+                if let Err(e) = mc.update_config(|config| {
+                    config.bpm = bpm;
+                }) {
+                    log::error!("Failed to set motor config: {}", e);
+                } else {
+                    log::info!("BPM set to {}", bpm);
+                }
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::SetWave { wave } => {
+            if wave == "sine" || wave == "thrust" || wave == "spline" {
                 let mut mc_opt = app_context.motor_controller.lock().unwrap();
                 if let Some(mc) = mc_opt.as_mut() {
                     if let Err(e) = mc.update_config(|config| {
-                        config.paused = true;
+                        config.wave_func = wave.to_string();
                     }) {
                         log::error!("Failed to set motor config: {}", e);
                     } else {
-                        log::info!("Motor paused");
+                        log::info!("Wave function set to {}", wave);
                     }
                 } else {
                     log::error!("Motor controller not initialized");
                 }
-            },
-            "start" => {
-                let mut mc_opt = app_context.motor_controller.lock().unwrap();
-                if let Some(mc) = mc_opt.as_mut() {
-                    if let Err(e) = mc.update_config(|config| {
-                        config.paused = false;
-                    }) {
-                        log::error!("Failed to set motor config: {}", e);
-                    } else {
-                        log::info!("Motor started");
-                    }
+            } else {
+                log::error!("Invalid wave function: {}. Use 'sine' or 'thrust' or 'spline'", wave);
+            }
+        }
+        BaseCommand::SetPausedPosition { position } => {
+            if position <= 0.0 || position >= 1.0 {
+                log::error!("Paused position must be between 0.0 and 1.0");
+                return
+            }
+             let mut mc_opt = app_context.motor_controller.lock().unwrap();
+            if let Some(mc) = mc_opt.as_mut() {
+                if let Err(e) = mc.update_config(|config| {
+                    config.paused_position = position;
+                }) {
+                    log::error!("Failed to set motor config: {}", e);
                 } else {
-                    log::error!("Motor controller not initialized");
+                    log::info!("Paused position set to {}", position);
                 }
-            },
-            "set_bpm" => {
-                match args.parse::<f32>() {
-                    Ok(bpm) => {
-                        let mut mc_opt = app_context.motor_controller.lock().unwrap();
-                        if let Some(mc) = mc_opt.as_mut() {
-                            if let Err(e) = mc.update_config(|config| {
-                                config.bpm = bpm;
-                            }) {
-                                log::error!("Failed to set motor config: {}", e);
-                            } else {
-                                log::info!("BPM set to {}", bpm);
-                            }
-                        } else {
-                            log::error!("Motor controller not initialized");
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::SetDepth { depth } => {
+            if depth <= 0.01 || depth >= 1.0 {
+                log::error!("Depth must be between 0.01 and 1.0");
+                return
+            }
+             let mut mc_opt = app_context.motor_controller.lock().unwrap();
+            if let Some(mc) = mc_opt.as_mut() {
+                if let Err(e) = mc.update_config(|config| {
+                    config.depth = depth;
+                }) {
+                    log::error!("Failed to set motor config: {}", e);
+                } else {
+                    log::info!("Depth set to {}", depth);
+                }
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::SetDepthTop { v } => {
+            let mut mc_opt = app_context.motor_controller.lock().unwrap();
+            if let Some(mc) = mc_opt.as_mut() {
+                if let Err(e) = mc.update_config(|config| {
+                    config.depth_top = v;
+                }) {
+                    log::error!("Failed to set motor config: {}", e);
+                } else {
+                    log::info!("Depth top set to {}", v);
+                }
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::SetSharpness { sharpness } => {
+             let mut mc_opt = app_context.motor_controller.lock().unwrap();
+             if sharpness < 0.01 || sharpness >= 1.0 {
+                log::error!("Sharpness must be between 0.01 and 0.99");
+                return
+             }
+            if let Some(mc) = mc_opt.as_mut() {
+                if let Err(e) = mc.update_config(|config| {
+                    config.sharpness = sharpness;
+                }) {
+                    log::error!("Failed to set motor config: {}", e);
+                } else {
+                    log::info!("Sharpness set to {}", sharpness);
+                }
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::SetSplinePoints { points } => {
+             let points_parsed: Result<Vec<f32>, _> = points.split_whitespace().map(|s| s.parse::<f32>()).collect();
+            match points_parsed {
+                Ok(points_vec) => {
+                    if points_vec.is_empty() {
+                        log::error!("Spline points cannot be empty");
+                        return;
+                    }
+                    for &p in &points_vec {
+                        if !(0.0..=1.0).contains(&p) {
+                            log::error!("Spline points must be between 0.0 and 1.0");
+                            return;
                         }
                     }
-                    Err(_) => log::error!("Invalid BPM value: {}", args),
-                }
-            },
-            "set_wave" => {
-                if args == "sine" || args == "thrust" || args == "spline" {
-                    let wave = args.to_string();
+
                     let mut mc_opt = app_context.motor_controller.lock().unwrap();
                     if let Some(mc) = mc_opt.as_mut() {
                         if let Err(e) = mc.update_config(|config| {
-                            config.wave_func = wave;
+                            config.spline_points = points_vec.clone();
                         }) {
                             log::error!("Failed to set motor config: {}", e);
                         } else {
-                            log::info!("Wave function set to {}", args);
+                            log::info!("Spline points set to {:?}", points_vec);
                         }
                     } else {
                         log::error!("Motor controller not initialized");
                     }
-                } else {
-                    log::error!("Invalid wave function: {}. Use 'sine' or 'thrust' or 'spline'", args);
                 }
-            },
-            "set_paused_position" => {
-                match args.parse::<f32>() {
-                    Ok(pos) => {
-                        let mut mc_opt = app_context.motor_controller.lock().unwrap();
-                        if let Some(mc) = mc_opt.as_mut() {
-                            if let Err(e) = mc.update_config(|config| {
-                                config.paused_position = pos;
-                            }) {
-                                log::error!("Failed to set motor config: {}", e);
-                            } else {
-                                log::info!("Paused position set to {}", pos);
-                            }
-                        } else {
-                            log::error!("Motor controller not initialized");
-                        }
-                    }
-                    Err(_) => log::error!("Invalid paused position value: {}", args),
-                }
-            },
-            "set_depth" => {
-                match args.parse::<f32>() {
-                    Ok(depth) => {
-                        let mut mc_opt = app_context.motor_controller.lock().unwrap();
-                        if let Some(mc) = mc_opt.as_mut() {
-                            if let Err(e) = mc.update_config(|config| {
-                                config.depth = depth;
-                            }) {
-                                log::error!("Failed to set motor config: {}", e);
-                            } else {
-                                log::info!("Depth set to {}", depth);
-                            }
-                        } else {
-                            log::error!("Motor controller not initialized");
-                        }
-                    }
-                    Err(_) => log::error!("Invalid depth value: {}", args),
-                }
-            },
-            "set_depth_top" => {
-                match args.parse::<bool>() {
-                    Ok(v) => {
-                        let mut mc_opt = app_context.motor_controller.lock().unwrap();
-                        if let Some(mc) = mc_opt.as_mut() {
-                            if let Err(e) = mc.update_config(|config| {
-                                config.depth_top = v;
-                            }) {
-                                log::error!("Failed to set motor config: {}", e);
-                            } else {
-                                log::info!("Depth top set to {}", v);
-                            }
-                        } else {
-                            log::error!("Motor controller not initialized");
-                        }
-                    }
-                    Err(_) => log::error!("Invalid boolean value: {}. Use 'true' or 'false'", args),
-                }
-            },
-            "set_sharpness" => {
-                match args.parse::<f32>() {
-                    Ok(sharpness) => {
-                        let mut mc_opt = app_context.motor_controller.lock().unwrap();
-                        if let Some(mc) = mc_opt.as_mut() {
-                            if let Err(e) = mc.update_config(|config| {
-                                config.sharpness = sharpness;
-                            }) {
-                                log::error!("Failed to set motor config: {}", e);
-                            } else {
-                                log::info!("Sharpness set to {}", sharpness);
-                            }
-                        } else {
-                            log::error!("Motor controller not initialized");
-                        }
-                    }
-                    Err(_) => log::error!("Invalid sharpness value: {}", args),
-                }
-            },
-            "help" => {
-                log::info!("Available commands:");
-                log::info!("  help                           - Show this help message");
-                log::info!("  set_wifi_ssid <ssid>                - Set WiFi SSID");
-                log::info!("  set_wifi_password <password>        - Set WiFi password");
-                log::info!("  get_pin_configuration          - Get pin configuration in JSON format");
-                log::info!("  set_pin_modbus_tx <pin>        - Set Modbus TX pin");
-                log::info!("  set_pin_modbus_rx <pin>        - Set Modbus RX pin");
-                log::info!("  set_pin_modbus_de_re <pin>     - Set Modbus DE/RE pin");
-                log::info!("  get_motor_config               - Get motor config in JSON format");
-                log::info!("  set_motor_config <json>        - Set motor config from a JSON string");
-                log::info!("  pause                          - Pause the motor");
-                log::info!("  start                          - Start the motor");
-                log::info!("  set_bpm <bpm>                  - Set motor BPM");
-                log::info!("  set_wave <sine|thrust|spline>         - Set motor waveform");
-                log::info!("  set_paused_position <position> - Set motor position when paused (0.0 to 1.0)");
-                log::info!("  set_depth <depth>              - Set motor stroke depth (0.0 to 1.0)");
-                log::info!("  set_depth_top <true|false>     - Set depth direction");
-                log::info!("  set_sharpness <sharpness>      - Set sharpness for thrust wave (0.01 to 0.99)");
-                log::info!("  set_spline_points <p1> <p2> ... - Set points for spline wave (0.0 to 1.0)");
-            },
-            "set_spline_points" => {
-                let points: Result<Vec<f32>, _> = args.split_whitespace().map(|s| s.parse::<f32>()).collect();
-                match points {
-                    Ok(points) => {
-                        if points.is_empty() {
-                            log::error!("Spline points cannot be empty");
-                            return;
-                        }
-                        for &p in &points {
-                            if !(0.0..=1.0).contains(&p) {
-                                log::error!("Spline points must be between 0.0 and 1.0");
-                                return;
-                            }
-                        }
-
-                        let mut mc_opt = app_context.motor_controller.lock().unwrap();
-                        if let Some(mc) = mc_opt.as_mut() {
-                            if let Err(e) = mc.update_config(|config| {
-                                config.spline_points = points.clone();
-                            }) {
-                                log::error!("Failed to set motor config: {}", e);
-                            } else {
-                                log::info!("Spline points set to {:?}", points);
-                            }
-                        } else {
-                            log::error!("Motor controller not initialized");
-                        }
-                    }
-                    Err(_) => log::error!("Invalid spline points value: {}", args),
-                }
-            },
-            _ => {
-                log::error!("Unknown command: {}", command);
-                continue
-            },
+                Err(_) => log::error!("Invalid spline points value: {}", points),
+            }
         }
     }
 }

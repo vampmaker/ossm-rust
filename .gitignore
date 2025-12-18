@@ -5,3 +5,5 @@
 
 repo.key
 repo.key.pub
+servercert.pem
+prvtkey.pem

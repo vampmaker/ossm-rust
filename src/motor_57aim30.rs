@@ -71,6 +71,8 @@ impl<'a> ModbusRTUMaster<'a> {
     fn modbus_request(&mut self, req: &[u8], resp: &mut [u8]) -> Result<usize> {
         assert!(resp.len() >= 256);
 
+        self.uart.clear_rx()?;
+
         if let Some(ref mut ctrl_pin_driver) = self.ctrl_pin_driver {
             ctrl_pin_driver.set_high().unwrap();
             Ets::delay_us(10);
@@ -202,8 +204,10 @@ impl<'a> Modbus57AIM30Motor<'a> {
         let baud_rates: [u32; _] = [115200, 9600, 19200, 38400];
         for baud_rate in baud_rates {
             self.client.set_baudrate(baud_rate)?;
+            let t3_5_us = Self::modbus_t3_5_us(baud_rate);
             for device_id in 1..=247 {
                 self.client.device_id = device_id;
+                Ets::delay_us(t3_5_us);
                 if self.client.read_holding_register(0x00).is_ok() {
                     return Ok(ModbusScanResult {
                         baud_rate,
@@ -213,6 +217,13 @@ impl<'a> Modbus57AIM30Motor<'a> {
             }
         }
         Err(anyhow::anyhow!("no response"))
+    }
+
+    fn modbus_t3_5_us(baud_rate: u32) -> u32 {
+        // t3.5 = 3.5 characters × 11 bits/char × 1_000_000 / baud_rate
+        // Minimum 1750 µs for baud rates > 19200 per Modbus spec
+        let calculated = 3_5 * 11 * 1_000_000 / (baud_rate * 10);
+        calculated.max(1750)
     }
 
     pub fn modbus_set_baud_rate(&mut self, baud_rate: u32) -> Result<(), anyhow::Error> {
@@ -283,16 +294,22 @@ impl<'a> Motor for Modbus57AIM30Motor<'a> {
             "Motor already homed"
         );
 
+        log::info!("Homing motor");
+
         self.set_max_power(0.1)?;
         self.set_acceleration(1000.0)?;
         self.reset_position()?;
+        log::info!("Writing position to -100.0");
         self.write_position(-100.0, 0.0)?;
         FreeRtos::delay_ms(5000);
         self.pos_min = self.wait_stable_position(5000)? + 0.1;
+        log::info!("pos_min: {}", self.pos_min);
 
+        log::info!("Writing position to 100.0");
         self.write_position(100.0, 0.0)?;
         FreeRtos::delay_ms(5000);
         self.pos_max = self.wait_stable_position(5000)? - 0.1;
+        log::info!("pos_max: {}", self.pos_max);
 
         self.write_position((self.pos_min + self.pos_max) / 2.0, 0.0)?;
         FreeRtos::delay_ms(5000);

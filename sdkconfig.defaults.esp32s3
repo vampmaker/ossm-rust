@@ -1,0 +1,10 @@
+# ESP32-S3 specific overrides
+
+# Xtensa has no hardware TLS register (unlike RISC-V's tp), so Rust's stdlib
+# falls back to pthread_key_create/pthread_setspecific which map to FreeRTOS
+# TLS slots. The default of 1 is insufficient; Rust needs slots for thread ID,
+# panic state, and stdout locking.
+CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=5
+
+# Xtensa register-window ABI uses more stack per call frame than RISC-V.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16000

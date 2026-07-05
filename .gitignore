@@ -2,6 +2,7 @@
 /.embuild
 /target
 /Cargo.lock
+/release
 
 repo.key
 repo.key.pub

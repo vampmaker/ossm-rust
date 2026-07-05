@@ -1,6 +1,6 @@
 # OSSM-Rust Firmware
 
-This repository contains the firmware for an OSSM controller, written in Rust. It's designed to run on ESP32-C6 microcontrollers and control a 57AIM30 integrated servo motor.
+This repository contains the firmware for an OSSM controller, written in Rust. It's designed to run on ESP32-C6 or ESP32-S3 microcontrollers and control a 57AIM30 integrated servo motor.
 
 This guide is intended for users who may not have a technical background. Please follow the steps carefully.
 
@@ -10,7 +10,7 @@ Here is a list of components you will need to build the controller.
 
 | Component | Description | Notes |
 | --- | --- | --- |
-| **Microcontroller** | ESP32-C6 Development Board | Any ESP32-C6 board with a USB-C connector should work. |
+| **Microcontroller** | ESP32-C6 or ESP32-S3 Development Board | Any ESP32-C6 or ESP32-S3 board with a USB-C connector should work. |
 | **Motor** | 57AIM30 Integrated Servo Motor | **Important:** Make sure to get the `57AIM30` model, not the `57AIM30H`. The `57AIM30` has a rated speed of 1500 RPM and 0.96 Nm of torque, which is ideal for this application. |
 | **RS485 Transceiver**| MAX3485 Module | This is used for communication between the ESP32 and the motor. |
 | **Power Supply (Motor)** | 24V DC Power Adapter | To power the servo motor. The connector type should be compatible with your DC jack. |
@@ -37,9 +37,9 @@ First, connect the motor to the MAX3485 RS485 transceiver:
 | --- | --- | --- |
 | Motor (485B) | --> | MAX3485 (B) |
 
-Next, connect the ESP32-C6 to the MAX3485 and the motor:
+Next, connect the ESP32 to the MAX3485 and the motor:
 
-| ESP32-C6 Pin | --> | Component Pin |
+| ESP32 Pin | --> | Component Pin |
 | --- | --- | --- |
 | 5V | --> | Motor (5V) |
 | GND | --> | Motor (COM) |
@@ -49,21 +49,32 @@ Next, connect the ESP32-C6 to the MAX3485 and the motor:
 | GPIO 19 (RX) | --> | MAX3485 (RO/RX) |
 | GPIO 20 | --> | MAX3485 (DE/RE) |
 
-Finally, power the ESP32-C6 board:
+Finally, power the ESP32 board:
 
-| ESP32-C6 Type-C Port | --> | 5V USB Charger |
+| ESP32 Type-C Port | --> | 5V USB Charger |
 | --- | --- | --- |
 
-**Note on GPIO pins**: The firmware uses GPIO 18, 19, and 20 by default for Modbus communication. If you use different pins, you will need to configure them later via serial commands.
+**Note on GPIO pins**: The firmware uses GPIO 18, 19, and 20 by default for Modbus communication on the ESP32-C6. If you use different pins or a different board, you will need to configure them later via serial commands.
+
+### Building from Source
+
+The project requires the Espressif `esp` Rust toolchain (configured in `rust-toolchain.toml`). Both targets are supported via cargo aliases defined in `.cargo/config.toml`:
+
+```
+cargo b-c6    # Build for ESP32-C6
+cargo b-s3    # Build for ESP32-S3
+```
+
+The firmware automatically adapts its pin layout based on the selected MCU.
 
 ## Part 3: Flashing the Firmware
 
 You don't need to build the firmware from source. Pre-compiled binary files will be available in the **Releases** section of this GitHub repository.
 
-We will use a web-based tool to flash the firmware onto your ESP32-C6.
+We will use a web-based tool to flash the firmware onto your ESP32.
 
 1.  Download the latest `firmware.bin` file from the Releases page of this project.
-2.  Connect your ESP32-C6 to your computer using a USB-C cable.
+2.  Connect your ESP32 to your computer using a USB-C cable.
 3.  Open your web browser (Google Chrome or Microsoft Edge are recommended) and go to: **[https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)**
 4.  Click the **"Connect"** button. A popup will appear asking you to select the serial port for your ESP32. It will usually be named `COMx` on Windows or `/dev/ttyUSBx` on Linux/macOS.
 5.  Once connected, you will see a table with "Flash Address" and "File" columns.
@@ -76,7 +87,7 @@ We will use a web-based tool to flash the firmware onto your ESP32-C6.
 
 After flashing, you need to configure the device to connect to your WiFi network. You'll do this by sending commands over a serial connection. The tool used for flashing can also be used as a serial monitor.
 
-1.  Keep the ESP32-C6 connected to your computer and stay on the flashing tool page. If you have closed it, you can open it again: **[https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)**
+1.  Keep the ESP32 connected to your computer and stay on the flashing tool page. If you have closed it, you can open it again: **[https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)**
 2.  If you are not connected, click **"Connect"** and select the same serial port you used for flashing.
 3.  The console is located at the bottom of the page. You should see log messages from the device. Press `Enter` in the input box to make sure the connection is working.
 4.  To configure WiFi, type the following commands one by one, replacing `<your-ssid>` and `<your-password>` with your actual WiFi network name and password. Press `Enter` after each command.
@@ -86,7 +97,7 @@ After flashing, you need to configure the device to connect to your WiFi network
     set-wifi-password <your-password>
     ```
 
-6.  After setting the SSID and password, you need to restart the ESP32-C6. You can do this by pressing the `RST` or `EN` button on the board, or by unplugging and plugging it back in.
+6.  After setting the SSID and password, you need to restart the ESP32. You can do this by pressing the `RST` or `EN` button on the board, or by unplugging and plugging it back in.
 7.  The device will now connect to your WiFi network. In the serial monitor, you should see a message indicating it has connected and received an IP address. Note down this IP address.
 
 ## Part 5: Usage

@@ -62,4 +62,4 @@ embedded-io = "0.6.1"
 embuild = "0.33"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(esp_idf_esp_https_server_enable)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(esp_idf_esp_https_server_enable)', 'cfg(esp32c6)', 'cfg(esp32s3)'] }

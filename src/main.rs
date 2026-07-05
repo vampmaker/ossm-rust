@@ -57,22 +57,50 @@ fn run_app() -> anyhow::Result<()> {
     let peripherals = Peripherals::take()?;
     let p = peripherals.pins;
 
-    // setup stdin, note that pins are consumed here
+    // setup stdin, note that USB serial pins are excluded from all_pins
+    #[cfg(esp32c6)]
     let all_pins = Arc::new(Mutex::new(vec![
         Some(p.gpio0.into()), Some(p.gpio1.into()), Some(p.gpio2.into()),
         Some(p.gpio3.into()), Some(p.gpio4.into()), Some(p.gpio5.into()),
         Some(p.gpio6.into()), Some(p.gpio7.into()), Some(p.gpio8.into()),
         Some(p.gpio9.into()), Some(p.gpio10.into()), Some(p.gpio11.into()),
-        None, None, Some(p.gpio14.into()), // 12, 13 used for stdin
+        None, None, Some(p.gpio14.into()), // 12, 13 used for USB serial
         Some(p.gpio15.into()), Some(p.gpio16.into()), Some(p.gpio17.into()),
         Some(p.gpio18.into()), Some(p.gpio19.into()), Some(p.gpio20.into()),
         Some(p.gpio21.into()), None, None, None, None, Some(p.gpio26.into()),
     ]));
 
+    #[cfg(esp32s3)]
+    let all_pins = Arc::new(Mutex::new(vec![
+        Some(p.gpio0.into()),  Some(p.gpio1.into()),  Some(p.gpio2.into()),
+        Some(p.gpio3.into()),  Some(p.gpio4.into()),  Some(p.gpio5.into()),
+        Some(p.gpio6.into()),  Some(p.gpio7.into()),  Some(p.gpio8.into()),
+        Some(p.gpio9.into()),  Some(p.gpio10.into()), Some(p.gpio11.into()),
+        Some(p.gpio12.into()), Some(p.gpio13.into()), Some(p.gpio14.into()),
+        Some(p.gpio15.into()), Some(p.gpio16.into()), Some(p.gpio17.into()),
+        Some(p.gpio18.into()), None, None,             // 19, 20 used for USB serial
+        Some(p.gpio21.into()), None, None, None, None, // 22-25 not exposed on most S3 modules
+        None, None, None, None, None, None, None,      // 26-32 SPI flash
+        Some(p.gpio33.into()), Some(p.gpio34.into()), Some(p.gpio35.into()),
+        Some(p.gpio36.into()), Some(p.gpio37.into()), Some(p.gpio38.into()),
+        Some(p.gpio39.into()), Some(p.gpio40.into()), Some(p.gpio41.into()),
+        Some(p.gpio42.into()), Some(p.gpio43.into()), Some(p.gpio44.into()),
+        Some(p.gpio45.into()), Some(p.gpio46.into()), Some(p.gpio47.into()),
+        Some(p.gpio48.into()),
+    ]));
+
+    #[cfg(esp32c6)]
     let usb_serial = usb_serial::UsbSerialDriver::new(
         peripherals.usb_serial,
         p.gpio12,
         p.gpio13,
+        &usb_serial::config::Config::default(),
+    )?;
+    #[cfg(esp32s3)]
+    let usb_serial = usb_serial::UsbSerialDriver::new(
+        peripherals.usb_serial,
+        p.gpio19,
+        p.gpio20,
         &usb_serial::config::Config::default(),
     )?;
     let _blocking_io = BlockingStdIo::usb_serial(usb_serial)?;
@@ -89,7 +117,7 @@ fn run_app() -> anyhow::Result<()> {
     // setup stdin command handler
     {
         let app_context = app_context.clone();
-        let builder = std::thread::Builder::new().name("stdin_command".to_string()).stack_size(8192);
+        let builder = std::thread::Builder::new().name("stdin_command".to_string()).stack_size(16384);
         builder.spawn(move || handle_stdin_command(app_context)).unwrap();
     }
 

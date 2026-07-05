@@ -1,4 +1,5 @@
-use std::io::{self, Read, Write as StdWrite};
+use std::io::{Read, Write as StdWrite};
+use std::os::fd::FromRawFd;
 
 use crate::context::AppContext;
 use crate::motion::MotorControllerConfig;
@@ -78,7 +79,9 @@ impl ErrorType for StdoutAdapter {
 
 impl EmbeddedWrite for StdoutAdapter {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        StdWrite::write(&mut self.0, buf)
+        let n = StdWrite::write(&mut self.0, buf)?;
+        StdWrite::flush(&mut self.0)?;
+        Ok(n)
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {
@@ -87,11 +90,10 @@ impl EmbeddedWrite for StdoutAdapter {
 }
 
 pub fn handle_stdin_command(app_context: AppContext) {
-    let stdin = io::stdin();
     let mut cli = CliBuilder::default()
         .writer(StdoutAdapter(std::io::stdout()))
-        .command_buffer([0u8; 256])
-        .history_buffer([0u8; 256])
+        .command_buffer([0u8; 512])
+        .history_buffer([0u8; 2048])
         .build()
         .unwrap();
     let mut processor = BaseCommand::processor(|_cli, command| {
@@ -99,28 +101,28 @@ pub fn handle_stdin_command(app_context: AppContext) {
         Ok(())
     });
     let mut buf = [0u8; 1];
-    let mut handle = stdin.lock();
+    let mut stdin = unsafe { std::fs::File::from_raw_fd(0) };
 
     loop {
-        match handle.read(&mut buf) {
-            Ok(0) => continue,
-            Ok(_) => {
-                if let Err(e) = cli.process_byte::<BaseCommand<'_>, _>(buf[0], &mut processor) {
+        match stdin.read(&mut buf) {
+            Ok(1) => {
+                let byte = if buf[0] == 0x7F { 0x08 } else { buf[0] };    // 0x7F is backspace, convert to 0x08 for embedded-cli
+                if let Err(e) = cli.process_byte::<BaseCommand<'_>, _>(byte, &mut processor) {
                     log::error!("CLI processing error: {:?}", e);
                 }
+                std::io::stdout().flush().unwrap();
+            }
+            Ok(_) => {
+                FreeRtos::delay_ms(10);
             }
             Err(e) => {
-                match e.kind() {
-                    std::io::ErrorKind::WouldBlock
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::Interrupted => {
-                        FreeRtos::delay_ms(10);
-                        continue;
-                    }
-                    _ => {
-                        log::info!("handle_uart_command: read from stdin failed: {e}");
-                        continue;
-                    }
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted
+                {
+                    FreeRtos::delay_ms(10);
+                } else {
+                    log::error!("stdin read error: {e}");
+                    FreeRtos::delay_ms(100);
                 }
             }
         }

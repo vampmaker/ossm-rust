@@ -65,10 +65,6 @@ function termLog(line: string) {
   xterm?.writeln(line)
 }
 
-function serialLog(line: string) {
-  serialXterm?.writeln(line)
-}
-
 onMounted(() => {
   const theme = {
     background: '#1a1a2e',
@@ -446,7 +442,10 @@ async function flash() {
   }
 }
 
-async function waitForBoot(reader: ReadableStreamDefaultReader<Uint8Array>, timeoutMs: number): Promise<boolean> {
+async function waitForBoot(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): Promise<boolean> {
   const decoder = new TextDecoder()
   let buffer = ''
   const deadline = Date.now() + timeoutMs
@@ -461,11 +460,7 @@ async function waitForBoot(reader: ReadableStreamDefaultReader<Uint8Array>, time
     if (result.value) {
       const text = decoder.decode(result.value, { stream: true })
       buffer += text
-      const lines = text.split('\n')
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (trimmed) serialLog(`\x1b[36m[device]\x1b[0m ${trimmed}`)
-      }
+      serialXterm?.write(text)
       if (buffer.includes('Hello, world!') || buffer.includes('ossm')) {
         termLog('\x1b[1;32mDevice boot detected.\x1b[0m')
         return true
@@ -473,7 +468,10 @@ async function waitForBoot(reader: ReadableStreamDefaultReader<Uint8Array>, time
     }
   }
   const tail = decoder.decode()
-  if (tail) serialXterm?.write(tail)
+  if (tail) {
+    buffer += tail
+    serialXterm?.write(tail)
+  }
   return false
 }
 
@@ -502,11 +500,7 @@ async function waitForAck(
       const text = decoder.decode(result.value, { stream: true })
       buffer += text
 
-      const lines = text.split('\n')
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (trimmed) serialLog(`\x1b[36m[device]\x1b[0m ${trimmed}`)
-      }
+      serialXterm?.write(text)
 
       if (expectedSubstrings.some((s) => buffer.includes(s))) {
         return true
@@ -538,34 +532,34 @@ async function sendConfig() {
     const commands: Array<{ cmd: string; ack: string[] }> = []
     if (wifiSsid.value) {
       commands.push({
-        cmd: `set_wifi_ssid ${wifiSsid.value}`,
+        cmd: `set-wifi-ssid ${wifiSsid.value}`,
         ack: ['SSID saved:'],
       })
     }
     if (wifiPassword.value) {
       commands.push({
-        cmd: `set_wifi_password ${wifiPassword.value}`,
+        cmd: `set-wifi-password ${wifiPassword.value}`,
         ack: ['Password saved:'],
       })
     }
     commands.push({
-      cmd: `set_pin_modbus_tx ${pinModbusTx.value}`,
+      cmd: `set-pin-modbus-tx ${pinModbusTx.value}`,
       ack: ['Modbus TX pin set to'],
     })
     commands.push({
-      cmd: `set_pin_modbus_rx ${pinModbusRx.value}`,
+      cmd: `set-pin-modbus-rx ${pinModbusRx.value}`,
       ack: ['Modbus RX pin set to'],
     })
     commands.push({
-      cmd: `set_pin_modbus_de_re ${pinModbusDeRe.value}`,
+      cmd: `set-pin-modbus-de-re ${pinModbusDeRe.value}`,
       ack: ['Modbus DE/RE pin set to'],
     })
 
     const encoder = new TextEncoder()
     for (const item of commands) {
       termLog(`\x1b[32m>\x1b[0m ${item.cmd}`)
-      await sessionWriter.write(encoder.encode(item.cmd + '\r\n'))
-      const acked = await waitForAck(sessionReader, item.ack, 5000)
+      await sessionWriter.write(encoder.encode(item.cmd + '\r'))
+      const acked = await waitForAck(sessionReader, item.ack, 10000)
       if (!acked) {
         throw new Error(`Timeout waiting for ACK: ${item.ack.join(' | ')}`)
       }
@@ -573,8 +567,8 @@ async function sendConfig() {
     }
 
     termLog('\x1b[32mConfiguration sent.\x1b[0m Resetting device to apply...')
-    await sessionWriter.write(encoder.encode('reset\r\n'))
-    const resetAcked = await waitForAck(sessionReader, ['Restarting device...'], 4000)
+    await sessionWriter.write(encoder.encode('reset\r'))
+    const resetAcked = await waitForAck(sessionReader, ['Restarting device...'], 8000)
     if (!resetAcked) {
       termLog('\x1b[33mReset ACK not seen; continuing with monitor attach.\x1b[0m')
     }

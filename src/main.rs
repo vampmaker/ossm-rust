@@ -89,7 +89,7 @@ fn run_app() -> anyhow::Result<()> {
     // setup stdin command handler
     {
         let app_context = app_context.clone();
-        let builder = std::thread::Builder::new().name("stdin_command".to_string()).stack_size(4096);
+        let builder = std::thread::Builder::new().name("stdin_command".to_string()).stack_size(8192);
         builder.spawn(move || handle_stdin_command(app_context)).unwrap();
     }
 
@@ -139,7 +139,7 @@ fn connect_wifi(
     };
     if let (Ok(saved_ssid), Ok(saved_password)) = (opt_ssid, opt_password) {
         if saved_ssid.is_empty() {
-            log::info!("SSID is empty. Please set it via UART command: set_ssid <your_ssid>");
+            log::info!("SSID is empty. Please set it via UART command: set-wifi-ssid <your_ssid> and set-wifi-password <your_password>");
         } else {
             let mut ssid = heapless::String::<32>::new();
             ssid.push_str(&saved_ssid)
@@ -170,7 +170,7 @@ fn connect_wifi(
             log::info!("WiFi connected.");
         }
     } else {
-        log::info!("WiFi SSID or password not set. Please set them via UART commands:\r\nset_ssid <your_ssid>\r\nset_password <your_password>");
+        log::info!("WiFi SSID or password not set. Please set them via UART commands:\r\nset-wifi-ssid <your_ssid>\r\nset-wifi-password <your_password>");
     }
     Ok(())
 }

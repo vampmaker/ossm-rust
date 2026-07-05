@@ -532,13 +532,13 @@ async function sendConfig() {
     const commands: Array<{ cmd: string; ack: string[] }> = []
     if (wifiSsid.value) {
       commands.push({
-        cmd: `set-wifi-ssid ${wifiSsid.value}`,
+        cmd: `set-wifi-ssid ${escapeCliArg(wifiSsid.value)}`,
         ack: ['SSID saved:'],
       })
     }
     if (wifiPassword.value) {
       commands.push({
-        cmd: `set-wifi-password ${wifiPassword.value}`,
+        cmd: `set-wifi-password ${escapeCliArg(wifiPassword.value)}`,
         ack: ['Password saved:'],
       })
     }
@@ -618,6 +618,11 @@ async function resetDevice() {
     errorMessage.value = err?.message || String(err)
     termLog(`\x1b[31mReset failed:\x1b[0m ${errorMessage.value}`)
   }
+}
+
+function escapeCliArg(value: string): string {
+  const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  return `"${escaped}"`
 }
 
 function sleep(ms: number) {

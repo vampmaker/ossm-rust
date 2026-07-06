@@ -142,11 +142,11 @@ pub fn handle_stdin_command(app_context: AppContext) {
 fn execute_command(command: BaseCommand<'_>, app_context: &AppContext) {
     match command {
         BaseCommand::SetWifiSsid { ssid } => {
-            app_context.storage_manager.lock().unwrap().set_ssid(&ssid).unwrap();
+            app_context.storage_manager.lock().unwrap().set_ssid(ssid).unwrap();
             log::info!("SSID saved: {}, restart to apply", ssid);
         }
         BaseCommand::SetWifiPassword { password } => {
-            app_context.storage_manager.lock().unwrap().set_password(&password).unwrap();
+            app_context.storage_manager.lock().unwrap().set_password(password).unwrap();
             log::info!("Password saved: {}, restart to apply", password);
         }
         BaseCommand::SetPinModbusTx { pin } => {
@@ -328,7 +328,7 @@ fn execute_command(command: BaseCommand<'_>, app_context: &AppContext) {
         }
         BaseCommand::SetSharpness { sharpness } => {
              let mut mc_opt = app_context.motor_controller.lock().unwrap();
-             if sharpness < 0.01 || sharpness >= 1.0 {
+             if !(0.01..1.0).contains(&sharpness) {
                 log::error!("Sharpness must be between 0.01 and 0.99");
                 return
              }

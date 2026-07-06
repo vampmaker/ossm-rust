@@ -5,11 +5,9 @@ use serde::{Serialize, Deserialize};
 use anyhow::Result;
 use heapless::spsc::{Queue, Producer, Consumer};
 
-use crate::motor::Motor;
-
 const SPLINE_RESOLUTION: usize = 1500;
 const COMMAND_QUEUE_SIZE: usize = 64;
-type CommandProducer = Producer<'static, MotionCommand, COMMAND_QUEUE_SIZE>;
+type CommandProducer = Producer<'static, MotionCommand>;
 
 // ===== Layer 1: Waveform Generator =====
 // Generates y ∈ [0, 1] given time, handles BPM internally
@@ -463,7 +461,7 @@ impl Trajectory {
 }
 
 struct StreamingMotionSource {
-    consumer: Consumer<'static, MotionCommand, COMMAND_QUEUE_SIZE>,
+    consumer: Consumer<'static, MotionCommand>,
     current_y: f32,
     current_speed: f32,
     max_speed: f32,
@@ -473,7 +471,7 @@ struct StreamingMotionSource {
 }
 
 impl StreamingMotionSource {
-    fn new(start_y: f32, consumer: Consumer<'static, MotionCommand, COMMAND_QUEUE_SIZE>) -> Self {
+    fn new(start_y: f32, consumer: Consumer<'static, MotionCommand>) -> Self {
         Self {
             consumer,
             current_y: start_y,
@@ -770,8 +768,7 @@ enum MotionMode {
     Streaming,
 }
 
-pub struct MotorController<'a> {
-    motor: Box<dyn Motor + Send + 'a>,
+pub struct MotorController {
     // Store concrete structs
     waveform_source: WaveformMotionSource,
     paused_source: PausedMotionSource,
@@ -792,8 +789,8 @@ pub struct MotorController<'a> {
     last_speed: f32,
 }
 
-impl<'a> MotorController<'a> {
-    pub fn new(motor: Box<dyn Motor + Send + 'a>, config: MotorControllerConfig) -> Self {
+impl MotorController {
+    pub fn new(config: MotorControllerConfig) -> Self {
         let generator = create_waveform_generator(&config);
         let waveform_source = WaveformMotionSource::new(generator, config.bpm);
         
@@ -825,7 +822,6 @@ impl<'a> MotorController<'a> {
         
         let now = time::Instant::now();
         Self {
-            motor,
             waveform_source,
             paused_source,
             streaming_source,
@@ -861,24 +857,15 @@ impl<'a> MotorController<'a> {
         }
     }
 
-    pub fn init_motor(&mut self) -> Result<(), anyhow::Error> {
-        self.motor.homing()?;
-        log::info!("Motor homed, pos_min: {}, pos_max: {}", self.motor.pos_min(), self.motor.pos_max());
-
+    // Sync internal state to the motor's homed range and current position.
+    // The actual homing and motor parameter setup happen in the (async) motor task,
+    // which then calls this to align the motion sources with the physical position.
+    pub fn sync_to_position(&mut self, pos_min: f32, pos_max: f32, position: f32) -> Result<(), anyhow::Error> {
         // Update position generator with actual range
-        self.position_gen = PositionGenerator::new(self.motor.pos_min(), self.motor.pos_max());
-
-        // set motor parameters
-        self.motor.set_max_power(0.6)?;
-        self.motor.set_acceleration(4000.0)?;
-        self.motor.set_position_ring_ratio(3000.0)?;
-        self.motor.set_speed_ring_ratio(3000.0)?;
+        self.position_gen = PositionGenerator::new(pos_min, pos_max);
 
         // pause the motor and set pause position to current position
-
-        // Read current motor position and sync source
-        let position = self.motor.read_position()?;
-        let pos_normalized = (position - self.motor.pos_min()) / (self.motor.pos_max() - self.motor.pos_min());
+        let pos_normalized = (position - pos_min) / (pos_max - pos_min);
         
         // Try to unshape the current position to get the waveform y
         match self.shaper.unshape(pos_normalized) {
@@ -1032,7 +1019,10 @@ impl<'a> MotorController<'a> {
         }
     }
 
-    pub fn cycle(&mut self) -> Result<(), anyhow::Error> {
+    // Pure computation step: advances motion state and returns the (position, speed)
+    // that should be written to the motor. The caller (motor task) performs the
+    // actual (async) motor I/O, so this can be called under a briefly-held mutex.
+    pub fn compute_cycle(&mut self) -> (f32, f32) {
         let now = time::Instant::now();
         let dt = now.duration_since(self.last_cycle).as_secs_f32();
         self.last_cycle = now;
@@ -1045,13 +1035,8 @@ impl<'a> MotorController<'a> {
         // Layer 2: Apply shaping (with smooth transitions)
         let (shaped_y, shaped_speed) = self.shaper.shape(y_wave, speed_wave, dt);
         
-        // Layer 3: Convert to position and write
-        let (position, speed) = self.position_gen.generate(shaped_y, shaped_speed);
-        self.motor.write_position(position, speed)?;
-
-        self.motor.cycle()?;
-        
-        Ok(())
+        // Layer 3: Convert to position
+        self.position_gen.generate(shaped_y, shaped_speed)
     }
 }
 

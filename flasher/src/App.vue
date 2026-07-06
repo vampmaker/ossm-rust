@@ -38,6 +38,7 @@ const DEFAULT_DEVICE_CONFIG = {
   pinModbusDeRe: 20,
   modbusTimeoutMs: 0,
   modbusScanDelayUs: 0,
+  flashAddress: '0x0',
 } as const
 
 function applyDeviceConfig(config: Partial<typeof DEFAULT_DEVICE_CONFIG>) {
@@ -48,6 +49,7 @@ function applyDeviceConfig(config: Partial<typeof DEFAULT_DEVICE_CONFIG>) {
   pinModbusDeRe.value = config.pinModbusDeRe ?? DEFAULT_DEVICE_CONFIG.pinModbusDeRe
   modbusTimeoutMs.value = config.modbusTimeoutMs ?? DEFAULT_DEVICE_CONFIG.modbusTimeoutMs
   modbusScanDelayUs.value = config.modbusScanDelayUs ?? DEFAULT_DEVICE_CONFIG.modbusScanDelayUs
+  flashAddress.value = config.flashAddress ?? DEFAULT_DEVICE_CONFIG.flashAddress
 }
 
 function loadDeviceConfig() {
@@ -73,6 +75,7 @@ function persistDeviceConfig() {
       pinModbusDeRe: pinModbusDeRe.value,
       modbusTimeoutMs: modbusTimeoutMs.value,
       modbusScanDelayUs: modbusScanDelayUs.value,
+      flashAddress: flashAddress.value,
     }
     localStorage.setItem(DEVICE_CONFIG_STORAGE_KEY, JSON.stringify(payload))
   } catch (err) {
@@ -189,7 +192,7 @@ onMounted(() => {
 })
 
 watch(
-  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusScanDelayUs],
+  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusScanDelayUs, flashAddress],
   () => {
     persistDeviceConfig()
   },
@@ -847,7 +850,7 @@ const statusColor = computed(() => {
         <button
           @click="flash"
           :disabled="!canFlash"
-          class="w-full py-2.5 bg-green-600 hover:bg-green-700 text-white disabled:bg-gray-300 disabled:text-gray-500 rounded font-semibold transition-colors"
+          class="w-full py-2.5 bg-green-600 hover:bg-green-700 text-white disabled:bg-gray-300 disabled:text-gray-500 rounded font-medium transition-colors"
         >
           {{ status === 'flashing' ? `Flashing... ${flashProgress}%` : 'Flash Firmware' }}
         </button>
@@ -979,13 +982,13 @@ const statusColor = computed(() => {
           <button
             @click="sendConfig"
             :disabled="!canConfigure"
-            class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white disabled:bg-gray-300 disabled:text-gray-500 rounded font-semibold transition-colors"
+            class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white disabled:bg-gray-300 disabled:text-gray-500 rounded font-medium transition-colors"
           >
             {{ status === 'configuring' ? 'Sending...' : 'Send Configuration' }}
           </button>
           <button
             @click="resetDeviceConfig"
-            class="w-full py-2.5 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded font-semibold transition-colors"
+            class="w-full py-2.5 bg-orange-500 hover:bg-orange-600 text-white rounded font-medium transition-colors"
           >
             Reset to defaults
           </button>

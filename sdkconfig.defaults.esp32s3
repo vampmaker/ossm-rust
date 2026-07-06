@@ -7,4 +7,8 @@
 CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=5
 
 # Xtensa register-window ABI uses more stack per call frame than RISC-V.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=40960
+
+# Catch stack overflows with a watchpoint at end-of-stack instead of a
+# corrupted-backtrace InstrFetchProhibited crash.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y

@@ -2,35 +2,40 @@
 use std::sync::{Arc, Mutex};
 use std::time;
 
-use esp_idf_svc::hal::delay::FreeRtos;
+use embassy_executor::Executor;
+use embassy_time::Timer;
+use static_cell::StaticCell;
+
 use esp_idf_svc::hal::gpio::{AnyInputPin, AnyIOPin, AnyOutputPin};
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::hal::prelude::*;
+use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::hal::uart;
 use esp_idf_svc::hal::uart::UART1;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::io::vfs::MountedEventfs;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
+use esp_idf_svc::timer::EspTaskTimerService;
+use esp_idf_svc::wifi::{AsyncWifi, AuthMethod, ClientConfiguration, Configuration, EspWifi};
 use esp_idf_svc::io::vfs::BlockingStdIo;
 use esp_idf_svc::hal::usb_serial;
-use esp_idf_svc::http::server::{EspHttpServer, Configuration as HttpdConfiguration};
 mod command;
 mod context;
 mod http_api;
 mod motion;
 mod motor;
 mod motor_57aim30;
-mod motor_pwm;
 mod storage;
 
 use command::handle_stdin_command;
 use context::AppContext;
 use motion::{MotorController, MotorControllerConfig};
+use motor::Motor;
 use motor_57aim30::{Modbus57AIM30Motor, ModbusRTUMaster};
 
 
 const TARGET_BAUD_RATE: u32 = 115200;
 
+static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 fn main() {
     // It is necessary to call this function once. Otherwise, some patches to the runtime
@@ -46,7 +51,7 @@ fn main() {
         log::error!("App error: {}", e);
         loop {
             log::info!("System halted. Restarting in 10 seconds...");
-            FreeRtos::delay_ms(10000);
+            std::thread::sleep(time::Duration::from_secs(10));
         }
     }
 }
@@ -56,6 +61,10 @@ fn run_app() -> anyhow::Result<()> {
     let nvs = EspDefaultNvsPartition::take()?;
     let peripherals = Peripherals::take()?;
     let p = peripherals.pins;
+
+    // eventfd VFS is required by async-io (used by the edge-http server sockets)
+    let eventfs = MountedEventfs::mount(5)?;
+    std::mem::forget(eventfs);
 
     // setup stdin, note that USB serial pins are excluded from all_pins
     #[cfg(esp32c6)]
@@ -103,7 +112,8 @@ fn run_app() -> anyhow::Result<()> {
         p.gpio20,
         &usb_serial::config::Config::default(),
     )?;
-    let _blocking_io = BlockingStdIo::usb_serial(usb_serial)?;
+    let blocking_io = BlockingStdIo::usb_serial(usb_serial)?;
+    std::mem::forget(blocking_io);
 
     // setup storage manager
     let storage_manager = Arc::new(Mutex::new(Box::new(storage::StorageManager::new(nvs))));
@@ -121,44 +131,65 @@ fn run_app() -> anyhow::Result<()> {
         builder.spawn(move || handle_stdin_command(app_context)).unwrap();
     }
 
-    // setup wifi
-    let mut wifi = EspWifi::new(
+    let wifi = EspWifi::new(
         peripherals.modem,
         sysloop.clone(),
         None,
     )?;
-    if let Err(e) = connect_wifi(&mut wifi, storage_manager.clone()) {
+    let wifi = AsyncWifi::wrap(wifi, sysloop, EspTaskTimerService::new()?)?;
+
+    // Run the Embassy executor on the main thread; it drives the network task
+    // (WiFi + async HTTP server) and the motor task cooperatively.
+    let executor = EXECUTOR.init(Executor::new());
+    executor.run(|spawner| {
+        spawner.spawn(net_task(wifi, app_context.clone()).unwrap());
+        spawner.spawn(motor_task(app_context, peripherals.uart1).unwrap());
+    })
+}
+
+#[embassy_executor::task]
+async fn net_task(mut wifi: AsyncWifi<EspWifi<'static>>, app_context: AppContext) {
+    if let Err(e) = connect_wifi(&mut wifi, app_context.storage_manager.clone()).await {
         log::error!("Failed to connect to wifi: {}", e);
     }
 
-    // setup http api
-    let httpd_config =
-    {
-        let mut httpd_config = HttpdConfiguration::default();
-        httpd_config.max_open_sockets = 7;
-        #[cfg(esp_idf_esp_https_server_enable)]
-        {
-            httpd_config.server_certificate = Some(esp_idf_svc::tls::X509::pem_until_nul(include_bytes!("../servercert.pem")));
-            httpd_config.private_key = Some(esp_idf_svc::tls::X509::pem_until_nul(include_bytes!("../prvtkey.pem")));
-        }
-        httpd_config
-    };
-    let mut server = EspHttpServer::new(&httpd_config)?;
-    http_api::register_handlers(&mut server, app_context.clone());
+    // Run the HTTP server on a dedicated thread with a heap-allocated stack.
+    // The edge-http server future is ~29KB and its poll chain is deep, far too
+    // big for the main task stack shared with the Embassy executor. See the
+    // comment in http_api::run_server for why the future itself is boxed
+    // rather than kept on this stack.
+    let builder = std::thread::Builder::new()
+        .name("http_server".to_string())
+        .stack_size(65536);
+    builder
+        .spawn(move || loop {
+            if let Err(e) =
+                esp_idf_svc::hal::task::block_on(http_api::run_server(app_context.clone()))
+            {
+                log::error!("HTTP server error: {}", e);
+            }
+            std::thread::sleep(time::Duration::from_millis(1000));
+        })
+        .unwrap();
 
-    if let Err(e) = run_motor(app_context, peripherals.uart1) {
-        log::error!("Motor task failed: {}", e);
-    }
-
-    // motor init/loop returned, linger here to keep command interface running
-    log::info!("Motor task has returned, lingering to keep command interface running");
+    // Keep wifi alive for the lifetime of the program.
     loop {
-        FreeRtos::delay_ms(1000);
+        Timer::after_millis(60_000).await;
     }
 }
 
-fn connect_wifi(
-    wifi: &mut EspWifi,
+#[embassy_executor::task]
+async fn motor_task(app_context: AppContext, uart_peripheral: UART1<'static>) {
+    if let Err(e) = run_motor(app_context, uart_peripheral).await {
+        log::error!("Motor task failed: {}", e);
+    }
+    // motor init/loop returned; the executor keeps running the other tasks
+    // (HTTP + CLI) so the user can reconfigure pins and restart.
+    log::info!("Motor task has returned, command interface remains available");
+}
+
+async fn connect_wifi(
+    wifi: &mut AsyncWifi<EspWifi<'static>>,
     storage_manager: Arc<Mutex<Box<storage::StorageManager>>>,
 ) -> anyhow::Result<()> {
     let (opt_ssid, opt_password) = {
@@ -185,16 +216,14 @@ fn connect_wifi(
             });
             wifi.set_configuration(&wifi_configuration)?;
 
-            wifi.start()?;
-            wifi.connect()?;
+            wifi.start().await?;
             log::info!(
                 "WiFi connecting, SSID: {}, Password: {}",
                 saved_ssid,
                 saved_password
             );
-            while !wifi.is_up()? {
-                FreeRtos::delay_ms(1);
-            }
+            wifi.connect().await?;
+            wifi.wait_netif_up().await?;
             log::info!("WiFi connected.");
         }
     } else {
@@ -203,197 +232,215 @@ fn connect_wifi(
     Ok(())
 }
 
-fn run_motor(app_context: AppContext, uart_peripheral: UART1) -> anyhow::Result<()> {
-    let motor_controller_result = (|| -> anyhow::Result<MotorController<'static>> {
-        let uart: uart::UartDriver = {
-            let pin_config = app_context.storage_manager.lock().unwrap().get_pin_configuration().unwrap_or_default();
-    
-            let config = uart::config::Config::default()
-                .baudrate(Hertz(TARGET_BAUD_RATE))
-                .mode(uart::config::Mode::RS485HalfDuplex);
-    
-            let mut all_pins = app_context.all_pins.lock().unwrap();
-            let tx_pin_num = pin_config.modbus_tx as usize;
-            let rx_pin_num = pin_config.modbus_rx as usize;
-            let rts_pin_num = pin_config.modbus_de_re as usize;
-    
-            let tx = all_pins.get_mut(tx_pin_num).and_then(|p| p.take());
-            let rx = all_pins.get_mut(rx_pin_num).and_then(|p| p.take());
-            let rts = all_pins.get_mut(rts_pin_num).and_then(|p| p.take());
-    
-            match (tx, rx, rts) {
-                (Some(tx), Some(rx), Some(rts)) => {
-                    log::info!("Using configured pins for UART: tx={}, rx={}, rts={}", tx_pin_num, rx_pin_num, rts_pin_num);
-                    uart::UartDriver::new(
-                        uart_peripheral,
-                        <AnyIOPin as Into<AnyOutputPin>>::into(tx),
-                        <AnyIOPin as Into<AnyInputPin>>::into(rx),
-                        Option::<AnyIOPin>::None,
-                        Some(<AnyIOPin as Into<AnyOutputPin>>::into(rts)),
-                        &config,
-                    )?
-                }
-                _ => {
-                    log::warn!("Failed to get configured pins, searching for available pins.");
-    
-                    let mut tx_pin_num = 0;
-                    let mut rx_pin_num = 0;
-                    let mut rts_pin_num = 0;
-    
-                    let tx = all_pins.iter_mut().enumerate().find_map(|(i, p)| if p.is_some() { tx_pin_num = i; p.take() } else { None });
-                    let rx = all_pins.iter_mut().enumerate().find_map(|(i, p)| if p.is_some() { rx_pin_num = i; p.take() } else { None });
-                    let rts = all_pins.iter_mut().enumerate().find_map(|(i, p)| if p.is_some() { rts_pin_num = i; p.take() } else { None });
-    
-                    if tx.is_none() || rx.is_none() || rts.is_none() {
-                        anyhow::bail!("Not enough available pins for UART.");
-                    }
-    
-                    log::info!("Found available pins for UART: tx={}, rx={}, rts={}", tx_pin_num, rx_pin_num, rts_pin_num);
-    
-                    let new_pin_config = storage::PinConfiguration {
-                        modbus_tx: tx_pin_num as u32,
-                        modbus_rx: rx_pin_num as u32,
-                        modbus_de_re: rts_pin_num as u32,
-                        ..Default::default()
-                    };
-                    app_context.storage_manager.lock().unwrap().set_pin_configuration(&new_pin_config)?;
-                    log::info!("Saved new pin configuration to NVS.");
-    
-                    let tx: AnyOutputPin = tx.unwrap().into();
-                    let rx: AnyInputPin = rx.unwrap().into();
-                    let rts: AnyOutputPin = rts.unwrap().into();
-    
-                    uart::UartDriver::new(
-                        uart_peripheral,
-                        tx,
-                        rx,
-                        Option::<AnyIOPin>::None,
-                        Some(rts),
-                        &config,
-                    )?
-                }
-            }
-        };
-
+async fn run_motor(app_context: AppContext, uart_peripheral: UART1<'static>) -> anyhow::Result<()> {
+    let uart: uart::AsyncUartDriver<uart::UartDriver> = {
         let pin_config = app_context.storage_manager.lock().unwrap().get_pin_configuration().unwrap_or_default();
-        let modbus = ModbusRTUMaster::new(uart, Option::<AnyOutputPin>::None, 1, pin_config.modbus_timeout_ms);
 
-        let mut motor = Modbus57AIM30Motor::new(modbus, pin_config.modbus_scan_delay_us);
+        let config = uart::config::Config::default()
+            .baudrate(Hertz(TARGET_BAUD_RATE))
+            .mode(uart::config::Mode::RS485HalfDuplex);
 
-        let mut modbus_ok = false;
-        for init_attempt in 1..=2 {
-            if init_attempt > 1 {
-                log::info!("Retrying motor initialization (attempt {}/2)...", init_attempt);
-                FreeRtos::delay_ms(1000);
+        let mut all_pins = app_context.all_pins.lock().unwrap();
+        let tx_pin_num = pin_config.modbus_tx as usize;
+        let rx_pin_num = pin_config.modbus_rx as usize;
+        let rts_pin_num = pin_config.modbus_de_re as usize;
+
+        let tx = all_pins.get_mut(tx_pin_num).and_then(|p| p.take());
+        let rx = all_pins.get_mut(rx_pin_num).and_then(|p| p.take());
+        let rts = all_pins.get_mut(rts_pin_num).and_then(|p| p.take());
+
+        match (tx, rx, rts) {
+            (Some(tx), Some(rx), Some(rts)) => {
+                log::info!("Using configured pins for UART: tx={}, rx={}, rts={}", tx_pin_num, rx_pin_num, rts_pin_num);
+                uart::AsyncUartDriver::new(
+                    uart_peripheral,
+                    <AnyIOPin as Into<AnyOutputPin>>::into(tx),
+                    <AnyIOPin as Into<AnyInputPin>>::into(rx),
+                    Option::<AnyIOPin>::None,
+                    Some(<AnyIOPin as Into<AnyOutputPin>>::into(rts)),
+                    &config,
+                )?
             }
-            match motor.enable_modbus_communication() {
-                Ok(()) => { modbus_ok = true; break; }
-                Err(e) => {
-                    log::info!("Failed to enable modbus (attempt {}/2), trying to scan and configure: {}", init_attempt, e);
-                    let mut scan_result = Err(anyhow::anyhow!("scan not attempted"));
-                    for attempt in 1..=3 {
-                        match motor.modbus_scan() {
-                            Ok(result) => { scan_result = Ok(result); break; }
-                            Err(e) => {
-                                log::warn!("Scan attempt {}/3 failed: {}", attempt, e);
-                                scan_result = Err(e);
-                            }
-                        }
-                    }
-                    match scan_result {
-                        Ok(motor_scan_result) => {
-                            log::info!("Motor device found, baud rate: {}, device id: {}", motor_scan_result.baud_rate, motor_scan_result.device_id);
-                            if motor_scan_result.baud_rate != TARGET_BAUD_RATE {
-                                motor.modbus_set_baud_rate(TARGET_BAUD_RATE).map_err(|e| anyhow::anyhow!("Failed to set baud rate to {}: {:?}", TARGET_BAUD_RATE, e))?;
-                                log::info!("Motor baud rate set to {}, please power cycle the motor.", TARGET_BAUD_RATE);
-                            }
-                            modbus_ok = true;
-                            break;
-                        }
+            _ => {
+                log::warn!("Failed to get configured pins, searching for available pins.");
+
+                let mut tx_pin_num = 0;
+                let mut rx_pin_num = 0;
+                let mut rts_pin_num = 0;
+
+                let tx = all_pins.iter_mut().enumerate().find_map(|(i, p)| if p.is_some() { tx_pin_num = i; p.take() } else { None });
+                let rx = all_pins.iter_mut().enumerate().find_map(|(i, p)| if p.is_some() { rx_pin_num = i; p.take() } else { None });
+                let rts = all_pins.iter_mut().enumerate().find_map(|(i, p)| if p.is_some() { rts_pin_num = i; p.take() } else { None });
+
+                if tx.is_none() || rx.is_none() || rts.is_none() {
+                    anyhow::bail!("Not enough available pins for UART.");
+                }
+
+                log::info!("Found available pins for UART: tx={}, rx={}, rts={}", tx_pin_num, rx_pin_num, rts_pin_num);
+
+                let new_pin_config = storage::PinConfiguration {
+                    modbus_tx: tx_pin_num as u32,
+                    modbus_rx: rx_pin_num as u32,
+                    modbus_de_re: rts_pin_num as u32,
+                    ..Default::default()
+                };
+                app_context.storage_manager.lock().unwrap().set_pin_configuration(&new_pin_config)?;
+                log::info!("Saved new pin configuration to NVS.");
+
+                let tx: AnyOutputPin = tx.unwrap().into();
+                let rx: AnyInputPin = rx.unwrap().into();
+                let rts: AnyOutputPin = rts.unwrap().into();
+
+                uart::AsyncUartDriver::new(
+                    uart_peripheral,
+                    tx,
+                    rx,
+                    Option::<AnyIOPin>::None,
+                    Some(rts),
+                    &config,
+                )?
+            }
+        }
+    };
+
+    let pin_config = app_context.storage_manager.lock().unwrap().get_pin_configuration().unwrap_or_default();
+    let modbus = ModbusRTUMaster::new(uart, Option::<AnyOutputPin>::None, 1, pin_config.modbus_timeout_ms);
+
+    let mut motor = Modbus57AIM30Motor::new(modbus, pin_config.modbus_scan_delay_us);
+
+    let mut modbus_ok = false;
+    for init_attempt in 1..=2 {
+        if init_attempt > 1 {
+            log::info!("Retrying motor initialization (attempt {}/2)...", init_attempt);
+            Timer::after_millis(1000).await;
+        }
+        match motor.enable_modbus_communication().await {
+            Ok(()) => { modbus_ok = true; break; }
+            Err(e) => {
+                log::info!("Failed to enable modbus (attempt {}/2), trying to scan and configure: {}", init_attempt, e);
+                let mut scan_result = Err(anyhow::anyhow!("scan not attempted"));
+                for attempt in 1..=3 {
+                    match motor.modbus_scan().await {
+                        Ok(result) => { scan_result = Ok(result); break; }
                         Err(e) => {
-                            log::error!("Motor init attempt {}/2: scan failed: {}", init_attempt, e);
+                            log::warn!("Scan attempt {}/3 failed: {}", attempt, e);
+                            scan_result = Err(e);
                         }
                     }
                 }
-            }
-        }
-        if !modbus_ok {
-            anyhow::bail!("Failed to establish modbus communication after retries. Please check connection to the motor.");
-        }
-        motor.enable_modbus_communication().map_err(|e| anyhow::anyhow!("Failed to enable modbus communication: {:?}", e))?;
-
-        let motor_config = {
-            let sm = app_context.storage_manager.lock().unwrap();
-            sm.get_motor_config()
-        };
-
-        let motor_config = match motor_config {
-            Ok(config) => {
-                log::info!("Loaded motor config from NVS");
-                config
-            }
-            Err(_) => {
-                log::info!("No motor config found in NVS, using default");
-                let default_config = MotorControllerConfig::default();
-                app_context.storage_manager.lock().unwrap().set_motor_config(&default_config)?;
-                default_config
-            }
-        };
-
-        let mut motor_controller = MotorController::new(Box::new(motor), motor_config);
-        motor_controller.init_motor().map_err(|e| anyhow::anyhow!("Failed to init motor: {:?}", e))?;
-        Ok(motor_controller)
-    })();
-
-    match motor_controller_result {
-        Ok(mc) => {
-            log::info!("Motor initialized, starting motor loop");
-            *app_context.motor_controller.lock().unwrap() = Some(Box::new(mc));
-
-            let mut last_config_check = time::Instant::now();
-            let mut last_saved_config_version = app_context.motor_controller.lock().unwrap().as_ref().map_or(0, |mc| mc.get_config_version());
-
-            let mut update_counter = 0;
-            let mut last_update_counter_reset = time::Instant::now();
-
-            loop {
-                {
-                    let mut motor_controller_lock = app_context.motor_controller.lock().unwrap();
-                    if let Some(controller) = motor_controller_lock.as_mut() {
-                        if last_config_check.elapsed() > time::Duration::from_millis(200) {
-                            last_config_check = time::Instant::now();
-                            let current_version = controller.get_config_version();
-                            if current_version != last_saved_config_version {
-                                let config = controller.get_config();
-                                log::info!("Config updated, saving to NVS");
-                                if let Err(e) = app_context.storage_manager.lock().unwrap().set_motor_config(&config) {
-                                    log::error!("Failed to save motor config: {}", e);
-                                } else {
-                                    last_saved_config_version = current_version;
-                                }
-                            }
+                match scan_result {
+                    Ok(motor_scan_result) => {
+                        log::info!("Motor device found, baud rate: {}, device id: {}", motor_scan_result.baud_rate, motor_scan_result.device_id);
+                        if motor_scan_result.baud_rate != TARGET_BAUD_RATE {
+                            motor.modbus_set_baud_rate(TARGET_BAUD_RATE).await.map_err(|e| anyhow::anyhow!("Failed to set baud rate to {}: {:?}", TARGET_BAUD_RATE, e))?;
+                            log::info!("Motor baud rate set to {}, please power cycle the motor.", TARGET_BAUD_RATE);
                         }
-            
-                        if let Err(e) = controller.cycle() {
-                            log::error!("Failed to cycle: {}", e);
-                        }
-                    } else {
-                        log::error!("Motor controller lost, stopping motor loop");
+                        modbus_ok = true;
                         break;
                     }
-                }
-        
-                update_counter += 1;
-                if last_update_counter_reset.elapsed() > time::Duration::from_secs(60) {
-                    log::info!("Motor task update per second: {}", update_counter as f64 / 60.0);
-                    last_update_counter_reset = time::Instant::now();
-                    update_counter = 0;
+                    Err(e) => {
+                        log::error!("Motor init attempt {}/2: scan failed: {}", init_attempt, e);
+                    }
                 }
             }
-        },
-        Err(e) => {
-            log::error!("Failed to initialize motor: {}. Motor task will not run.", e);
-            return Err(e);
+        }
+    }
+    if !modbus_ok {
+        anyhow::bail!("Failed to establish modbus communication after retries. Please check connection to the motor.");
+    }
+    motor.enable_modbus_communication().await.map_err(|e| anyhow::anyhow!("Failed to enable modbus communication: {:?}", e))?;
+
+    let motor_config = {
+        let sm = app_context.storage_manager.lock().unwrap();
+        sm.get_motor_config()
+    };
+
+    let motor_config = match motor_config {
+        Ok(config) => {
+            log::info!("Loaded motor config from NVS");
+            config
+        }
+        Err(_) => {
+            log::info!("No motor config found in NVS, using default");
+            let default_config = MotorControllerConfig::default();
+            app_context.storage_manager.lock().unwrap().set_motor_config(&default_config)?;
+            default_config
+        }
+    };
+
+    // Home the motor and set its parameters (the async I/O half of initialization)
+    motor.homing().await.map_err(|e| anyhow::anyhow!("Failed to home motor: {:?}", e))?;
+    log::info!("Motor homed, pos_min: {}, pos_max: {}", motor.pos_min(), motor.pos_max());
+
+    motor.set_max_power(0.6).await?;
+    motor.set_acceleration(4000.0).await?;
+    motor.set_position_ring_ratio(3000.0).await?;
+    motor.set_speed_ring_ratio(3000.0).await?;
+
+    let current_position = motor.read_position().await?;
+
+    // Create the controller (pure state/math) and sync it to the motor position
+    let mut motor_controller = MotorController::new(motor_config);
+    motor_controller
+        .sync_to_position(motor.pos_min(), motor.pos_max(), current_position)
+        .map_err(|e| anyhow::anyhow!("Failed to sync motor controller: {:?}", e))?;
+
+    log::info!("Motor initialized, starting motor loop");
+    *app_context.motor_controller.lock().unwrap() = Some(Box::new(motor_controller));
+
+    let mut last_config_check = time::Instant::now();
+    let mut last_saved_config_version = app_context.motor_controller.lock().unwrap().as_ref().map_or(0, |mc| mc.get_config_version());
+
+    let mut update_counter = 0;
+    let mut last_update_counter_reset = time::Instant::now();
+
+    loop {
+        // Compute the next position under a briefly-held lock (no I/O inside)
+        let target = {
+            let mut motor_controller_lock = app_context.motor_controller.lock().unwrap();
+            if let Some(controller) = motor_controller_lock.as_mut() {
+                if last_config_check.elapsed() > time::Duration::from_millis(200) {
+                    last_config_check = time::Instant::now();
+                    let current_version = controller.get_config_version();
+                    if current_version != last_saved_config_version {
+                        let config = controller.get_config();
+                        log::info!("Config updated, saving to NVS");
+                        if let Err(e) = app_context.storage_manager.lock().unwrap().set_motor_config(&config) {
+                            log::error!("Failed to save motor config: {}", e);
+                        } else {
+                            last_saved_config_version = current_version;
+                        }
+                    }
+                }
+
+                Some(controller.compute_cycle())
+            } else {
+                None
+            }
+        };
+
+        // Perform the motor I/O outside the lock; awaiting here yields to the
+        // HTTP server and other tasks.
+        match target {
+            Some((position, speed)) => {
+                if let Err(e) = motor.write_position(position, speed).await {
+                    log::error!("Failed to write motor position: {}", e);
+                }
+                if let Err(e) = motor.cycle().await {
+                    log::error!("Failed to cycle: {}", e);
+                }
+            }
+            None => {
+                log::error!("Motor controller lost, stopping motor loop");
+                break;
+            }
+        }
+
+        update_counter += 1;
+        if last_update_counter_reset.elapsed() > time::Duration::from_secs(60) {
+            log::info!("Motor task update per second: {}", update_counter as f64 / 60.0);
+            last_update_counter_reset = time::Instant::now();
+            update_counter = 0;
         }
     }
     Ok(())

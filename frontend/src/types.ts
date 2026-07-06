@@ -1,4 +1,5 @@
 export type WaveFunc = 'sine' | 'thrust' | 'spline'
+export type PauseMode = 'fixed-position' | 'in-place'
 
 export interface MotorControllerConfig {
   bpm: number
@@ -26,4 +27,12 @@ export interface MotorState {
   shaped_y: number
   position: number
   speed: number
+}
+
+export interface PinConfiguration {
+  modbus_tx: number
+  modbus_rx: number
+  modbus_de_re: number
+  modbus_timeout_ms: number
+  modbus_scan_delay_us: number
 }

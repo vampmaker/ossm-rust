@@ -1,4 +1,4 @@
-import type { MotorControllerConfig, PausedControlPayload, MotorState } from './types'
+import type { MotorControllerConfig, PausedControlPayload, MotorState, PinConfiguration } from './types'
 
 const api_base = window.location.hostname === 'localhost' ? 'http://ossm.lan' : document.location.href;
 
@@ -24,6 +24,15 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
   return await response.json()
 }
 
+async function postNoContent(path: string): Promise<void> {
+  const response = await fetch(new URL(path, api_base).toString(), {
+    method: 'POST',
+  })
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+}
+
 export async function getConfig(): Promise<MotorControllerConfig> {
   return getJson<MotorControllerConfig>('/config')
 }
@@ -38,4 +47,16 @@ export async function setPaused(payload: PausedControlPayload): Promise<MotorCon
 
 export async function getState(): Promise<MotorState> {
   return getJson<MotorState>('/state')
+}
+
+export async function getPinConfig(): Promise<PinConfiguration> {
+  return getJson<PinConfiguration>('/pin-config')
+}
+
+export async function setPinConfig(config: PinConfiguration): Promise<PinConfiguration> {
+  return postJson<PinConfiguration>('/pin-config', config)
+}
+
+export async function restartDevice(): Promise<void> {
+  await postNoContent('/restart')
 }

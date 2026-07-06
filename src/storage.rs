@@ -13,6 +13,10 @@ pub struct PinConfiguration {
     pub modbus_tx: u32,
     pub modbus_rx: u32,
     pub modbus_de_re: u32,
+    #[serde(default)]
+    pub modbus_timeout_ms: u32,
+    #[serde(default)]
+    pub modbus_scan_delay_us: u32,
 }
 
 impl Default for PinConfiguration {
@@ -21,6 +25,8 @@ impl Default for PinConfiguration {
             modbus_tx: 18,
             modbus_rx: 19,
             modbus_de_re: 20,
+            modbus_timeout_ms: 0,
+            modbus_scan_delay_us: 0,
         }
     }
 }

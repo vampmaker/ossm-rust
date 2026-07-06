@@ -1,10 +1,12 @@
 use esp_idf_svc::http::server::{EspHttpServer, Method};
 use serde::{Deserialize, Serialize};
 use crate::motion::MotorControllerConfig;
+use crate::storage::PinConfiguration;
 use esp_idf_svc::io::{Read, Write};
 use crate::context::AppContext;
 use esp_idf_svc::sys::EspError;
 use crate::motion::MotionCommand;
+use esp_idf_svc::hal::delay::FreeRtos;
 
 #[derive(Serialize, Deserialize)]
 pub struct PausedControl {
@@ -74,6 +76,24 @@ pub fn register_handlers<'a>(
             req.into_response(200, Some("OK"), &[
                 ("Access-Control-Allow-Origin", "*"),
                 ("Access-Control-Allow-Methods", "GET, OPTIONS"),
+                ("Access-Control-Allow-Headers", "*"),
+            ])?
+                .write_all(&[])?;
+            Ok(())
+        }).unwrap();
+        server.fn_handler::<anyhow::Error, _>("/pin-config", Method::Options, |req| {
+            req.into_response(200, Some("OK"), &[
+                ("Access-Control-Allow-Origin", "*"),
+                ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+                ("Access-Control-Allow-Headers", "*"),
+            ])?
+                .write_all(&[])?;
+            Ok(())
+        }).unwrap();
+        server.fn_handler::<anyhow::Error, _>("/restart", Method::Options, |req| {
+            req.into_response(200, Some("OK"), &[
+                ("Access-Control-Allow-Origin", "*"),
+                ("Access-Control-Allow-Methods", "POST, OPTIONS"),
                 ("Access-Control-Allow-Headers", "*"),
             ])?
                 .write_all(&[])?;
@@ -158,6 +178,59 @@ pub fn register_handlers<'a>(
                         .write_all("Bad Request".as_bytes())?;
                 }
             }
+            Ok(())
+        }).unwrap();
+    }
+
+    {
+        let storage = app_context.storage_manager.clone();
+        server.fn_handler::<anyhow::Error, _>("/pin-config", Method::Get, move |req| {
+            let config = storage.lock().unwrap().get_pin_configuration().unwrap_or_default();
+            let json = serde_json::to_string(&config).unwrap();
+            req.into_response(200, Some("OK"), &[("Access-Control-Allow-Origin", "*")])?
+                .write_all(json.as_bytes())?;
+            Ok(())
+        }).unwrap();
+    }
+
+    {
+        let storage = app_context.storage_manager.clone();
+        server.fn_handler::<anyhow::Error, _>("/pin-config", Method::Post, move |mut req| {
+            match serde_json::from_reader::<_, PinConfiguration>(IoCompat::new(&mut req, 8192)) {
+                Ok(config) => {
+                    if config.modbus_timeout_ms > 1000 {
+                        req.into_response(400, None, &[("Access-Control-Allow-Origin", "*")])?
+                            .write_all("modbus_timeout_ms must be 0..=1000".as_bytes())?;
+                        return Ok(());
+                    }
+                    if config.modbus_scan_delay_us > 200000 {
+                        req.into_response(400, None, &[("Access-Control-Allow-Origin", "*")])?
+                            .write_all("modbus_scan_delay_us must be 0..=200000".as_bytes())?;
+                        return Ok(());
+                    }
+                    storage.lock().unwrap().set_pin_configuration(&config)?;
+                    let json = serde_json::to_string(&config).unwrap();
+                    req.into_response(200, Some("OK"), &[("Access-Control-Allow-Origin", "*")])?
+                        .write_all(json.as_bytes())?;
+                }
+                Err(e) => {
+                    log::error!("Failed to parse pin config: {}", e);
+                    req.into_response(400, None, &[("Access-Control-Allow-Origin", "*")])?
+                        .write_all("Bad Request".as_bytes())?;
+                }
+            }
+            Ok(())
+        }).unwrap();
+    }
+
+    {
+        server.fn_handler::<anyhow::Error, _>("/restart", Method::Post, move |req| {
+            req.into_response(200, Some("OK"), &[("Access-Control-Allow-Origin", "*")])?
+                .write_all("Restarting device".as_bytes())?;
+            std::thread::spawn(|| {
+                FreeRtos::delay_ms(100);
+                esp_idf_svc::hal::reset::restart();
+            });
             Ok(())
         }).unwrap();
     }

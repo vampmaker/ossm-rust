@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /// <reference types="w3c-web-serial" />
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ESPLoader, Transport } from 'esptool-js'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -26,6 +26,64 @@ const wifiPassword = ref('')
 const pinModbusTx = ref(18)
 const pinModbusRx = ref(19)
 const pinModbusDeRe = ref(20)
+const modbusTimeoutMs = ref(0)
+const modbusScanDelayUs = ref(0)
+
+const DEVICE_CONFIG_STORAGE_KEY = 'ossm-flasher-device-config-v1'
+const DEFAULT_DEVICE_CONFIG = {
+  wifiSsid: '',
+  wifiPassword: '',
+  pinModbusTx: 18,
+  pinModbusRx: 19,
+  pinModbusDeRe: 20,
+  modbusTimeoutMs: 0,
+  modbusScanDelayUs: 0,
+} as const
+
+function applyDeviceConfig(config: Partial<typeof DEFAULT_DEVICE_CONFIG>) {
+  wifiSsid.value = config.wifiSsid ?? DEFAULT_DEVICE_CONFIG.wifiSsid
+  wifiPassword.value = config.wifiPassword ?? DEFAULT_DEVICE_CONFIG.wifiPassword
+  pinModbusTx.value = config.pinModbusTx ?? DEFAULT_DEVICE_CONFIG.pinModbusTx
+  pinModbusRx.value = config.pinModbusRx ?? DEFAULT_DEVICE_CONFIG.pinModbusRx
+  pinModbusDeRe.value = config.pinModbusDeRe ?? DEFAULT_DEVICE_CONFIG.pinModbusDeRe
+  modbusTimeoutMs.value = config.modbusTimeoutMs ?? DEFAULT_DEVICE_CONFIG.modbusTimeoutMs
+  modbusScanDelayUs.value = config.modbusScanDelayUs ?? DEFAULT_DEVICE_CONFIG.modbusScanDelayUs
+}
+
+function loadDeviceConfig() {
+  try {
+    const raw = localStorage.getItem(DEVICE_CONFIG_STORAGE_KEY)
+    if (!raw) {
+      return
+    }
+    const parsed = JSON.parse(raw) as Partial<typeof DEFAULT_DEVICE_CONFIG>
+    applyDeviceConfig(parsed)
+  } catch (err) {
+    console.warn('Failed to load persisted device config:', err)
+  }
+}
+
+function persistDeviceConfig() {
+  try {
+    const payload = {
+      wifiSsid: wifiSsid.value,
+      wifiPassword: wifiPassword.value,
+      pinModbusTx: pinModbusTx.value,
+      pinModbusRx: pinModbusRx.value,
+      pinModbusDeRe: pinModbusDeRe.value,
+      modbusTimeoutMs: modbusTimeoutMs.value,
+      modbusScanDelayUs: modbusScanDelayUs.value,
+    }
+    localStorage.setItem(DEVICE_CONFIG_STORAGE_KEY, JSON.stringify(payload))
+  } catch (err) {
+    console.warn('Failed to persist device config:', err)
+  }
+}
+
+function resetDeviceConfig() {
+  applyDeviceConfig(DEFAULT_DEVICE_CONFIG)
+  termLog('\x1b[33mConfiguration fields reset to defaults.\x1b[0m')
+}
 
 let transport: Transport | null = null
 let esploader: ESPLoader | null = null
@@ -66,6 +124,8 @@ function termLog(line: string) {
 }
 
 onMounted(() => {
+  loadDeviceConfig()
+
   const theme = {
     background: '#1a1a2e',
     foreground: '#e0e0e0',
@@ -127,6 +187,13 @@ onMounted(() => {
   if (terminalEl.value) resizeObserver.observe(terminalEl.value)
   if (serialTerminalEl.value) resizeObserver.observe(serialTerminalEl.value)
 })
+
+watch(
+  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusScanDelayUs],
+  () => {
+    persistDeviceConfig()
+  },
+)
 
 onUnmounted(() => {
   resizeObserver?.disconnect()
@@ -554,6 +621,14 @@ async function sendConfig() {
       cmd: `set-pin-modbus-de-re ${pinModbusDeRe.value}`,
       ack: ['Modbus DE/RE pin set to'],
     })
+    commands.push({
+      cmd: `set-modbus-timeout-ms ${modbusTimeoutMs.value}`,
+      ack: ['modbus_timeout_ms set to'],
+    })
+    commands.push({
+      cmd: `set-modbus-scan-delay-us ${modbusScanDelayUs.value}`,
+      ack: ['modbus_scan_delay_us set to'],
+    })
 
     const encoder = new TextEncoder()
     for (const item of commands) {
@@ -856,9 +931,9 @@ const statusColor = computed(() => {
             </div>
           </fieldset>
 
-          <!-- Motor / Modbus (read-only) -->
+          <!-- Motor / Modbus -->
           <fieldset class="space-y-2">
-            <legend class="text-sm font-medium text-gray-700">Motor / Modbus <span class="text-xs text-gray-400">(read-only)</span></legend>
+            <legend class="text-sm font-medium text-gray-700">Motor / Modbus</legend>
             <div class="grid grid-cols-2 gap-2">
               <div>
                 <label class="text-xs text-gray-500">Baud Rate</label>
@@ -876,17 +951,45 @@ const statusColor = computed(() => {
                   class="w-full bg-gray-100 border border-gray-200 rounded px-3 py-1.5 text-sm font-mono text-gray-400 cursor-not-allowed"
                 />
               </div>
+              <div>
+                <label class="text-xs text-gray-500">Read timeout (ms) <span class="text-gray-400">0 = default</span></label>
+                <input
+                  v-model.number="modbusTimeoutMs"
+                  type="number"
+                  min="0"
+                  max="1000"
+                  class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm font-mono focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">Scan delay (µs) <span class="text-gray-400">0 = t3.5</span></label>
+                <input
+                  v-model.number="modbusScanDelayUs"
+                  type="number"
+                  min="0"
+                  max="200000"
+                  class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm font-mono focus:border-blue-500 focus:outline-none"
+                />
+              </div>
             </div>
           </fieldset>
         </div>
 
-        <button
-          @click="sendConfig"
-          :disabled="!canConfigure"
-          class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white disabled:bg-gray-300 disabled:text-gray-500 rounded font-semibold transition-colors"
-        >
-          {{ status === 'configuring' ? 'Sending...' : 'Send Configuration' }}
-        </button>
+        <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <button
+            @click="sendConfig"
+            :disabled="!canConfigure"
+            class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white disabled:bg-gray-300 disabled:text-gray-500 rounded font-semibold transition-colors"
+          >
+            {{ status === 'configuring' ? 'Sending...' : 'Send Configuration' }}
+          </button>
+          <button
+            @click="resetDeviceConfig"
+            class="w-full py-2.5 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded font-semibold transition-colors"
+          >
+            Reset to defaults
+          </button>
+        </div>
 
         <p v-if="status === 'config_done' || status === 'monitoring'" class="text-green-600 text-sm text-center">
           Configuration sent. Monitoring device output.

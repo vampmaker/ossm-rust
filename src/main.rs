@@ -210,7 +210,7 @@ fn run_motor(app_context: AppContext, uart_peripheral: UART1) -> anyhow::Result<
     
             let config = uart::config::Config::default()
                 .baudrate(Hertz(TARGET_BAUD_RATE))
-                .mode(uart::config::Mode::RS485HalfDuplex);    // the driver software will control rts pin, which is connected to the rs485 transceiver's DE/~RE pin
+                .mode(uart::config::Mode::RS485HalfDuplex);
     
             let mut all_pins = app_context.all_pins.lock().unwrap();
             let tx_pin_num = pin_config.modbus_tx as usize;
@@ -254,6 +254,7 @@ fn run_motor(app_context: AppContext, uart_peripheral: UART1) -> anyhow::Result<
                         modbus_tx: tx_pin_num as u32,
                         modbus_rx: rx_pin_num as u32,
                         modbus_de_re: rts_pin_num as u32,
+                        ..Default::default()
                     };
                     app_context.storage_manager.lock().unwrap().set_pin_configuration(&new_pin_config)?;
                     log::info!("Saved new pin configuration to NVS.");
@@ -274,17 +275,50 @@ fn run_motor(app_context: AppContext, uart_peripheral: UART1) -> anyhow::Result<
             }
         };
 
-        let modbus = ModbusRTUMaster::new(uart, Option::<AnyOutputPin>::None, 1);
+        let pin_config = app_context.storage_manager.lock().unwrap().get_pin_configuration().unwrap_or_default();
+        let modbus = ModbusRTUMaster::new(uart, Option::<AnyOutputPin>::None, 1, pin_config.modbus_timeout_ms);
 
-        let mut motor = Modbus57AIM30Motor::new(modbus);
-        if let Err(e) = motor.enable_modbus_communication() {
-            log::info!("Failed to enable modbus, trying to scan and configure: {}", e);
-            let motor_scan_result = motor.modbus_scan().map_err(|e| anyhow::anyhow!("Failed to scan motor device. Please check connection to the motor. {:?}", e))?;
-            log::info!("Motor device found, baud rate: {}, device id: {}", motor_scan_result.baud_rate, motor_scan_result.device_id);
-            if motor_scan_result.baud_rate != TARGET_BAUD_RATE {
-                motor.modbus_set_baud_rate(TARGET_BAUD_RATE).map_err(|e| anyhow::anyhow!("Failed to set baud rate to {}: {:?}", TARGET_BAUD_RATE, e))?;
-                log::info!("Motor baud rate set to {}, please power cycle the motor.", TARGET_BAUD_RATE);
+        let mut motor = Modbus57AIM30Motor::new(modbus, pin_config.modbus_scan_delay_us);
+
+        let mut modbus_ok = false;
+        for init_attempt in 1..=2 {
+            if init_attempt > 1 {
+                log::info!("Retrying motor initialization (attempt {}/2)...", init_attempt);
+                FreeRtos::delay_ms(1000);
             }
+            match motor.enable_modbus_communication() {
+                Ok(()) => { modbus_ok = true; break; }
+                Err(e) => {
+                    log::info!("Failed to enable modbus (attempt {}/2), trying to scan and configure: {}", init_attempt, e);
+                    let mut scan_result = Err(anyhow::anyhow!("scan not attempted"));
+                    for attempt in 1..=3 {
+                        match motor.modbus_scan() {
+                            Ok(result) => { scan_result = Ok(result); break; }
+                            Err(e) => {
+                                log::warn!("Scan attempt {}/3 failed: {}", attempt, e);
+                                scan_result = Err(e);
+                            }
+                        }
+                    }
+                    match scan_result {
+                        Ok(motor_scan_result) => {
+                            log::info!("Motor device found, baud rate: {}, device id: {}", motor_scan_result.baud_rate, motor_scan_result.device_id);
+                            if motor_scan_result.baud_rate != TARGET_BAUD_RATE {
+                                motor.modbus_set_baud_rate(TARGET_BAUD_RATE).map_err(|e| anyhow::anyhow!("Failed to set baud rate to {}: {:?}", TARGET_BAUD_RATE, e))?;
+                                log::info!("Motor baud rate set to {}, please power cycle the motor.", TARGET_BAUD_RATE);
+                            }
+                            modbus_ok = true;
+                            break;
+                        }
+                        Err(e) => {
+                            log::error!("Motor init attempt {}/2: scan failed: {}", init_attempt, e);
+                        }
+                    }
+                }
+            }
+        }
+        if !modbus_ok {
+            anyhow::bail!("Failed to establish modbus communication after retries. Please check connection to the motor.");
         }
         motor.enable_modbus_communication().map_err(|e| anyhow::anyhow!("Failed to enable modbus communication: {:?}", e))?;
 

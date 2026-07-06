@@ -17,6 +17,7 @@ pub struct ModbusRTUMaster<'a> {
     device_id: u8,
     read_timeout: TickType_t,
     write_timeout: TickType_t,
+    timeout_override_ms: u32,
 }
 
 impl<'a> ModbusRTUMaster<'a> {
@@ -24,9 +25,10 @@ impl<'a> ModbusRTUMaster<'a> {
         uart: uart::UartDriver<'a>,
         ctrl_pin: Option<gpio::AnyOutputPin>,
         device_id: u8,
+        timeout_override_ms: u32,
     ) -> Self {
         let ctrl_pin_driver = ctrl_pin.map(|ctrl_pin| gpio::PinDriver::output(ctrl_pin).unwrap());
-        let timeout = Self::get_operation_timeout(uart.baudrate().unwrap().into()).unwrap();
+        let timeout = Self::compute_timeout(uart.baudrate().unwrap().into(), timeout_override_ms).unwrap();
         
         Self {
             uart,
@@ -34,16 +36,25 @@ impl<'a> ModbusRTUMaster<'a> {
             device_id,
             read_timeout: timeout,
             write_timeout: timeout,
+            timeout_override_ms,
         }
     }
 
-    fn get_operation_timeout(baudrate: u32) -> Result<TickType_t> {
+    fn get_default_timeout(baudrate: u32) -> Result<TickType_t> {
         match baudrate {
             9600 => Ok(TICK_RATE_HZ / 10),
             19200 => Ok(TICK_RATE_HZ / 20),
             38400 => Ok(TICK_RATE_HZ / 40),
             115200 | 115201 => Ok(TICK_RATE_HZ / 200),
             _ => Err(anyhow::anyhow!("Invalid baud rate: {}", baudrate)),
+        }
+    }
+
+    fn compute_timeout(baudrate: u32, override_ms: u32) -> Result<TickType_t> {
+        if override_ms > 0 {
+            Ok(TICK_RATE_HZ * override_ms / 1000)
+        } else {
+            Self::get_default_timeout(baudrate)
         }
     }
 
@@ -85,10 +96,15 @@ impl<'a> ModbusRTUMaster<'a> {
             Ets::delay_us(10);
         }
         
-        self.uart_read_exactly(&mut resp[..6])?;
-        let len = guess_response_frame_len(&resp[..6], ModbusProto::Rtu)? as usize;
-        if len > 6 {
-            self.uart_read_exactly(&mut resp[6..len])?;
+        // Read 3 bytes first: addr + func + (byte_count or exception_code).
+        // This is the minimum needed by guess_response_frame_len for all cases:
+        //   FC1-4: uses f[2] (byte count) → variable length
+        //   FC5,6,15,16: uses f[1] only → fixed 8
+        //   Exception (func >= 0x80): uses f[1] only → fixed 5
+        self.uart_read_exactly(&mut resp[..3])?;
+        let len = guess_response_frame_len(&resp[..3], ModbusProto::Rtu)? as usize;
+        if len > 3 {
+            self.uart_read_exactly(&mut resp[3..len])?;
         }
         Ok(len)
     }
@@ -151,7 +167,7 @@ impl<'a> ModbusRTUMaster<'a> {
 
     pub fn set_baudrate(&mut self, baudrate: u32) -> Result<()> {
         self.uart.change_baudrate(baudrate)?;
-        let timeout = Self::get_operation_timeout(baudrate)?;
+        let timeout = Self::compute_timeout(baudrate, self.timeout_override_ms)?;
         self.read_timeout = timeout;
         self.write_timeout = timeout;
         Ok(())
@@ -162,14 +178,16 @@ pub struct Modbus57AIM30Motor<'a> {
     client: ModbusRTUMaster<'a>,
     pos_min: f32,
     pos_max: f32,
+    scan_delay_us: u32,
 }
 
 impl<'a> Modbus57AIM30Motor<'a> {
-    pub fn new(modbus_client: ModbusRTUMaster<'a>) -> Self {
+    pub fn new(modbus_client: ModbusRTUMaster<'a>, scan_delay_us: u32) -> Self {
         Self {
             client: modbus_client,
             pos_min: 0.0,
             pos_max: 0.0,
+            scan_delay_us,
         }
     }
 
@@ -204,11 +222,11 @@ impl<'a> Modbus57AIM30Motor<'a> {
         let baud_rates: [u32; _] = [115200, 9600, 19200, 38400];
         for baud_rate in baud_rates {
             self.client.set_baudrate(baud_rate)?;
-            let t3_5_us = Self::modbus_t3_5_us(baud_rate);
+            let delay_us = Self::modbus_t3_5_us(baud_rate).max(self.scan_delay_us);
             for device_id in 1..=247 {
                 self.client.device_id = device_id;
-                Ets::delay_us(t3_5_us);
-                if self.client.read_holding_register(0x00).is_ok() {
+                Ets::delay_us(delay_us);
+                if self.client.write_holding_register(0x00, 0x01).is_ok() {
                     return Ok(ModbusScanResult {
                         baud_rate,
                         device_id,

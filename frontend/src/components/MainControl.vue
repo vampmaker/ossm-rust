@@ -1,15 +1,17 @@
 <script setup lang="ts">
-import type { MotorControllerConfig, WaveFunc } from '../types'
+import type { MotorControllerConfig, PauseMode, WaveFunc } from '../types'
 
 const props = defineProps<{
   modelValue: MotorControllerConfig
   connected: boolean
+  pauseMode: PauseMode
 }>()
 
 const emit = defineEmits<{
   (e: 'update:modelValue', config: MotorControllerConfig): void
   (e: 'setPaused', paused: boolean): void
   (e: 'setPausedPosition', position: number): void
+  (e: 'setPauseMode', mode: PauseMode): void
 }>()
 
 function updateField<K extends keyof MotorControllerConfig>(
@@ -97,13 +99,17 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
     </div>
 
     <!-- Checkboxes -->
-    <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+    <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
       <div class="flex items-center">
         <input
           :id="`reversed-checkbox`" type="checkbox" :checked="modelValue.reversed" class="mr-2"
           :disabled="!connected" @input="updateField('reversed', ($event.target as HTMLInputElement).checked)"
         >
         <label :for="`reversed-checkbox`">Reversed Direction</label>
+        <span
+          class="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-200 text-xs text-gray-700"
+          title="Invert movement direction so the waveform runs in reverse."
+        >?</span>
       </div>
       <div class="flex items-center">
         <input
@@ -111,6 +117,25 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
           :disabled="!connected" @input="updateField('depth_top', ($event.target as HTMLInputElement).checked)"
         >
         <label :for="`depth-top-checkbox`">Depth From Top</label>
+        <span
+          class="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-200 text-xs text-gray-700"
+          title="Checked: stroke uses the top range. Unchecked: stroke uses the bottom range."
+        >?</span>
+      </div>
+      <div class="flex items-center">
+        <input
+          :id="`pause-mode-in-place-checkbox`"
+          type="checkbox"
+          :checked="pauseMode === 'in-place'"
+          class="mr-2"
+          :disabled="!connected"
+          @input="emit('setPauseMode', ($event.target as HTMLInputElement).checked ? 'in-place' : 'fixed-position')"
+        >
+        <label :for="`pause-mode-in-place-checkbox`">Pause in-place</label>
+        <span
+          class="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-200 text-xs text-gray-700"
+          title="Unchecked: Fixed position (pause slider target). Checked: In-place (capture current motor position on Stop)."
+        >?</span>
       </div>
     </div>
   </div>

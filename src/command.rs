@@ -69,6 +69,16 @@ enum BaseCommand<'a> {
         /// Spline points separated by space (0.0 to 1.0)
         points: &'a str, // embedded-cli doesn't support Vec<f32> directly as argument, so we parse string manually
     },
+    SetModbusTimeoutMs {
+        /// Modbus per-read timeout in ms (0 = use default for baud rate)
+        value: u32,
+    },
+    GetModbusTimeoutMs,
+    SetModbusScanDelayUs {
+        /// Modbus scan inter-probe delay in us (0 = use Modbus t3.5 only)
+        value: u32,
+    },
+    GetModbusScanDelayUs,
 }
 
 struct StdoutAdapter(std::io::Stdout);
@@ -363,6 +373,52 @@ fn execute_command(command: BaseCommand<'_>, app_context: &AppContext) {
                     }
                 }
                 Err(_) => log::error!("Invalid spline points value: {}", points),
+            }
+        }
+        BaseCommand::SetModbusTimeoutMs { value } => {
+            if value > 1000 {
+                log::error!("modbus_timeout_ms must be 0..=1000 (0 = use default)");
+                return;
+            }
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            config.modbus_timeout_ms = value;
+            sm.set_pin_configuration(&config).unwrap();
+            if value == 0 {
+                log::info!("modbus_timeout_ms set to 0 (use default for baud rate), restart to apply");
+            } else {
+                log::info!("modbus_timeout_ms set to {}ms, restart to apply", value);
+            }
+        }
+        BaseCommand::GetModbusTimeoutMs => {
+            let config = app_context.storage_manager.lock().unwrap().get_pin_configuration().unwrap_or_default();
+            if config.modbus_timeout_ms == 0 {
+                println!("modbus_timeout_ms: 0 (using default for baud rate)");
+            } else {
+                println!("modbus_timeout_ms: {}ms", config.modbus_timeout_ms);
+            }
+        }
+        BaseCommand::SetModbusScanDelayUs { value } => {
+            if value > 200000 {
+                log::error!("modbus_scan_delay_us must be 0..=200000 (0 = use Modbus t3.5 only)");
+                return;
+            }
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            config.modbus_scan_delay_us = value;
+            sm.set_pin_configuration(&config).unwrap();
+            if value == 0 {
+                log::info!("modbus_scan_delay_us set to 0 (use Modbus t3.5 only), restart to apply");
+            } else {
+                log::info!("modbus_scan_delay_us set to {}us, restart to apply", value);
+            }
+        }
+        BaseCommand::GetModbusScanDelayUs => {
+            let config = app_context.storage_manager.lock().unwrap().get_pin_configuration().unwrap_or_default();
+            if config.modbus_scan_delay_us == 0 {
+                println!("modbus_scan_delay_us: 0 (using Modbus t3.5 only)");
+            } else {
+                println!("modbus_scan_delay_us: {}us", config.modbus_scan_delay_us);
             }
         }
     }

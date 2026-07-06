@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 RELEASE_DIR="$SCRIPT_DIR/release"
-rm -rf "$RELEASE_DIR"
 mkdir -p "$RELEASE_DIR"
+rm -rf "$RELEASE_DIR/*"
 
 echo "==> Building frontend..."
 (cd frontend && npm ci && npm run build)

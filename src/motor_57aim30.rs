@@ -46,7 +46,7 @@ impl<'a> ModbusRTUMaster<'a> {
             9600 => Ok(Duration::from_millis(100)),
             19200 => Ok(Duration::from_millis(50)),
             38400 => Ok(Duration::from_millis(25)),
-            115200 | 115201 => Ok(Duration::from_millis(5)),
+            115200 | 115201 => Ok(Duration::from_millis(15)),
             _ => Err(anyhow::anyhow!("Invalid baud rate: {}", baudrate)),
         }
     }

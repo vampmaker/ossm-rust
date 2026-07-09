@@ -28,6 +28,7 @@ const pinModbusRx = ref(19)
 const pinModbusDeRe = ref(20)
 const modbusTimeoutMs = ref(0)
 const modbusScanDelayUs = ref(0)
+const bleEnabled = ref(true)
 
 const DEVICE_CONFIG_STORAGE_KEY = 'ossm-flasher-device-config-v1'
 const DEFAULT_DEVICE_CONFIG = {
@@ -38,6 +39,7 @@ const DEFAULT_DEVICE_CONFIG = {
   pinModbusDeRe: 20,
   modbusTimeoutMs: 0,
   modbusScanDelayUs: 0,
+  bleEnabled: true,
   flashAddress: '0x0',
 } as const
 
@@ -49,6 +51,7 @@ function applyDeviceConfig(config: Partial<typeof DEFAULT_DEVICE_CONFIG>) {
   pinModbusDeRe.value = config.pinModbusDeRe ?? DEFAULT_DEVICE_CONFIG.pinModbusDeRe
   modbusTimeoutMs.value = config.modbusTimeoutMs ?? DEFAULT_DEVICE_CONFIG.modbusTimeoutMs
   modbusScanDelayUs.value = config.modbusScanDelayUs ?? DEFAULT_DEVICE_CONFIG.modbusScanDelayUs
+  bleEnabled.value = config.bleEnabled ?? DEFAULT_DEVICE_CONFIG.bleEnabled
   flashAddress.value = config.flashAddress ?? DEFAULT_DEVICE_CONFIG.flashAddress
 }
 
@@ -75,6 +78,7 @@ function persistDeviceConfig() {
       pinModbusDeRe: pinModbusDeRe.value,
       modbusTimeoutMs: modbusTimeoutMs.value,
       modbusScanDelayUs: modbusScanDelayUs.value,
+      bleEnabled: bleEnabled.value,
       flashAddress: flashAddress.value,
     }
     localStorage.setItem(DEVICE_CONFIG_STORAGE_KEY, JSON.stringify(payload))
@@ -169,8 +173,8 @@ onMounted(() => {
 
   if (serialTerminalEl.value) {
     serialXterm = new Terminal({
-      cursorBlink: false,
-      disableStdin: true,
+      cursorBlink: true,
+      disableStdin: false,
       scrollback: 5000,
       fontSize: 13,
       fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
@@ -181,6 +185,26 @@ onMounted(() => {
     serialXterm.open(serialTerminalEl.value)
     serialFitAddon.fit()
     serialXterm.writeln('\x1b[90mWaiting for serial data...\x1b[0m')
+
+    serialXterm.onData(async (data) => {
+      const encoder = new TextEncoder()
+      const payload = encoder.encode(data)
+      if (sessionWriter) {
+        try {
+          await sessionWriter.write(payload)
+        } catch (err) {
+          console.error('Serial terminal write error:', err)
+        }
+      } else if (serialPort?.writable && !serialPort.writable.locked) {
+        try {
+          const writer = serialPort.writable.getWriter()
+          await writer.write(payload)
+          writer.releaseLock()
+        } catch (err) {
+          console.error('Serial terminal write error:', err)
+        }
+      }
+    })
   }
 
   resizeObserver = new ResizeObserver(() => {
@@ -192,7 +216,7 @@ onMounted(() => {
 })
 
 watch(
-  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusScanDelayUs, flashAddress],
+  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusScanDelayUs, bleEnabled, flashAddress],
   () => {
     persistDeviceConfig()
   },
@@ -357,9 +381,10 @@ async function monitorLoop(token: number, logStart: boolean) {
         await releaseIoNoLock()
         await closePortNoLock()
         await openPortNoLock(115200)
-        if (!serialPort?.readable) throw new Error('Readable stream unavailable.')
+        if (!serialPort?.readable || !serialPort?.writable) throw new Error('Serial streams unavailable.')
         const reader = serialPort.readable.getReader()
         sessionReader = reader
+        sessionWriter = serialPort.writable.getWriter()
         return reader
       })
       if (!activeReader) throw new Error('Failed to acquire monitor reader.')
@@ -631,6 +656,10 @@ async function sendConfig() {
     commands.push({
       cmd: `set-modbus-scan-delay-us ${modbusScanDelayUs.value}`,
       ack: ['modbus_scan_delay_us set to'],
+    })
+    commands.push({
+      cmd: `set-ble-enabled ${bleEnabled.value}`,
+      ack: ['ble_enabled set to'],
     })
 
     const encoder = new TextEncoder()
@@ -974,6 +1003,17 @@ const statusColor = computed(() => {
                   class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm font-mono focus:border-blue-500 focus:outline-none"
                 />
               </div>
+            </div>
+            <div class="mt-3 flex items-center space-x-2 pt-2 border-t border-gray-100">
+              <input
+                id="flasher-ble-enabled"
+                type="checkbox"
+                v-model="bleEnabled"
+                class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+              <label for="flasher-ble-enabled" class="text-xs font-medium text-gray-700">
+                Enable Bluetooth Low Energy (BLE)
+              </label>
             </div>
           </fieldset>
         </div>

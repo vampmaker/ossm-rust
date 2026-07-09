@@ -18,6 +18,7 @@ use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_svc::wifi::{AsyncWifi, AuthMethod, ClientConfiguration, Configuration, EspWifi};
 use esp_idf_svc::io::vfs::BlockingStdIo;
 use esp_idf_svc::hal::usb_serial;
+mod ble_api;
 mod command;
 mod context;
 mod http_api;
@@ -127,24 +128,150 @@ fn run_app() -> anyhow::Result<()> {
     // setup stdin command handler
     {
         let app_context = app_context.clone();
-        let builder = std::thread::Builder::new().name("stdin_command".to_string()).stack_size(16384);
+        let builder = std::thread::Builder::new().name("stdin_command".to_string()).stack_size(32768);
         builder.spawn(move || handle_stdin_command(app_context)).unwrap();
     }
 
-    let wifi = EspWifi::new(
-        peripherals.modem,
-        sysloop.clone(),
-        None,
+    // setup ble server
+    let ble_enabled = app_context.storage_manager.lock().unwrap().get_pin_configuration().map(|c| c.ble_enabled).unwrap_or(true);
+    if ble_enabled {
+        let app_context = app_context.clone();
+        let builder = std::thread::Builder::new().name("ble_server".to_string()).stack_size(16384);
+        builder.spawn(move || {
+            if let Err(e) = ble_api::run_ble_server(app_context) {
+                log::error!("BLE server error: {}", e);
+            }
+        }).unwrap();
+    } else {
+        log::info!("BLE server disabled by configuration");
+    }
+
+
+    let net_conf = app_context.storage_manager.lock().unwrap().get_network_configuration().unwrap_or_default();
+
+    let mut sta_conf = esp_idf_svc::netif::NetifConfiguration::wifi_default_client();
+    if !net_conf.dhcp_enabled {
+        let ip: std::net::Ipv4Addr = net_conf.static_ip.parse().unwrap_or_else(|_| std::net::Ipv4Addr::new(192, 168, 1, 100));
+        let gateway: std::net::Ipv4Addr = net_conf.static_gateway.parse().unwrap_or_else(|_| std::net::Ipv4Addr::new(192, 168, 1, 1));
+        
+        let mask_val = if let Ok(val) = net_conf.static_mask.parse::<u8>() {
+            val
+        } else if let Ok(addr) = net_conf.static_mask.parse::<std::net::Ipv4Addr>() {
+            u32::from_be_bytes(addr.octets()).leading_ones() as u8
+        } else {
+            24
+        };
+        let dns = net_conf.static_dns.parse::<std::net::Ipv4Addr>().ok();
+
+        sta_conf.ip_configuration = Some(esp_idf_svc::ipv4::Configuration::Client(
+            esp_idf_svc::ipv4::ClientConfiguration::Fixed(esp_idf_svc::ipv4::ClientSettings {
+                ip,
+                subnet: esp_idf_svc::ipv4::Subnet {
+                    gateway,
+                    mask: esp_idf_svc::ipv4::Mask(mask_val),
+                },
+                dns,
+                secondary_dns: None,
+            })
+        ));
+    } else {
+        sta_conf.ip_configuration = Some(esp_idf_svc::ipv4::Configuration::Client(
+            esp_idf_svc::ipv4::ClientConfiguration::DHCP(esp_idf_svc::ipv4::DHCPClientSettings {
+                hostname: Some(heapless::String::try_from(net_conf.hostname.as_str()).unwrap_or_else(|_| heapless::String::try_from("ossm").unwrap())),
+            })
+        ));
+    }
+
+    let driver = esp_idf_svc::wifi::WifiDriver::new(peripherals.modem, sysloop.clone(), None)?;
+    let sta_netif = esp_idf_svc::netif::EspNetif::new_with_conf(&sta_conf)?;
+    
+    if let Ok(c_hostname) = std::ffi::CString::new(net_conf.hostname.as_str()) {
+        unsafe {
+            use esp_idf_svc::handle::RawHandle;
+            let _ = esp_idf_svc::sys::esp_netif_set_hostname(sta_netif.handle(), c_hostname.as_ptr());
+        }
+    }
+
+    let wifi = EspWifi::wrap_all(
+        driver,
+        sta_netif,
+        esp_idf_svc::netif::EspNetif::new(esp_idf_svc::netif::NetifStack::Ap)?,
     )?;
     let wifi = AsyncWifi::wrap(wifi, sysloop, EspTaskTimerService::new()?)?;
 
-    // Run the Embassy executor on the main thread; it drives the network task
-    // (WiFi + async HTTP server) and the motor task cooperatively.
+    // Run the Embassy executor on the main thread; it drives the network task,
+    // background NVS saving task, and motor task cooperatively.
     let executor = EXECUTOR.init(Executor::new());
+
+    #[cfg(esp32s3)]
+    {
+        let mut cfg = esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration::get().unwrap_or_default();
+        cfg.pin_to_core = Some(esp_idf_svc::hal::cpu::Core::Core1);
+        cfg.priority = 15;
+        cfg.stack_size = 32768;
+        cfg.set().unwrap();
+
+        let app_context_motor = app_context.clone();
+        let uart1 = peripherals.uart1;
+        std::thread::spawn(move || {
+            log::info!("ESP32-S3: Motor loop running on dedicated Core 1 at FreeRTOS priority 15");
+            if let Err(e) = esp_idf_svc::hal::task::block_on(run_motor(app_context_motor, uart1)) {
+                log::error!("Motor task failed: {}", e);
+            }
+        });
+    }
+
+    #[cfg(esp32c6)]
+    unsafe {
+        esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), 15);
+    }
+
     executor.run(|spawner| {
         spawner.spawn(net_task(wifi, app_context.clone()).unwrap());
-        spawner.spawn(motor_task(app_context, peripherals.uart1).unwrap());
+        #[cfg(esp32c6)]
+        spawner.spawn(motor_task(app_context.clone(), peripherals.uart1).unwrap());
+        spawner.spawn(nvs_saver_task(app_context.clone()).unwrap());
     })
+}
+
+#[cfg(esp32c6)]
+#[embassy_executor::task]
+async fn motor_task(app_context: AppContext, uart_peripheral: UART1<'static>) {
+    if let Err(e) = run_motor(app_context, uart_peripheral).await {
+        log::error!("Motor task failed: {}", e);
+    }
+    log::info!("Motor task has returned, command interface remains available");
+}
+
+#[embassy_executor::task]
+async fn nvs_saver_task(app_context: AppContext) {
+    let mut last_saved_version = 0;
+    loop {
+        Timer::after_millis(500).await;
+        let to_save = {
+            let mut mc_opt = app_context.motor_controller.lock().unwrap();
+            if let Some(mc) = mc_opt.as_mut() {
+                let ver = mc.get_config_version();
+                if ver != last_saved_version && last_saved_version != 0 {
+                    last_saved_version = ver;
+                    Some(mc.get_config())
+                } else {
+                    if last_saved_version == 0 {
+                        last_saved_version = ver;
+                    }
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(config) = to_save {
+            log::info!("Saving updated motor config to NVS via embassy task");
+            if let Err(e) = app_context.storage_manager.lock().unwrap().set_motor_config(&config) {
+                log::error!("Failed to save motor config to NVS: {}", e);
+            }
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -176,16 +303,6 @@ async fn net_task(mut wifi: AsyncWifi<EspWifi<'static>>, app_context: AppContext
     loop {
         Timer::after_millis(60_000).await;
     }
-}
-
-#[embassy_executor::task]
-async fn motor_task(app_context: AppContext, uart_peripheral: UART1<'static>) {
-    if let Err(e) = run_motor(app_context, uart_peripheral).await {
-        log::error!("Motor task failed: {}", e);
-    }
-    // motor init/loop returned; the executor keeps running the other tasks
-    // (HTTP + CLI) so the user can reconfigure pins and restart.
-    log::info!("Motor task has returned, command interface remains available");
 }
 
 async fn connect_wifi(
@@ -224,7 +341,32 @@ async fn connect_wifi(
             );
             wifi.connect().await?;
             wifi.wait_netif_up().await?;
-            log::info!("WiFi connected.");
+            
+            let net_conf = storage_manager.lock().unwrap().get_network_configuration().unwrap_or_default();
+            if let Ok(ip_info) = wifi.wifi().sta_netif().get_ip_info() {
+                log::info!("WiFi connected. IP: {}, mDNS: http://{}.local", ip_info.ip, net_conf.hostname);
+            } else {
+                log::info!("WiFi connected. mDNS: http://{}.local", net_conf.hostname);
+            }
+
+            match esp_idf_svc::mdns::EspMdns::take() {
+                Ok(mut mdns) => {
+                    if let Err(e) = mdns.set_hostname(&net_conf.hostname) {
+                        log::error!("Failed to set mDNS hostname: {}", e);
+                    }
+                    if let Err(e) = mdns.set_instance_name("OSSM Sex Machine") {
+                        log::error!("Failed to set mDNS instance name: {}", e);
+                    }
+                    if let Err(e) = mdns.add_service(None, "_http", "_tcp", 80, &[("path", "/")]) {
+                        log::error!("Failed to add mDNS service: {}", e);
+                    }
+                    log::info!("mDNS responder initialized for hostname: {}.local", net_conf.hostname);
+                    std::mem::forget(mdns);
+                }
+                Err(e) => {
+                    log::error!("Failed to initialize mDNS: {}", e);
+                }
+            }
         }
     } else {
         log::info!("WiFi SSID or password not set. Please set them via UART commands:\r\nset-wifi-ssid <your_ssid>\r\nset-wifi-password <your_password>");
@@ -388,35 +530,14 @@ async fn run_motor(app_context: AppContext, uart_peripheral: UART1<'static>) -> 
     log::info!("Motor initialized, starting motor loop");
     *app_context.motor_controller.lock().unwrap() = Some(Box::new(motor_controller));
 
-    let mut last_config_check = time::Instant::now();
-    let mut last_saved_config_version = app_context.motor_controller.lock().unwrap().as_ref().map_or(0, |mc| mc.get_config_version());
-
-    let mut update_counter = 0;
+    let mut _update_counter = 0;
     let mut last_update_counter_reset = time::Instant::now();
 
     loop {
-        // Compute the next position under a briefly-held lock (no I/O inside)
+        // Compute the next position under a briefly-held lock (< 2 us, no I/O inside)
         let target = {
             let mut motor_controller_lock = app_context.motor_controller.lock().unwrap();
-            if let Some(controller) = motor_controller_lock.as_mut() {
-                if last_config_check.elapsed() > time::Duration::from_millis(200) {
-                    last_config_check = time::Instant::now();
-                    let current_version = controller.get_config_version();
-                    if current_version != last_saved_config_version {
-                        let config = controller.get_config();
-                        log::info!("Config updated, saving to NVS");
-                        if let Err(e) = app_context.storage_manager.lock().unwrap().set_motor_config(&config) {
-                            log::error!("Failed to save motor config: {}", e);
-                        } else {
-                            last_saved_config_version = current_version;
-                        }
-                    }
-                }
-
-                Some(controller.compute_cycle())
-            } else {
-                None
-            }
+            motor_controller_lock.as_mut().map(|controller| controller.compute_cycle())
         };
 
         // Perform the motor I/O outside the lock; awaiting here yields to the
@@ -436,11 +557,19 @@ async fn run_motor(app_context: AppContext, uart_peripheral: UART1<'static>) -> 
             }
         }
 
-        update_counter += 1;
-        if last_update_counter_reset.elapsed() > time::Duration::from_secs(60) {
-            log::info!("Motor task update per second: {}", update_counter as f64 / 60.0);
+        _update_counter += 1;
+        if last_update_counter_reset.elapsed() >= time::Duration::from_secs(5) {
+            if let Some(ref mut mc_lock) = *app_context.motor_controller.lock().unwrap() {
+                let st = &mc_lock.last_loop_stats;
+                if st.ups > 0 {
+                    log::info!(
+                        "Motor loop stats (1s): UPS={}, dt(ms) min/avg/max/mdev = {:.2} / {:.2} / {:.2} / {:.2}",
+                        st.ups, st.min_dt_ms, st.avg_dt_ms, st.max_dt_ms, st.mdev_dt_ms
+                    );
+                }
+            }
             last_update_counter_reset = time::Instant::now();
-            update_counter = 0;
+            _update_counter = 0;
         }
     }
     Ok(())

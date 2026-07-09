@@ -17,6 +17,12 @@ pub struct PinConfiguration {
     pub modbus_timeout_ms: u32,
     #[serde(default)]
     pub modbus_scan_delay_us: u32,
+    #[serde(default = "default_ble_enabled")]
+    pub ble_enabled: bool,
+}
+
+fn default_ble_enabled() -> bool {
+    true
 }
 
 impl Default for PinConfiguration {
@@ -27,6 +33,60 @@ impl Default for PinConfiguration {
             modbus_de_re: 20,
             modbus_timeout_ms: 0,
             modbus_scan_delay_us: 0,
+            ble_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NetworkConfiguration {
+    #[serde(default = "default_hostname")]
+    pub hostname: String,
+    #[serde(default = "default_dhcp_enabled")]
+    pub dhcp_enabled: bool,
+    #[serde(default = "default_static_ip")]
+    pub static_ip: String,
+    #[serde(default = "default_static_mask")]
+    pub static_mask: String,
+    #[serde(default = "default_static_gateway")]
+    pub static_gateway: String,
+    #[serde(default = "default_static_dns")]
+    pub static_dns: String,
+}
+
+fn default_hostname() -> String {
+    "ossm".to_string()
+}
+
+fn default_dhcp_enabled() -> bool {
+    true
+}
+
+fn default_static_ip() -> String {
+    "192.168.1.100".to_string()
+}
+
+fn default_static_mask() -> String {
+    "255.255.255.0".to_string()
+}
+
+fn default_static_gateway() -> String {
+    "192.168.1.1".to_string()
+}
+
+fn default_static_dns() -> String {
+    "8.8.8.8".to_string()
+}
+
+impl Default for NetworkConfiguration {
+    fn default() -> Self {
+        Self {
+            hostname: default_hostname(),
+            dhcp_enabled: default_dhcp_enabled(),
+            static_ip: default_static_ip(),
+            static_mask: default_static_mask(),
+            static_gateway: default_static_gateway(),
+            static_dns: default_static_dns(),
         }
     }
 }
@@ -112,5 +172,14 @@ impl StorageManager {
 
     pub fn get_pin_configuration(&self) -> Result<PinConfiguration> {
         self.get_json("pin_conf")
+    }
+
+    pub fn set_network_configuration(&mut self, config: &NetworkConfiguration) -> Result<()> {
+        self.set_json("net_conf", config)?;
+        Ok(())
+    }
+
+    pub fn get_network_configuration(&self) -> Result<NetworkConfiguration> {
+        self.get_json("net_conf").or_else(|_| Ok(NetworkConfiguration::default()))
     }
 }

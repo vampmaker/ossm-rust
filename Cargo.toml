@@ -43,6 +43,7 @@ edge-http = { version = "0.8", features = ["std"] }
 edge-nal = "0.7"
 edge-nal-std = { version = "0.7", features = ["async-io-mini"], default-features = false }
 edge-ws = { version = "0.8", features = ["io"] }
+esp32-nimble = "0.12"
 
 rmodbus = { version = "0.9.10", features = ["fixedvec"] }
 anyhow = "1.0.100"
@@ -55,9 +56,12 @@ libm = "0.2.8"
 embedded-cli = "0.2.1"
 embedded-io = { version = "0.6.1", features = ["std"] }
 embedded-io-async = "0.7"
-
 [build-dependencies]
 embuild = "0.33"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(esp32c6)', 'cfg(esp32s3)'] }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mdns", version = "^1.2" }

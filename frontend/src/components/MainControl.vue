@@ -29,6 +29,7 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
   { name: 'Sine', value: 'sine' },
   { name: 'Thrust', value: 'thrust' },
   { name: 'Spline', value: 'spline' },
+  { name: 'Funscript', value: 'funscript' },
 ]
 </script>
 

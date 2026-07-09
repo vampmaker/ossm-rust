@@ -1,0 +1,27 @@
+{
+  "name": "@ossm/client",
+  "version": "1.0.0",
+  "description": "Standalone universal TypeScript/JavaScript client SDK and single-owner WebSocket manager for OSSM devices",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "ossm",
+    "modbus",
+    "websocket",
+    "json-rpc",
+    "esp32"
+  ],
+  "author": "OSSM Project Contributors",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

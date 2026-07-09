@@ -79,6 +79,47 @@ enum BaseCommand<'a> {
         value: u32,
     },
     GetModbusScanDelayUs,
+    SetBleEnabled {
+        /// Enable BLE: true or false
+        value: bool,
+    },
+    GetBleEnabled,
+    SetHostname {
+        /// Device mDNS hostname
+        hostname: &'a str,
+    },
+    SetDhcpEnabled {
+        /// Enable or disable DHCP (true/false)
+        value: bool,
+    },
+    SetStaticIp {
+        /// Static IP address (e.g. 192.168.1.100)
+        ip: &'a str,
+    },
+    SetStaticMask {
+        /// Static subnet mask (e.g. 255.255.255.0 or 24)
+        mask: &'a str,
+    },
+    SetStaticGateway {
+        /// Static gateway IP (e.g. 192.168.1.1)
+        gateway: &'a str,
+    },
+    SetStaticDns {
+        /// Static DNS server IP (e.g. 8.8.8.8)
+        dns: &'a str,
+    },
+    GetNetworkConfig,
+    GetState,
+    GetStatus,
+    ResetTimestamp,
+    SetWaypoints {
+        /// Waypoints JSON string
+        json: &'a str,
+    },
+    AppendWaypoints {
+        /// Waypoints JSON string
+        json: &'a str,
+    },
 }
 
 struct StdoutAdapter(std::io::Stdout);
@@ -102,7 +143,7 @@ impl EmbeddedWrite for StdoutAdapter {
 pub fn handle_stdin_command(app_context: AppContext) {
     let mut cli = CliBuilder::default()
         .writer(StdoutAdapter(std::io::stdout()))
-        .command_buffer([0u8; 512])
+        .command_buffer([0u8; 2048])
         .history_buffer([0u8; 2048])
         .build()
         .unwrap();
@@ -419,6 +460,154 @@ fn execute_command(command: BaseCommand<'_>, app_context: &AppContext) {
                 println!("modbus_scan_delay_us: 0 (using Modbus t3.5 only)");
             } else {
                 println!("modbus_scan_delay_us: {}us", config.modbus_scan_delay_us);
+            }
+        }
+        BaseCommand::SetBleEnabled { value } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            config.ble_enabled = value;
+            sm.set_pin_configuration(&config).unwrap();
+            log::info!("ble_enabled set to {}, restart to apply", value);
+        }
+        BaseCommand::GetBleEnabled => {
+            let config = app_context.storage_manager.lock().unwrap().get_pin_configuration().unwrap_or_default();
+            println!("ble_enabled: {}", config.ble_enabled);
+        }
+        BaseCommand::SetHostname { hostname } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_network_configuration().unwrap_or_default();
+            config.hostname = hostname.to_string();
+            sm.set_network_configuration(&config).unwrap();
+            log::info!("hostname set to {}, restart to apply", hostname);
+        }
+        BaseCommand::SetDhcpEnabled { value } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_network_configuration().unwrap_or_default();
+            config.dhcp_enabled = value;
+            sm.set_network_configuration(&config).unwrap();
+            log::info!("dhcp_enabled set to {}, restart to apply", value);
+        }
+        BaseCommand::SetStaticIp { ip } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_network_configuration().unwrap_or_default();
+            config.static_ip = ip.to_string();
+            sm.set_network_configuration(&config).unwrap();
+            log::info!("static_ip set to {}, restart to apply", ip);
+        }
+        BaseCommand::SetStaticMask { mask } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_network_configuration().unwrap_or_default();
+            config.static_mask = mask.to_string();
+            sm.set_network_configuration(&config).unwrap();
+            log::info!("static_mask set to {}, restart to apply", mask);
+        }
+        BaseCommand::SetStaticGateway { gateway } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_network_configuration().unwrap_or_default();
+            config.static_gateway = gateway.to_string();
+            sm.set_network_configuration(&config).unwrap();
+            log::info!("static_gateway set to {}, restart to apply", gateway);
+        }
+        BaseCommand::SetStaticDns { dns } => {
+            let mut sm = app_context.storage_manager.lock().unwrap();
+            let mut config = sm.get_network_configuration().unwrap_or_default();
+            config.static_dns = dns.to_string();
+            sm.set_network_configuration(&config).unwrap();
+            log::info!("static_dns set to {}, restart to apply", dns);
+        }
+        BaseCommand::GetNetworkConfig => {
+            match app_context.storage_manager.lock().unwrap().get_network_configuration() {
+                Ok(config) => {
+                    let json = serde_json::to_string_pretty(&config).unwrap();
+                    println!("{}", json);
+                }
+                Err(e) => {
+                    log::error!("Failed to get network config: {}", e);
+                }
+            }
+        }
+        BaseCommand::GetState => {
+            let state = {
+                let mut mc_opt = app_context.motor_controller.lock().unwrap();
+                mc_opt.as_mut().map(|mc| mc.get_current_state())
+            };
+            if let Some(state) = state {
+                println!("{}", serde_json::to_string(&state).unwrap());
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::GetStatus => {
+            let st = {
+                let mut mc_opt = app_context.motor_controller.lock().unwrap();
+                mc_opt.as_mut().map(|mc| {
+                    serde_json::json!({
+                        "state": mc.get_current_state(),
+                        "config": mc.get_config()
+                    })
+                })
+            };
+            if let Some(st) = st {
+                println!("{}", serde_json::to_string(&st).unwrap());
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::ResetTimestamp => {
+            let command_tx = {
+                let mut mc_opt = app_context.motor_controller.lock().unwrap();
+                mc_opt.as_mut().map(|mc| mc.get_command_sender())
+            };
+            if let Some(tx) = command_tx {
+                let _ = tx.lock().unwrap().enqueue(crate::motion::MotionCommand::ResetTimestamp);
+                println!("ok");
+            } else {
+                log::error!("Motor controller not initialized");
+            }
+        }
+        BaseCommand::SetWaypoints { json } => {
+            match serde_json::from_str::<crate::http_api::WaypointsInput>(json) {
+                Ok(input) => {
+                    let (waypoints, reset_timestamp) = input.into_parts();
+                    let cmd = crate::motion::MotionCommand::SetWaypoints {
+                        waypoints,
+                        reset_timestamp,
+                    };
+                    let command_tx = {
+                        let mut mc_opt = app_context.motor_controller.lock().unwrap();
+                        mc_opt.as_mut().map(|mc| mc.get_command_sender())
+                    };
+                    if let Some(tx) = command_tx {
+                        let _ = tx.lock().unwrap().enqueue(cmd);
+                        println!("ok");
+                    } else {
+                        log::error!("Motor controller not initialized");
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to parse waypoints JSON: {}", e);
+                }
+            }
+        }
+        BaseCommand::AppendWaypoints { json } => {
+            match serde_json::from_str::<crate::http_api::WaypointsInput>(json) {
+                Ok(input) => {
+                    let (waypoints, _) = input.into_parts();
+                    let cmd = crate::motion::MotionCommand::AppendWaypoints(waypoints);
+                    let command_tx = {
+                        let mut mc_opt = app_context.motor_controller.lock().unwrap();
+                        mc_opt.as_mut().map(|mc| mc.get_command_sender())
+                    };
+                    if let Some(tx) = command_tx {
+                        let _ = tx.lock().unwrap().enqueue(cmd);
+                        println!("ok");
+                    } else {
+                        log::error!("Motor controller not initialized");
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to parse waypoints JSON: {}", e);
+                }
             }
         }
     }

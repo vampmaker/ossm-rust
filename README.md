@@ -2,7 +2,7 @@
 
 This repository contains the firmware for an OSSM controller, written in Rust. It's designed to run on ESP32-C6 or ESP32-S3 microcontrollers and control a 57AIM30 integrated servo motor.
 
-This guide is intended for users who may not have a technical background. Please follow the steps carefully.
+This guide is designed to be friendly for everyone, even if you have no technical or engineering background! Please follow these step-by-step instructions to get your hardware wired and running smoothly.
 
 ## Part 1: Required Hardware
 
@@ -10,55 +10,79 @@ Here is a list of components you will need to build the controller.
 
 | Component | Description | Notes |
 | --- | --- | --- |
-| **Microcontroller** | ESP32-C6 or ESP32-S3 Development Board | Any ESP32-C6 or ESP32-S3 board with a USB-C connector should work. |
+| **Microcontroller** | ESP32-C6 or ESP32-S3 Development Board | Any ESP32-C6 or ESP32-S3 board with a USB-C connector will work.<br><br>**Important Note on USB Ports:** Many development boards have **two** USB-C ports (often labeled "USB" / "Native" / "JTAG" vs "UART" / "COM"). Please always use the **Native JTAG / USB port** instead of the USB-to-UART converter port! The native JTAG port connects directly to the processor for faster, hassle-free flashing without needing external driver chips. |
 | **Motor** | 57AIM30 Integrated Servo Motor | **Important:** Make sure to get the `57AIM30` model, not the `57AIM30H`. The `57AIM30` has a rated speed of 1500 RPM and 0.96 Nm of torque, which is ideal for this application. |
-| **RS485 Transceiver**| MAX3485 Module | This is used for communication between the ESP32 and the motor. |
-| **Power Supply (Motor)** | 24V DC Power Adapter | To power the servo motor. The connector type should be compatible with your DC jack. |
-| **Power Supply (ESP32)**| 5V USB Charger | Any standard USB phone charger with a USB-C cable will work. |
-| **Cables & Connectors** | - DC 5.5mm female jack<br>- PHB2.0 2x5 pin connector cable<br>- Jumper wires | The DC jack is for connecting the 24V power supply to the motor. The PHB2.0 cable connects to the motor's communication port. You will need to do some soldering. |
+| **RS485 Transceiver**| MAX3485 Module | This small board translates signals between the ESP32 microcontroller and the motor. |
+| **Power Supply (Motor)** | 24V DC Power Adapter | To power the servo motor. Make sure it can supply enough current for your mechanical load. |
+| **Power Supply (ESP32)**| 5V USB Charger | Any standard USB phone charger with a USB-C cable will work to power the controller once everything is set up. |
+| **Cables & Connectors** | - DC 5.5×2.1/2.5mm female jack<br>- **KF2EDGK-3.81 6P** terminal plug<br>- **PHB2.0 2×5P** cable / connector<br>- Jumper (DuPont) wires | **Important Note on Motor Connectors:** Check the box your 57AIM30 motor arrived in. If the matching green and white plugs were not included, you will need to buy them separately:<br>• **For Motor Power (front 6-pin socket):** buy a **KF2EDGK-3.81 6P** pluggable terminal block.<br>• **For Communication & Logic (back 10-pin socket):** buy a **PHB2.0 2×5P** (2.0mm pitch, 2x5 pin) connector or pre-crimped cable.<br>The DC female jack connects your 24V power adapter to the green KF2EDGK power terminal. |
 
-## Part 2: Wiring
+## Part 2: Wiring & Hardware Assembly
 
-Connecting the components correctly is crucial. Please double-check all connections before powering anything on.
+Connecting the components correctly is crucial. Don't worry if you're new to this—just take it step by step! Please double-check all connections before plugging in any power supplies.
 
-Here is a breakdown of the wiring:
+### Complete Hardware Wiring Diagram
+Below is the complete visual system diagram illustrating the connections between your power adapters, ESP32 development board, MAX3485 transceiver, and the 57AIM30 servo motor's front and back terminals:
 
-### Motor Power Connection (Front 6-pin terminal)
+<div align="center">
+  <img src="./assets/wiring_diagram.svg" alt="OSSM Hardware Wiring Diagram" width="100%"/>
+</div>
 
-| Motor (+V) | --> | 24V Power Supply (Positive `+`) |
+> [!TIP]
+> **Which connector goes where?**
+> Your 57AIM30 motor has two sockets:
+> • **Front 6-Pin Socket (Power):** Uses the green **KF2EDGK-3.81 6P** connector for the 24V heavy-duty motor power.
+> • **Back 10-Pin Socket (Communication):** Uses the white **PHB2.0 2×5P** connector for 5V logic power and RS-485 signal wires.
+
+### Step 1: Motor Power Connection (Front 6-Pin Terminal)
+
+This terminal supplies the 24V power needed to drive the motor shaft. Use your green **KF2EDGK-3.81 6P** connector here.
+
+| Motor Terminal (+V) | --> | 24V Power Supply (Positive `+`) |
 | --- | --- | --- |
-| Motor (GND) | --> | 24V Power Supply (Negative `-`) |
+| Motor Terminal (GND) | --> | 24V Power Supply (Negative `-`) |
 
-### Communication and Logic Power (Motor's back 2x5 pin terminal & ESP32)
+> [!CAUTION]
+> **Check Polarity!** Double-check that positive (`+`) and negative (`-`) wires are not reversed before plugging in your 24V power adapter!
 
-First, connect the motor to the MAX3485 RS485 transceiver:
+### Step 2: Communication & Logic Power (Back 2×5-Pin Terminal & ESP32)
 
-| Motor (485A) | --> | MAX3485 (A) |
+This back terminal uses the **PHB2.0 2×5P** connector. It powers the motor's internal smart controller (5V) and sends control commands back and forth using the RS-485 transceiver board (MAX3485).
+
+First, connect the motor's communication wires to the MAX3485 RS-485 module:
+
+| Motor Terminal (485A) | --> | MAX3485 Module (A) |
 | --- | --- | --- |
-| Motor (485B) | --> | MAX3485 (B) |
+| Motor Terminal (485B) | --> | MAX3485 Module (B) |
 
-Next, connect the ESP32 to the MAX3485 and the motor:
+Next, connect your ESP32 development board to the MAX3485 module and the motor's logic power pins:
 
-| ESP32 Pin | --> | Component Pin |
+| ESP32 Pin | --> | Component Pin | Purpose |
+| --- | --- | --- | --- |
+| 5V (or VBUS/VIN) | --> | Motor Terminal (5V) | Powers the motor's internal logic chip |
+| GND (Ground) | --> | Motor Terminal (COM / GND) | Common ground for signal stability |
+| 3.3V (or 3V3) | --> | MAX3485 Module (VCC / 3.3V) | Powers the RS-485 module |
+| GND (Ground) | --> | MAX3485 Module (GND) | Ground for the RS-485 module |
+| GPIO 18 (TX) | --> | MAX3485 Module (DI / TX) | Sends data to motor |
+| GPIO 19 (RX) | --> | MAX3485 Module (RO / RX) | Receives data from motor |
+| GPIO 20 | --> | MAX3485 Module (DE / RE) | Controls data transmission direction |
+
+> [!NOTE]
+> **About GPIO pins**: GPIO 18, 19, and 20 are the default pins on ESP32-C6. On ESP32-S3 boards (where pins 19 and 20 are reserved for USB JTAG), or if you connect to different pins, don't worry! The firmware has an automatic pin detection feature that finds your connections and saves them automatically. You can also view or change pins anytime using the web interface or serial commands.
+
+### Step 3: Powering the ESP32 Board
+
+Finally, connect your ESP32 board to a standard 5V USB charger or your computer using a USB-C cable:
+
+| ESP32 Type-C Port | --> | 5V USB Charger / Computer |
 | --- | --- | --- |
-| 5V | --> | Motor (5V) |
-| GND | --> | Motor (COM) |
-| 3.3V | --> | MAX3485 (VCC/3.3V) |
-| GND | --> | MAX3485 (GND) |
-| GPIO 18 (TX) | --> | MAX3485 (DI/TX) |
-| GPIO 19 (RX) | --> | MAX3485 (RO/RX) |
-| GPIO 20 | --> | MAX3485 (DE/RE) |
 
-Finally, power the ESP32 board:
+> [!IMPORTANT]
+> Remember: If your ESP32 board has two USB-C ports, always plug your cable into the **Native JTAG / USB port** (not the UART/COM port)!
 
-| ESP32 Type-C Port | --> | 5V USB Charger |
-| --- | --- | --- |
+### Building from Source (Optional for Developers)
 
-**Note on GPIO pins**: The firmware uses GPIO 18, 19, and 20 by default for Modbus communication on the ESP32-C6. If you use different pins or a different board, you will need to configure them later via serial commands.
-
-### Building from Source
-
-The project requires the Espressif `esp` Rust toolchain (configured in `rust-toolchain.toml`). Both targets are supported via cargo aliases defined in `.cargo/config.toml`:
+You don't need to build the code yourself—pre-compiled firmware is provided in Part 3! But if you are a developer and wish to compile from source, the project requires the Espressif `esp` Rust toolchain (configured in `rust-toolchain.toml`). Both targets are supported via cargo aliases defined in `.cargo/config.toml`:
 
 ```
 cargo b-c6    # Build for ESP32-C6
@@ -69,36 +93,40 @@ The firmware automatically adapts its pin layout based on the selected MCU.
 
 ## Part 3: Flashing the Firmware
 
-You don't need to build the firmware from source. Pre-compiled binary files will be available in the **Releases** section of this GitHub repository.
+You don't need to be a software programmer or build code from source! Pre-compiled binary files are ready for you in the **Releases** section of this repository. We also provide a built-in standalone web flasher (`flasher.html`) that runs directly inside your web browser without installing any software!
 
-We will use a web-based tool to flash the firmware onto your ESP32.
+> [!IMPORTANT]
+> **Use the Native JTAG Port!**
+> If your ESP32 development board has **two** USB-C ports (often labeled "USB", "Native", or "JTAG" vs "UART", "COM", or "CP2102"), **always plug your USB cable into the Native JTAG / USB port**, instead of the USB-to-UART converter port. The native JTAG port communicates faster and works directly with your browser without requiring extra driver installations!
 
-1.  Download the latest `firmware.bin` file from the Releases page of this project.
-2.  Connect your ESP32 to your computer using a USB-C cable.
-3.  Open your web browser (Google Chrome or Microsoft Edge are recommended) and go to: **[https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)**
-4.  Click the **"Connect"** button. A popup will appear asking you to select the serial port for your ESP32. It will usually be named `COMx` on Windows or `/dev/ttyUSBx` on Linux/macOS.
-5.  Once connected, you will see a table with "Flash Address" and "File" columns.
-6.  In the "Flash Address" field, enter `0x0` (this is the offset for the merged firmware image).
-7.  Click **"Choose a file..."** and select the `firmware.bin` file you downloaded.
-8.  Click the **"Program"** button to start flashing.
-9.  Wait for the process to complete. You should see a "Finished" message in the log.
+### Step-by-Step Flashing Guide
 
-## Part 4: Configuration
+1.  Download and extract the latest release package (`.zip`) from the **Releases** page of this GitHub repository.
+2.  Connect your ESP32-C6 or ESP32-S3 board to your computer using a USB-C data cable (remembering to use the **Native JTAG port** if your board has two ports!).
+3.  Open `flasher.html` directly in a browser that supports Web Serial (Google Chrome, Microsoft Edge, or Opera) by double-clicking the file or dragging it into your browser tab.
+4.  Click the **"Connect Device"** button. A browser popup will appear asking you to select the serial port for your ESP32.
+    > [!TIP]
+    > **How do I know which serial port belongs to my device?**
+    > If you see multiple COM ports or serial devices in the list and aren't sure which one is your ESP32, use this simple **plug-and-unplug test**:
+    > 1. Look at the current list of ports in the popup, then close or cancel the popup.
+    > 2. **Unplug** the USB cable of your ESP32 board from your computer.
+    > 3. Click **"Connect Device"** again and see which port **disappeared**. That is your device!
+    > 4. Close the popup, **plug your ESP32 back in**, click **"Connect Device"** again, select the port that just **reappeared**, and click **Connect**.
+5.  In the flasher interface, select or drag-and-drop the firmware binary file matching your chip model (e.g., `ossm-esp32c6.bin` for ESP32-C6 or `ossm-esp32s3.bin` for ESP32-S3). The flasher automatically configures the correct flash address offset (`0x0`).
+6.  Click the **"Flash Firmware"** button to start flashing.
+7.  Wait for the progress bar to reach 100% and the log to indicate that flashing is complete.
 
-After flashing, you need to configure the device to connect to your WiFi network. You'll do this by sending commands over a serial connection. The tool used for flashing can also be used as a serial monitor.
+## Part 4: Network & Device Configuration
 
-1.  Keep the ESP32 connected to your computer and stay on the flashing tool page. If you have closed it, you can open it again: **[https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/)**
-2.  If you are not connected, click **"Connect"** and select the same serial port you used for flashing.
-3.  The console is located at the bottom of the page. You should see log messages from the device. Press `Enter` in the input box to make sure the connection is working.
-4.  To configure WiFi, type the following commands one by one, replacing `<your-ssid>` and `<your-password>` with your actual WiFi network name and password. Press `Enter` after each command.
+After flashing, you need to configure the device to connect to your home WiFi network and set up your RS-485 Modbus pins. You can do this directly within the same web flasher using its convenient graphical interface!
 
-    ```
-    set-wifi-ssid <your-ssid>
-    set-wifi-password <your-password>
-    ```
+1.  Keep the ESP32 connected to your computer and stay on the `flasher.html` page.
+2.  If disconnected after flashing, click **"Connect Device"** again and select your serial port.
+3.  In the **"Step 2: Post-Flash Device Configuration"** panel, enter your home WiFi network name (SSID) and password into the input fields. You can also review or adjust Modbus GPIO pins and BLE settings.
+4.  Click the **"Send Configuration"** button. The flasher will automatically program your settings and reboot the ESP32.
+5.  The device will boot up and connect to your WiFi network. In the integrated terminal monitor at the bottom of the page, you will see a log message indicating it has connected and received an IP address. **Note down this IP address!** You will need it to open the control interface.
 
-6.  After setting the SSID and password, you need to restart the ESP32. You can do this by pressing the `RST` or `EN` button on the board, or by unplugging and plugging it back in.
-7.  The device will now connect to your WiFi network. In the serial monitor, you should see a message indicating it has connected and received an IP address. Note down this IP address.
+**Note on Motor Initialization**: When the firmware boots up, it automatically talks to your motor. If standard communication fails, it intelligently scans across different speeds (baud rates) and device IDs. If it finds a motor running at a different speed, it will automatically adjust the motor to the standard speed (`115200` baud) and print a message in the log asking you to power-cycle the motor. If you see this, simply unplug the 24V motor power for 3 seconds and plug it back in!
 
 ## Part 5: Usage
 
@@ -106,11 +134,14 @@ Once the device is on your network, you can control it through a web interface o
 
 ### Web Interface
 
-The firmware hosts a simple web interface. Open a browser on a device connected to the same WiFi network and navigate to the IP address of your ESP32 (the one you noted down earlier).
+The firmware hosts an embedded, real-time single-page web interface. Open a browser on a device connected to the same WiFi network and navigate to the IP address or mDNS hostname of your ESP32:
 
-Example: `http://192.168.1.123`
+Example: `http://192.168.1.123` or `http://ossm.local`
 
-From here, you can control the motor's functions.
+Key interface features include:
+- **Toggleable Real-Time Motor Position Diagram**: Visualizes the full stroke range (`0% – 100%`), physical hardware limits (`pos_min` / `pos_max`), active stroke window with distinct **Left Limit** and **Right Limit** boundaries, and an animated puck showing live motor position at 30 FPS. Can be toggled on or off using the Activity icon in the header, with toggle state persisted across browser sessions.
+- **Resilient High-Frequency Live Telemetry (`WsDataManager`)**: Uses a single-owner WebSocket client (`client.ts`) to stream real-time motor updates and loop statistics (`ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, `dt_mdev_ms`) at up to **30 FPS (`33ms`)** over WebSocket or BLE. Includes automatic idle connection cleanup after 3 seconds of inactivity, application-level watchdog silent-failure detection, and automatic reconnection loops.
+- **Interactive Motion Control & Spline Editor**: Adjust BPM (speed), stroke depth, top/bottom depth anchoring, stroke reversal, pause/resume modes, or design custom periodic trajectories with interactive spline control points.
 
 ### Serial Commands
 
@@ -136,7 +167,49 @@ set-depth <depth>              - Set motor stroke depth (0.0 to 1.0)
 set-depth-top <true|false>     - Set depth direction
 set-sharpness <sharpness>      - Set sharpness for thrust wave (0.01 to 0.99)
 set-spline-points <p1> <p2>... - Set points for spline wave (0.0 to 1.0)
+set-modbus-timeout-ms <val>    - Set Modbus per-read timeout in ms (0 = use default for baud rate)
+get-modbus-timeout-ms          - Get Modbus per-read timeout in ms
+set-modbus-scan-delay-us <val> - Set Modbus scan inter-probe delay in us (0 = use Modbus t3.5 only)
+get-modbus-scan-delay-us       - Get Modbus scan inter-probe delay in us
 ```
+
+### Multi-Mode Control CLI (`ossm.py`)
+
+The repository includes a comprehensive, unified command-line tool (`scripts/ossm.py`) built as a self-contained PEP 723 script. Using [`uv`](https://docs.astral.sh/uv/), you can run it directly without manually configuring a Python virtual environment.
+
+It supports controlling and monitoring your OSSM device across three communication modes: **WiFi** (HTTP REST & WebSocket JSON-RPC), **Bluetooth Low Energy** (`ble`), and **USB Serial** (`serial`).
+
+**Prerequisites:** Install [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+
+**Basic Usage & Syntax:**
+```bash
+# View available commands and options
+./scripts/ossm.py --help
+
+# Check device status over WiFi (default mode, IP defaults to 192.168.24.63 or set via -i)
+./scripts/ossm.py status -i 192.168.1.123
+
+# Check status over Bluetooth Low Energy (auto-discovers OSSM BLE device)
+./scripts/ossm.py status -m ble
+
+# Start the motor at 40 BPM with 80% depth using a spline waveform
+./scripts/ossm.py run --bpm 40 --depth 0.8 --wave spline -m wifi
+
+# Immediately pause the motor or park at bottom (pos 0.0)
+./scripts/ossm.py pause --pos 0.0 -m ble
+./scripts/ossm.py resume -m ble
+
+# View or configure RS-485 Modbus pins and BLE enable toggle over USB serial
+./scripts/ossm.py pins -m serial -p /dev/ttyACM0
+
+# Configure network & mDNS hostname
+./scripts/ossm.py net -m wifi
+
+# Launch real-time telemetry monitoring TUI dashboard
+./scripts/ossm.py monitor -m ble
+```
+
+When imported as a Python library, `ossm.py` also exports validated Pydantic v2 schemas (`MotorControllerConfig`, `StateResponse`, `PinConfiguration`, `NetworkConfiguration`, etc.) and the `DeviceBackend` class for custom Python automation scripts.
 
 ### Advanced Control: The Spline Wave
 
@@ -176,27 +249,29 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 {
   "bpm": 60.0,
   "depth": 1.0,
-  "depth-top": true,
+  "depth_top": true,
   "reversed": false,
-  "wave-func": "sine",
+  "wave_func": "sine",
   "sharpness": 0.5,
-  "spline-points": [0.0, 1.0],
+  "spline_points": [0.0, 1.0],
   "paused": true,
-  "paused-position": 0.5
+  "paused_position": 0.5,
+  "streaming": false
 }
 ```
 
 *   `bpm` (number): Beats per minute. Controls the speed of the motion cycle.
 *   `depth` (number): The stroke depth, from 0.0 (no movement) to 1.0 (full range).
-*   `depth-top` (boolean): Determines the direction of the stroke.
+*   `depth_top` (boolean): Determines the direction of the stroke.
     *   `true`: The stroke moves from the fully retracted position (0.0) to the specified `depth`. For example, a depth of 0.8 would move in the range [0.0, 0.8].
     *   `false`: The stroke moves from `1.0 - depth` to the fully extended position (1.0). For example, a depth of 0.8 would move in the range [0.2, 1.0].
 *   `reversed` (boolean): When `true`, reverses the direction of the waveform.
-*   `wave-func` (string): The motion pattern. Can be `"sine"`, `"thrust"`, or `"spline"`.
+*   `wave_func` (string): The motion pattern. Can be `"sine"`, `"thrust"`, or `"spline"`.
 *   `sharpness` (number): Only affects the `"thrust"` waveform. Controls the duration of the thrust, from 0.01 (sharpest) to 0.99 (smoothest).
-*   `spline-points` (array of numbers): An array of points (0.0 to 1.0) that define the custom motion path for the `"spline"` waveform.
+*   `spline_points` (array of numbers): An array of points (0.0 to 1.0) that define the custom motion path for the `"spline"` waveform.
 *   `paused` (boolean): `true` to pause the motor, `false` to run it.
-*   `paused-position` (number): The position (0.0 to 1.0) the motor will hold when paused.
+*   `paused_position` (number): The position (0.0 to 1.0) the motor will hold when paused.
+*   `streaming` (boolean): When `true`, the motor controller accepts real-time streaming motion commands over WebSocket (`/ws/command`).
 
 #### `POST /config`
 
@@ -234,20 +309,30 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
   "config": {
     "bpm": 60.0,
     "depth": 1.0,
-    "depth-top": true,
+    "depth_top": true,
     "reversed": false,
-    "wave-func": "sine",
+    "wave_func": "sine",
     "sharpness": 0.5,
-    "spline-points": [0.0, 1.0],
+    "spline_points": [0.0, 1.0],
     "paused": true,
-    "paused-position": 0.5
+    "paused_position": 0.5,
+    "streaming": false
   },
   "t": 123.45,
   "x": 0.5,
   "y": 1.0,
-  "shaped-y": 1.0,
+  "shaped_y": 1.0,
   "position": 10000,
-  "speed": 0.0
+  "speed": 0.0,
+  "stream": {
+    "buffered": 0,
+    "stream_time": 0.0,
+    "underrun": false
+  },
+  "update_history": [60, 60, 60, 60],
+  "position_history": [0.0, 0.5, 1.0, 0.5],
+  "pos_min": 0.0,
+  "pos_max": 25.0
 }
 ```
 
@@ -255,6 +340,148 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 *   `t`: Time offset in seconds since the motion started.
 *   `x`: The current phase of the waveform, from 0.0 to 1.0.
 *   `y`: The raw output of the waveform generator, from 0.0 to 1.0.
-*   `shaped-y`: The waveform output after depth and direction have been applied.
+*   `shaped_y`: The waveform output after depth and direction have been applied.
 *   `position`: The current absolute position of the motor in its native units.
 *   `speed`: The current speed of the motor.
+*   `stream`: The status of the streaming motion source (`buffered` waypoints count, current `stream_time`, and whether a buffer `underrun` occurred).
+*   `update_history`: Array of recent 1-second window counts of motor position updates (for telemetry update rate in Hz).
+*   `position_history`: Array of recent 1-second sampled motor position values.
+*   `pos_min`: Physical minimum position limit of the motor.
+*   `pos_max`: Physical maximum position limit of the motor.
+
+#### `GET /pin-config`
+
+*   **Method:** `GET`
+*   **Description:** Retrieves the current GPIO pin configuration and Modbus communication timing settings.
+*   **Response Body:** A JSON object representing the hardware pin and timing configuration.
+
+```json
+{
+  "modbus_tx": 18,
+  "modbus_rx": 19,
+  "modbus_de_re": 20,
+  "modbus_timeout_ms": 0,
+  "modbus_scan_delay_us": 0
+}
+```
+
+*   `modbus_tx` (number): GPIO pin number assigned to Modbus TX (DI).
+*   `modbus_rx` (number): GPIO pin number assigned to Modbus RX (RO).
+*   `modbus_de_re` (number): GPIO pin number assigned to Modbus DE/RE control.
+*   `modbus_timeout_ms` (number): Modbus per-read timeout in milliseconds (`0` = use default based on baud rate, up to `1000`).
+*   `modbus_scan_delay_us` (number): Modbus scan inter-probe delay in microseconds (`0` = use Modbus t3.5 timing only, up to `200000`).
+
+#### `POST /pin-config`
+
+*   **Method:** `POST`
+*   **Description:** Updates the GPIO pin configuration and Modbus timing settings. You must restart the microcontroller for pin assignment changes to take effect.
+*   **Request Body:** A JSON object with the same structure as the `GET /pin-config` response.
+*   **Response Body:** The updated configuration as a JSON object.
+
+#### `POST /restart`
+
+*   **Method:** `POST`
+*   **Description:** Triggers a soft reset and restarts the ESP32 microcontroller.
+*   **Response Body:** `"Restarting device"`
+
+#### `GET /ws/command`
+
+*   **Method:** `GET` (WebSocket Upgrade)
+*   **Description:** A WebSocket endpoint for real-time streaming of motion commands. This allows external applications to stream trajectory waypoints dynamically or query streaming status.
+*   **Protocol & Format:** Supports both traditional flat JSON command frames (`{"cmd": "..."}`) and JSON-RPC 2.0 style command/response messages (`{"jsonrpc": "2.0", "method": "...", "params": {...}, "id": 1}`). If an `id` is provided in the request, the server replies with a matching JSON-RPC response (`{"jsonrpc": "2.0", "id": 1, "result": ...}`).
+*   **Supported Commands**:
+    *   **Append Waypoints**: Appends a list of trajectory waypoints to the streaming buffer.
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "append-waypoints",
+  "params": [
+    { "ts": 1000, "pos": 0.5, "vel": 0.2 },
+    { "ts": 1050, "pos": 0.7 }
+  ],
+  "id": 1
+}
+```
+        *   `ts` (number): Sender clock timestamp in milliseconds.
+        *   `pos` (number): Target normalized position (from 0.0 to 1.0).
+        *   `vel` (optional number): Target velocity in normalized units/second.
+    *   **Set Waypoints**: Clears currently buffered waypoints and replaces them with a new list of trajectory waypoints. Optionally accepts an object with `reset-timestamp` set to `true` to drop the current stream time anchoring so that the first waypoint re-anchors the clock.
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "set-waypoints",
+  "params": {
+    "waypoints": [
+      { "ts": 1000, "pos": 0.5, "vel": 0.2 }
+    ],
+    "reset-timestamp": true
+  },
+  "id": 2
+}
+```
+    *   **Reset Timestamp**: Clears buffered waypoints and resets the streaming timestamp epoch so that the next received waypoint re-anchors the stream.
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "reset-timestamp",
+  "id": 2
+}
+```
+    *   **Status**: Requests the current `StreamStatus` (`{"buffered": 0, "stream_time": 0.0, "underrun": false}`).
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "status",
+  "id": 3
+}
+```
+    *   **Ping**: Application-level liveness check. Replies with `"pong"`.
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "ping",
+  "id": 4
+}
+```
+    *   **Get State**: Returns the comprehensive motor controller state (`StateResponse`, including real-time loop telemetry `ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, and `dt_mdev_ms`).
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get-state",
+  "id": 5
+}
+```
+    *   **Set Config**: Dynamically updates the motor controller configuration (`MotorControllerConfig`).
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "set-config",
+  "params": {
+    "motion": { ... },
+    "driver": { ... }
+  },
+  "id": 6
+}
+```
+    *   **Subscribe State**: Subscribes the WebSocket connection to periodic state notifications pushed by the server.
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "subscribe-state",
+  "params": {
+    "interval_ms": 33
+  },
+  "id": 7
+}
+```
+        *   When subscribed, the server periodically pushes lightweight JSON-RPC notifications of the form `{"jsonrpc": "2.0", "method": "state", "params": { ...StateResponse... }}`. Supports intervals down to `20ms` (`50 FPS`).
+        *   **Idle Auto-Disconnect**: To conserve device memory and TCP connection handler slots (`HANDLER_TASKS`), the embedded web interface automatically disconnects the WebSocket after 3 seconds of inactivity when no active listeners remain.
+        *   **Persistent Position Diagram Toggle**: The UI remembers the visibility toggle state of the Motor Position Diagram in browser `localStorage`.
+    *   **Unsubscribe State**: Stops periodic state pushing.
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "unsubscribe-state",
+  "id": 8
+}
+```

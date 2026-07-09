@@ -8,3 +8,13 @@ repo.key
 repo.key.pub
 servercert.pem
 prvtkey.pem
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+assets/wiring_diagram.png
+assets/wiring_diagram_zh.png
+components_*.lock
+__pycache__/

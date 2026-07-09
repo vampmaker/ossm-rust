@@ -1,4 +1,4 @@
-export type WaveFunc = 'sine' | 'thrust' | 'spline'
+export type WaveFunc = 'sine' | 'thrust' | 'spline' | 'funscript'
 export type PauseMode = 'fixed-position' | 'in-place'
 
 export interface MotorControllerConfig {
@@ -11,12 +11,35 @@ export interface MotorControllerConfig {
   spline_points: number[]
   paused: boolean
   paused_position: number
+  streaming?: boolean
 }
 
 export interface PausedControlPayload {
   paused?: boolean
   position?: number
   adjust?: number
+}
+
+export interface StreamStatus {
+  buffered: number
+  stream_time: number
+  underrun: boolean
+}
+
+export interface StreamWaypoint {
+  ts: number
+  pos: number
+  vel?: number
+}
+
+export interface FunscriptAction {
+  at: number
+  pos: number
+}
+
+export interface FunscriptDocument {
+  version?: string
+  actions: FunscriptAction[]
 }
 
 export interface MotorState {
@@ -27,6 +50,16 @@ export interface MotorState {
   shaped_y: number
   position: number
   speed: number
+  stream?: StreamStatus
+  update_history?: number[]
+  position_history?: number[]
+  pos_min?: number
+  pos_max?: number
+  ups?: number
+  dt_min_ms?: number
+  dt_max_ms?: number
+  dt_avg_ms?: number
+  dt_mdev_ms?: number
 }
 
 export interface PinConfiguration {
@@ -35,4 +68,15 @@ export interface PinConfiguration {
   modbus_de_re: number
   modbus_timeout_ms: number
   modbus_scan_delay_us: number
+  ble_enabled: boolean
 }
+
+export interface NetworkConfiguration {
+  hostname: string
+  dhcp_enabled: boolean
+  static_ip: string
+  static_mask: string
+  static_gateway: string
+  static_dns: string
+}
+

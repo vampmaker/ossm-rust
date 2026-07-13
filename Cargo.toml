@@ -24,6 +24,9 @@ opt-level = 3
 
 [features]
 default = ["esp32c6"]
+# Enable per-byte UART receive timing diagnostics (logs BYTE_DIAG lines via log::info!).
+# Build with: cargo b-c6 --release --features byte-timing-diag
+byte-timing-diag = []
 esp32c6 = [
     "esp-hal/esp32c6",
     "esp-rtos/esp32c6",

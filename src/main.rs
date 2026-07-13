@@ -81,7 +81,16 @@ async fn main(spawner: Spawner) -> ! {
             let exec = MOTOR_EXEC.init(InterruptExecutor::new(sw_interrupt.software_interrupt1));
             exec.start(Priority::Priority3)
         };
-        motor_spawner.spawn(motor_task(app_context, peripherals.UART1, pin_config).unwrap());
+        motor_spawner.spawn(
+            motor_task(
+                app_context,
+                peripherals.UART1,
+                peripherals.UHCI0,
+                peripherals.DMA_CH0,
+                pin_config,
+            )
+            .unwrap(),
+        );
     }
 
     #[cfg(feature = "esp32s3")]
@@ -91,12 +100,14 @@ async fn main(spawner: Spawner) -> ! {
         static CORE1_STACK: StaticCell<Stack<{ 32 * 1024 }>> = StaticCell::new();
         let stack = CORE1_STACK.init(Stack::new());
         let uart = peripherals.UART1;
+        let uhci = peripherals.UHCI0;
+        let dma_ch = peripherals.DMA_CH0;
         esp_rtos::start_second_core(
             peripherals.CPU_CTRL,
             sw_interrupt.software_interrupt1,
             stack,
             move || {
-                motor_57aim30::run_motor_blocking(app_context, uart, pin_config);
+                motor_57aim30::run_motor_blocking(app_context, uart, uhci, dma_ch, pin_config);
             },
         );
     }
@@ -129,9 +140,11 @@ async fn main(spawner: Spawner) -> ! {
 async fn motor_task(
     app_context: AppContext,
     uart: esp_hal::peripherals::UART1<'static>,
+    uhci: esp_hal::peripherals::UHCI0<'static>,
+    dma_ch: esp_hal::peripherals::DMA_CH0<'static>,
     pin_config: PinConfiguration,
 ) {
-    if let Err(e) = motor_57aim30::run_motor(app_context, uart, pin_config).await {
+    if let Err(e) = motor_57aim30::run_motor(app_context, uart, uhci, dma_ch, pin_config).await {
         log::error!("Motor task failed: {}", e);
     }
 }

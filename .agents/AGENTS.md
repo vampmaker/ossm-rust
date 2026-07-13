@@ -170,8 +170,8 @@ When interacting over USB serial (`115200` baud, `\r\n` terminated):
 
 1. **Stack Size Caution on ESP-IDF**:
    - The `edge-http` server future and its poll chain are ~29KB in memory. **Never** run the HTTP server directly on the main Embassy executor stack. Always spawn it on a dedicated `std::thread` with a heap-allocated stack of at least `65536` bytes (as seen in `src/main.rs`).
-2. **Modbus UART Concurrency**:
-   - Modbus communication happens over RS-485. Ensure pin DE/RE (Driver Enable / Receiver Enable) timing is respected if modifying UART drivers.
+2. **Modbus UART Concurrency & GDMA**:
+   - Modbus communication happens over RS-485 via ESP-HAL GDMA (`Uhci0` + `DmaCh0`). Ensure pin DE/RE (Driver Enable / Receiver Enable) timing is respected if modifying UART drivers. Circular DMA buffers (`esp_hal::dma_buffers!(256, 256)`) ensure continuous RX reception without dropping bytes during multi-phase Modbus frame reads.
 3. **Multi-Target Compatibility**:
    - Always ensure changes compile for both RISC-V (`esp32c6`) and Xtensa (`esp32s3`) architectures. Avoid using architecture-specific assembly or registers unless gated by conditional compilation (`#[cfg(target_arch = "...")]`).
 4. **Keeping APIs Synchronized**:

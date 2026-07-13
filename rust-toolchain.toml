@@ -1,3 +1,8 @@
 [toolchain]
 channel = "esp"
-components = ["rust-src"]
+components = ["rust-src", "rustfmt", "clippy", "rust-analyzer"]
+
+targets = [
+    "riscv32imac-unknown-none-elf",
+    "xtensa-esp32s3-none-elf",
+]

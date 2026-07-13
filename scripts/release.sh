@@ -19,22 +19,22 @@ echo "==> Building firmware for ESP32-C6 ..."
 cargo b-c6 --release
 
 echo "==> Building firmware for ESP32-S3 ..."
+source "${HOME}/export-esp.sh" 2>/dev/null || true
+# RUSTUP_TOOLCHAIN=esp cargo b-s3 --release
 cargo b-s3 --release
 
 echo "==> Generating merged flash image for ESP32-C6..."
 espflash save-image \
     --chip esp32c6 \
     --merge \
-    --bootloader target/riscv32imac-esp-espidf/release/bootloader.bin \
-    target/riscv32imac-esp-espidf/release/ossm-rust \
+    target/riscv32imac-unknown-none-elf/release/ossm-rust \
     "$RELEASE_DIR/ossm-esp32c6.bin"
 
 echo "==> Generating merged flash image for ESP32-S3..."
 espflash save-image \
     --chip esp32s3 \
     --merge \
-    --bootloader target/xtensa-esp32s3-espidf/release/bootloader.bin \
-    target/xtensa-esp32s3-espidf/release/ossm-rust \
+    target/xtensa-esp32s3-none-elf/release/ossm-rust \
     "$RELEASE_DIR/ossm-esp32s3.bin"
 
 echo ""

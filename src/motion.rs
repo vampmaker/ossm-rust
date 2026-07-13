@@ -1,9 +1,19 @@
-use std::time;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+extern crate alloc;
 
-use serde::{Serialize, Deserialize};
-use anyhow::Result;
+use alloc::vec;
+
+use alloc::collections::VecDeque;
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
+use embassy_time::{self, Duration, Instant};
+use serde::{Deserialize, Serialize};
+use static_cell::StaticCell;
+
+use crate::error::Result;
 use heapless::spsc::{Queue, Producer, Consumer};
 
 const SPLINE_RESOLUTION: usize = 1500;
@@ -26,13 +36,13 @@ impl WaveformGenerator for SineWaveform {
     fn evaluate(&self, time_offset_seconds: f32, bpm: f32) -> (f32, f32) {
         // period = 1 cycle, y ∈ [0, 1]
         let freq = bpm / 60.0;
-        let phase_rads = 2.0 * std::f32::consts::PI * time_offset_seconds * freq;
-        let y = f32::sin(phase_rads) / 2.0 + 0.5;
+        let phase_rads = 2.0 * core::f32::consts::PI * time_offset_seconds * freq;
+        let y = libm::sinf(phase_rads) / 2.0 + 0.5;
         
         // speed = d/dt(y) = d/dt(sin(2π * freq * t) / 2 + 0.5)
         //       = cos(2π * freq * t) * (2π * freq) / 2
         //       = π * freq * cos(2π * freq * t)
-        let speed = std::f32::consts::PI * freq * f32::cos(phase_rads);
+        let speed = core::f32::consts::PI * freq * libm::cosf(phase_rads);
         (y, speed)
     }
     
@@ -43,8 +53,8 @@ impl WaveformGenerator for SineWaveform {
         // x = asin((y - 0.5) * 2) / (2π)
         let normalized = (y - 0.5) * 2.0;
         let clamped = normalized.clamp(-1.0, 1.0);
-        let angle = f32::asin(clamped);
-        let x = angle / (2.0 * std::f32::consts::PI);
+        let angle = libm::asinf(clamped);
+        let x = angle / (2.0 * core::f32::consts::PI);
         // asin returns [-π/2, π/2], map to [0, 1]
         if x < 0.0 {
             x + 1.0
@@ -175,7 +185,7 @@ impl SplineWaveform {
         for i in 0..resolution {
             let x = i as f32 / (resolution as f32 - 1.0).max(1.0);
             
-            let segment_index = (x / segment_width).floor() as usize;
+            let segment_index = libm::floorf(x / segment_width) as usize;
             let segment_index = segment_index.min(num_points - 1);
             
             let p0_index = segment_index;
@@ -251,7 +261,7 @@ impl WaveformGenerator for SplineWaveform {
         
         // Linear interpolation
         let float_index = x * (self.resolution as f32 - 1.0);
-        let index1 = float_index.floor() as usize;
+        let index1 = libm::floorf(float_index) as usize;
         let index2 = (index1 + 1).min(self.resolution - 1);
 
         if index1 >= self.resolution -1 {
@@ -327,7 +337,7 @@ pub trait MotionSource: Send {
 struct WaveformMotionSource {
     generator: Box<dyn WaveformGenerator>,
     bpm: f32,
-    t0: time::Instant,
+    t0: Instant,
 }
 
 impl WaveformMotionSource {
@@ -335,15 +345,15 @@ impl WaveformMotionSource {
         Self {
             generator,
             bpm,
-            t0: time::Instant::now(),
+            t0: Instant::now(),
         }
     }
 }
 
 impl MotionSource for WaveformMotionSource {
     fn update(&mut self, _dt: f32) -> (f32, f32) {
-        let now = time::Instant::now();
-        let elapsed = now.duration_since(self.t0).as_secs_f32();
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.t0).as_micros() as f32 / 1_000_000.0;
         self.generator.evaluate(elapsed, self.bpm)
     }
 
@@ -352,12 +362,13 @@ impl MotionSource for WaveformMotionSource {
         // position, so only the phase is matched.
         let phase = self.generator.find_x_for_y(y);
         let time_offset = phase * 60.0 / self.bpm;
-        self.t0 = time::Instant::now() - time::Duration::from_secs_f32(time_offset);
+        self.t0 = Instant::now()
+            - Duration::from_micros((time_offset * 1_000_000.0) as u64);
     }
     
     fn get_phase_info(&self) -> (f32, f32) {
-        let now = time::Instant::now();
-        let elapsed = now.duration_since(self.t0).as_secs_f32();
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.t0).as_micros() as f32 / 1_000_000.0;
         let cycles = elapsed * self.bpm / 60.0;
         let x = cycles % 1.0;
         (elapsed, x)
@@ -582,12 +593,16 @@ impl StreamingMotionSource {
                     self.window.clear();
                     self.epoch = None;
                     self.catchup = None;
+                    self.stream_time = 0.0;
+                    self.underrun = false;
                 }
                 MotionCommand::SetWaypoints { waypoints, reset_timestamp } => {
                     self.window.clear();
                     if reset_timestamp {
                         self.epoch = None;
                         self.catchup = None;
+                        self.stream_time = 0.0;
+                        self.underrun = false;
                     }
                     for wp in waypoints {
                         self.ingest_waypoint(wp);
@@ -985,7 +1000,7 @@ enum MotionMode {
     Streaming,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, Default, PartialEq)]
 pub struct LoopStats {
     pub ups: u32,
     pub min_dt_ms: f32,
@@ -1000,7 +1015,7 @@ pub struct MotorController {
     paused_source: PausedMotionSource,
     streaming_source: StreamingMotionSource,
     
-    command_producer: Arc<Mutex<CommandProducer>>,
+    command_producer: &'static Mutex<CriticalSectionRawMutex, CommandProducer>,
 
     active_mode: MotionMode,
 
@@ -1008,20 +1023,22 @@ pub struct MotorController {
     position_gen: PositionGenerator,
     config: MotorControllerConfig,
     config_version: u32,
-    last_cycle: time::Instant,
+    last_cycle: Instant,
     
     // Internal state
     last_y: f32,
     last_speed: f32,
 
     // Telemetry history (10s capacity, 1s window)
-    last_window_time: time::Instant,
+    last_window_time: Instant,
     current_window_updates: u32,
     current_min_dt_ms: f32,
     current_max_dt_ms: f32,
     current_sum_dt_ms: f32,
     current_sum_sq_dt_ms: f32,
     pub last_loop_stats: LoopStats,
+    pub motor_connected: bool,
+    pub modbus_stats: ModbusStats,
     update_history: Vec<u32>,
     position_history: Vec<f32>,
 }
@@ -1034,9 +1051,11 @@ impl MotorController {
         let paused_source = PausedMotionSource::new(config.paused_position, config.paused_position);
         
         // Initialize Queue
-        let queue: &'static mut Queue<MotionCommand, COMMAND_QUEUE_SIZE> = Box::leak(Box::new(Queue::new()));
+        static CMD_QUEUE: StaticCell<Queue<MotionCommand, COMMAND_QUEUE_SIZE>> = StaticCell::new();
+        static CMD_PRODUCER: StaticCell<Mutex<CriticalSectionRawMutex, CommandProducer>> = StaticCell::new();
+        let queue = CMD_QUEUE.init(Queue::new());
         let (producer, consumer) = queue.split();
-        let command_producer = Arc::new(Mutex::new(producer));
+        let command_producer = CMD_PRODUCER.init(Mutex::new(producer));
 
         let streaming_source = StreamingMotionSource::new(config.paused_position, consumer);
         
@@ -1057,7 +1076,7 @@ impl MotorController {
         let shaper = Shaper::new(config.depth, direction, config.reversed);
         let position_gen = PositionGenerator::new(0.0, 0.0); // Will be updated after homing
         
-        let now = time::Instant::now();
+        let now = Instant::now();
         Self {
             waveform_source,
             paused_source,
@@ -1078,13 +1097,15 @@ impl MotorController {
             current_sum_dt_ms: 0.0,
             current_sum_sq_dt_ms: 0.0,
             last_loop_stats: LoopStats::default(),
+            motor_connected: false,
+            modbus_stats: ModbusStats::default(),
             update_history: Vec::with_capacity(10),
             position_history: Vec::with_capacity(10),
         }
     }
 
-    pub fn get_command_sender(&self) -> Arc<Mutex<CommandProducer>> {
-        self.command_producer.clone()
+    pub fn get_command_sender(&self) -> &'static Mutex<CriticalSectionRawMutex, CommandProducer> {
+        self.command_producer
     }
 
     fn active_source(&self) -> &dyn MotionSource {
@@ -1106,7 +1127,7 @@ impl MotorController {
     // Sync internal state to the motor's homed range and current position.
     // The actual homing and motor parameter setup happen in the (async) motor task,
     // which then calls this to align the motion sources with the physical position.
-    pub fn sync_to_position(&mut self, pos_min: f32, pos_max: f32, position: f32) -> Result<(), anyhow::Error> {
+    pub fn sync_to_position(&mut self, pos_min: f32, pos_max: f32, position: f32) -> Result<()> {
         // Update position generator with actual range
         self.position_gen = PositionGenerator::new(pos_min, pos_max);
 
@@ -1117,14 +1138,14 @@ impl MotorController {
         match self.shaper.unshape(pos_normalized) {
             Some(waveform_y) => {
                 // Position is within current depth range, sync source to match
-                println!("Syncing waveform to current position (y={})", waveform_y);
+                log::info!("Syncing waveform to current position (y={})", waveform_y);
                 self.active_source_mut().follow(waveform_y, 0.0);
                 self.last_y = waveform_y;
                 self.last_speed = 0.0; // Approximation
             }
             None => {
                 // Position is outside current depth range, trigger transition
-                println!("Current position is outside depth range, starting transition");
+                log::info!("Current position is outside depth range, starting transition");
                 
                 // Set transitioning flag so shaper will move to target depth
                 self.shaper.transitioning = true;
@@ -1147,7 +1168,7 @@ impl MotorController {
         Ok(())
     }
 
-    pub fn set_config(&mut self, config: MotorControllerConfig) -> Result<(), anyhow::Error> {
+    pub fn set_config(&mut self, config: MotorControllerConfig) -> Result<()> {
         let wave_changed = self.config.wave_func != config.wave_func || self.config.spline_points != config.spline_points;
         let sharpness_changed = (self.config.sharpness - config.sharpness).abs() > 0.001;
         let bpm_changed = (self.config.bpm - config.bpm).abs() > 0.001;
@@ -1212,7 +1233,7 @@ impl MotorController {
         Ok(())
     }
 
-    pub fn update_config(&mut self, f: impl FnOnce(&mut MotorControllerConfig)) -> Result<(), anyhow::Error> {
+    pub fn update_config(&mut self, f: impl FnOnce(&mut MotorControllerConfig)) -> Result<()> {
         let mut config = self.config.clone();
         f(&mut config);
         self.set_config(config)
@@ -1273,15 +1294,21 @@ impl MotorController {
             dt_max_ms: self.last_loop_stats.max_dt_ms,
             dt_avg_ms: self.last_loop_stats.avg_dt_ms,
             dt_mdev_ms: self.last_loop_stats.mdev_dt_ms,
+            motor_connected: self.motor_connected,
+            modbus_stats: self.modbus_stats.clone(),
         }
+    }
+
+    pub fn set_motor_connected(&mut self, connected: bool) {
+        self.motor_connected = connected;
     }
 
     // Pure computation step: advances motion state and returns the (position, speed)
     // that should be written to the motor. The caller (motor task) performs the
     // actual (async) motor I/O, so this can be called under a briefly-held mutex.
     pub fn compute_cycle(&mut self) -> (f32, f32) {
-        let now = time::Instant::now();
-        let dt = now.duration_since(self.last_cycle).as_secs_f32();
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_cycle).as_micros() as f32 / 1_000_000.0;
         self.last_cycle = now;
 
         let dt_ms = dt * 1000.0;
@@ -1296,7 +1323,7 @@ impl MotorController {
         self.current_sum_sq_dt_ms += dt_ms * dt_ms;
 
         // Clamp step dt to at most 12ms so temporary CPU scheduling delays
-        // never cause sudden start/stop position jumps on the stepper motor.
+        // never cause sudden start/stop position jumps on the servo motor.
         let dt_clamped = dt.min(0.012);
 
         // Layer 1: Motion Source
@@ -1311,11 +1338,11 @@ impl MotorController {
         let (position, speed) = self.position_gen.generate(shaped_y, shaped_speed);
 
         self.current_window_updates += 1;
-        if now.duration_since(self.last_window_time).as_secs_f32() >= 1.0 {
+        if now.duration_since(self.last_window_time).as_micros() as f32 / 1_000_000.0 >= 1.0 {
             let n = self.current_window_updates as f32;
             let avg_dt_ms = if n > 0.0 { self.current_sum_dt_ms / n } else { 0.0 };
             let var = if n > 0.0 { (self.current_sum_sq_dt_ms / n) - (avg_dt_ms * avg_dt_ms) } else { 0.0 };
-            let mdev_dt_ms = if var > 0.0 { var.sqrt() } else { 0.0 };
+            let mdev_dt_ms = if var > 0.0 { libm::sqrtf(var) } else { 0.0 };
 
             self.last_loop_stats = LoopStats {
                 ups: self.current_window_updates,
@@ -1361,6 +1388,29 @@ pub struct MotorControllerConfig {
     pub streaming: bool,
 }
 
+#[derive(Serialize, Clone, Default, PartialEq)]
+pub struct TimingWindowStats {
+    pub min: u16,
+    pub max: u16,
+    pub pct5: u16,
+    pub pct10: u16,
+    pub pct50: u16,
+    pub pct90: u16,
+    pub pct95: u16,
+    pub mean: u16,
+    pub mdev: u16,
+}
+
+#[derive(Serialize, Clone, Default, PartialEq)]
+pub struct ModbusStats {
+    pub successful_requests: u32,
+    pub failed_requests: u32,
+    pub success_rate: f32,
+    pub round_trip: TimingWindowStats,
+    pub slave_latency: TimingWindowStats,
+    pub rx_duration: TimingWindowStats,
+}
+
 #[derive(Serialize)]
 pub struct StateResponse {
     pub config: MotorControllerConfig,
@@ -1380,6 +1430,8 @@ pub struct StateResponse {
     pub dt_max_ms: f32,
     pub dt_avg_ms: f32,
     pub dt_mdev_ms: f32,
+    pub motor_connected: bool,
+    pub modbus_stats: ModbusStats,
 }
 
 impl MotorControllerConfig {
@@ -1389,7 +1441,7 @@ impl MotorControllerConfig {
             depth: 1.0,
             depth_top: false,
             reversed: false,
-            wave_func: "sine".to_string(),
+            wave_func: String::from("sine"),
             sharpness: 0.3,
             spline_points: vec![0.0, 1.0], // Default to a sawtooth wave
             paused: false,

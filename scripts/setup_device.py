@@ -8,7 +8,7 @@
 #     "rich>=13.7.0",
 #     "bleak>=0.21.0",
 #     "websockets>=12.0",
-#     "requests>=2.31.0",
+#     "httpx2>=0.1.0",
 #     "pydantic>=2.0.0",
 # ]
 # ///
@@ -19,6 +19,7 @@ Uses DeviceBackend from ossm.py for UART communication and environment loading.
 """
 
 import argparse
+import asyncio
 import os
 import sys
 import time
@@ -49,7 +50,7 @@ def update_env_ip(ip_address):
     print(f"\033[36mUpdated DEVICE_IP=\"{ip_address}\" in .env\033[0m")
 
 
-def main():
+async def main_async():
     load_env()
 
     parser = argparse.ArgumentParser(description="OSSM Post-Flashing Setup Tool")
@@ -138,17 +139,17 @@ def main():
 
     for cmd in commands:
         print(f"\033[36m>\033[0m {cmd}")
-        lines = backend._serial_command(cmd, wait_response=True)
+        lines = await backend._serial_command(cmd, wait_response=True)
         for line in lines:
             print(f"  {line}")
 
     if not args.no_reset:
         print("\n\033[32mConfiguration sent.\033[0m Resetting device to apply changes...")
-        backend.restart_device()
-        time.sleep(0.5)
+        await backend.restart_device()
+        await asyncio.sleep(0.5)
 
         print("\n\033[33m--- Waiting for Reboot & WiFi Connection ---\033[0m")
-        ip_assigned = backend.wait_for_wifi_ip(timeout=25)
+        ip_assigned = await backend.wait_for_wifi_ip(timeout=25)
 
         if ip_assigned:
             print(f"\n\033[32m========================================================\033[0m")
@@ -164,9 +165,13 @@ def main():
 
         if args.monitor:
             print("\n\033[36mEntering monitor mode (press Ctrl+C to exit)...\033[0m")
-            backend.monitor_serial()
+            await backend.monitor_serial()
 
     print("\nDone!")
+
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

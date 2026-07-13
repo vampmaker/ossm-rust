@@ -42,6 +42,27 @@ export interface FunscriptDocument {
   actions: FunscriptAction[]
 }
 
+export interface TimingWindowStats {
+  min: number
+  max: number
+  pct5: number
+  pct10: number
+  pct50: number
+  pct90: number
+  pct95: number
+  mean: number
+  mdev: number
+}
+
+export interface ModbusStats {
+  successful_requests: number
+  failed_requests: number
+  success_rate: number
+  round_trip: TimingWindowStats
+  slave_latency: TimingWindowStats
+  rx_duration: TimingWindowStats
+}
+
 export interface MotorState {
   config: MotorControllerConfig
   t: number
@@ -60,6 +81,8 @@ export interface MotorState {
   dt_max_ms?: number
   dt_avg_ms?: number
   dt_mdev_ms?: number
+  motor_connected?: boolean
+  modbus_stats?: ModbusStats
 }
 
 export interface PinConfiguration {
@@ -67,11 +90,16 @@ export interface PinConfiguration {
   modbus_rx: number
   modbus_de_re: number
   modbus_timeout_ms: number
+  modbus_rx_timeout_us?: number
   modbus_scan_delay_us: number
+  modbus_inter_frame_delay_us: number
   ble_enabled: boolean
 }
 
 export interface NetworkConfiguration {
+  wifi_enabled: boolean
+  ssid: string
+  password: string
   hostname: string
   dhcp_enabled: boolean
   static_ip: string

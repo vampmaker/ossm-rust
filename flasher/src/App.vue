@@ -27,29 +27,38 @@ const pinModbusTx = ref(18)
 const pinModbusRx = ref(19)
 const pinModbusDeRe = ref(20)
 const modbusTimeoutMs = ref(0)
+const modbusRxTimeoutUs = ref(0)
+const modbusInterFrameDelayUs = ref(0)
 const modbusScanDelayUs = ref(0)
+const wifiEnabled = ref(true)
 const bleEnabled = ref(true)
 
 const DEVICE_CONFIG_STORAGE_KEY = 'ossm-flasher-device-config-v1'
 const DEFAULT_DEVICE_CONFIG = {
+  wifiEnabled: true,
   wifiSsid: '',
   wifiPassword: '',
   pinModbusTx: 18,
   pinModbusRx: 19,
   pinModbusDeRe: 20,
   modbusTimeoutMs: 0,
+  modbusRxTimeoutUs: 0,
+  modbusInterFrameDelayUs: 0,
   modbusScanDelayUs: 0,
   bleEnabled: true,
   flashAddress: '0x0',
 } as const
 
 function applyDeviceConfig(config: Partial<typeof DEFAULT_DEVICE_CONFIG>) {
+  wifiEnabled.value = config.wifiEnabled ?? DEFAULT_DEVICE_CONFIG.wifiEnabled
   wifiSsid.value = config.wifiSsid ?? DEFAULT_DEVICE_CONFIG.wifiSsid
   wifiPassword.value = config.wifiPassword ?? DEFAULT_DEVICE_CONFIG.wifiPassword
   pinModbusTx.value = config.pinModbusTx ?? DEFAULT_DEVICE_CONFIG.pinModbusTx
   pinModbusRx.value = config.pinModbusRx ?? DEFAULT_DEVICE_CONFIG.pinModbusRx
   pinModbusDeRe.value = config.pinModbusDeRe ?? DEFAULT_DEVICE_CONFIG.pinModbusDeRe
   modbusTimeoutMs.value = config.modbusTimeoutMs ?? DEFAULT_DEVICE_CONFIG.modbusTimeoutMs
+  modbusRxTimeoutUs.value = config.modbusRxTimeoutUs ?? DEFAULT_DEVICE_CONFIG.modbusRxTimeoutUs
+  modbusInterFrameDelayUs.value = config.modbusInterFrameDelayUs ?? DEFAULT_DEVICE_CONFIG.modbusInterFrameDelayUs
   modbusScanDelayUs.value = config.modbusScanDelayUs ?? DEFAULT_DEVICE_CONFIG.modbusScanDelayUs
   bleEnabled.value = config.bleEnabled ?? DEFAULT_DEVICE_CONFIG.bleEnabled
   flashAddress.value = config.flashAddress ?? DEFAULT_DEVICE_CONFIG.flashAddress
@@ -71,12 +80,15 @@ function loadDeviceConfig() {
 function persistDeviceConfig() {
   try {
     const payload = {
+      wifiEnabled: wifiEnabled.value,
       wifiSsid: wifiSsid.value,
       wifiPassword: wifiPassword.value,
       pinModbusTx: pinModbusTx.value,
       pinModbusRx: pinModbusRx.value,
       pinModbusDeRe: pinModbusDeRe.value,
       modbusTimeoutMs: modbusTimeoutMs.value,
+      modbusRxTimeoutUs: modbusRxTimeoutUs.value,
+      modbusInterFrameDelayUs: modbusInterFrameDelayUs.value,
       modbusScanDelayUs: modbusScanDelayUs.value,
       bleEnabled: bleEnabled.value,
       flashAddress: flashAddress.value,
@@ -216,7 +228,7 @@ onMounted(() => {
 })
 
 watch(
-  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusScanDelayUs, bleEnabled, flashAddress],
+  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusRxTimeoutUs, modbusInterFrameDelayUs, modbusScanDelayUs, bleEnabled, flashAddress],
   () => {
     persistDeviceConfig()
   },
@@ -625,13 +637,17 @@ async function sendConfig() {
     }
 
     const commands: Array<{ cmd: string; ack: string[] }> = []
-    if (wifiSsid.value) {
+    commands.push({
+      cmd: `set-wifi-enabled ${wifiEnabled.value}`,
+      ack: ['wifi_enabled set to'],
+    })
+    if (wifiEnabled.value && wifiSsid.value) {
       commands.push({
         cmd: `set-wifi-ssid ${escapeCliArg(wifiSsid.value)}`,
         ack: ['SSID saved:'],
       })
     }
-    if (wifiPassword.value) {
+    if (wifiEnabled.value && wifiPassword.value) {
       commands.push({
         cmd: `set-wifi-password ${escapeCliArg(wifiPassword.value)}`,
         ack: ['Password saved:'],
@@ -652,6 +668,14 @@ async function sendConfig() {
     commands.push({
       cmd: `set-modbus-timeout-ms ${modbusTimeoutMs.value}`,
       ack: ['modbus_timeout_ms set to'],
+    })
+    commands.push({
+      cmd: `set-modbus-rx-timeout-us ${modbusRxTimeoutUs.value}`,
+      ack: ['modbus_rx_timeout_us set to'],
+    })
+    commands.push({
+      cmd: `set-modbus-inter-frame-delay-us ${modbusInterFrameDelayUs.value}`,
+      ack: ['modbus_inter_frame_delay_us set to'],
     })
     commands.push({
       cmd: `set-modbus-scan-delay-us ${modbusScanDelayUs.value}`,
@@ -904,25 +928,40 @@ const statusColor = computed(() => {
         <div class="space-y-3">
           <!-- WiFi -->
           <fieldset class="space-y-2">
-            <legend class="text-sm font-medium text-gray-700">WiFi</legend>
-            <div>
-              <label class="text-xs text-gray-500">SSID</label>
-              <input
-                v-model="wifiSsid"
-                maxlength="32"
-                placeholder="Your WiFi network"
-                class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
-              />
+            <div class="flex items-center justify-between">
+              <legend class="text-sm font-medium text-gray-700">WiFi</legend>
+              <div class="flex items-center space-x-2">
+                <input
+                  id="flasher-wifi-enabled"
+                  type="checkbox"
+                  v-model="wifiEnabled"
+                  class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <label for="flasher-wifi-enabled" class="text-xs font-medium text-gray-700">
+                  Enable WiFi
+                </label>
+              </div>
             </div>
-            <div>
-              <label class="text-xs text-gray-500">Password</label>
-              <input
-                v-model="wifiPassword"
-                type="password"
-                maxlength="64"
-                placeholder="WiFi password"
-                class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
-              />
+            <div v-if="wifiEnabled" class="space-y-2">
+              <div>
+                <label class="text-xs text-gray-500">SSID</label>
+                <input
+                  v-model="wifiSsid"
+                  maxlength="32"
+                  placeholder="Your WiFi network"
+                  class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">Password</label>
+                <input
+                  v-model="wifiPassword"
+                  type="password"
+                  maxlength="64"
+                  placeholder="WiFi password"
+                  class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
+                />
+              </div>
             </div>
           </fieldset>
 
@@ -984,12 +1023,32 @@ const statusColor = computed(() => {
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">Read timeout (ms) <span class="text-gray-400">0 = default</span></label>
+                <label class="text-xs text-gray-500">Read timeout (ms) <span class="text-gray-400">0 = 10ms</span></label>
                 <input
                   v-model.number="modbusTimeoutMs"
                   type="number"
                   min="0"
                   max="1000"
+                  class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm font-mono focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">RX inter-byte (µs) <span class="text-gray-400">0 = Auto (1750µs @ 115200)</span></label>
+                <input
+                  v-model.number="modbusRxTimeoutUs"
+                  type="number"
+                  min="0"
+                  max="200000"
+                  class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm font-mono focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label class="text-xs text-gray-500">Inter-frame quiet (µs) <span class="text-gray-400">0 = Auto (350µs @ 115200)</span></label>
+                <input
+                  v-model.number="modbusInterFrameDelayUs"
+                  type="number"
+                  min="0"
+                  max="200000"
                   class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm font-mono focus:border-blue-500 focus:outline-none"
                 />
               </div>

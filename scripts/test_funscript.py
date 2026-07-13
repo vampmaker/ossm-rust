@@ -4,7 +4,7 @@
 # dependencies = [
 #     "websockets>=12.0",
 #     "python-dotenv>=1.0.0",
-#     "requests>=2.31.0",
+#     "httpx2>=0.1.0",
 #     "pyserial>=3.5",
 #     "bleak>=0.21.0",
 #     "typer>=0.12.0",
@@ -18,6 +18,7 @@ Tests .funscript parsing, trajectory scaling, chunked waypoint streaming, and de
 """
 
 import argparse
+import asyncio
 import json
 import os
 import socket
@@ -51,7 +52,7 @@ def is_host_online(host: str, port: int = 80, timeout: float = 1.0) -> bool:
         return False
 
 
-def run_funscript_tests(mode: str, live: bool):
+async def run_funscript_tests(mode: str, live: bool):
     backend = DeviceBackend(mode=mode)
     print(f"Initialized DeviceBackend in '{backend.mode}' mode (Target IP: {backend.ip})")
 
@@ -101,18 +102,18 @@ def run_funscript_tests(mode: str, live: bool):
         print(f"  [NOTE] Target device at {backend.ip}:80 not reachable right now. Live streaming hardware test skipped.")
     else:
         try:
-            res = backend.set_config({"streaming": True, "paused": False})
+            res = await backend.set_config({"streaming": True, "paused": False})
             log_pass(f"Device set to streaming mode: {res}")
 
-            send_res = backend.send_waypoints(scaled_chunk, reset_timestamp=True)
+            send_res = await backend.send_waypoints(scaled_chunk, reset_timestamp=True)
             log_pass(f"Sent initial waypoint chunk (reset-timestamp=True): {send_res}")
 
             time.sleep(0.3)
-            st = backend.get_status()
+            st = await backend.get_status()
             stream_st = st.get("state", {}).get("stream") or st.get("stream", {})
             log_pass(f"Stream status after feeding: {stream_st}")
 
-            backend.set_config({"streaming": False, "paused": True})
+            await backend.set_config({"streaming": False, "paused": True})
             log_pass("Cleaned up device state (streaming=False, paused=True)")
         except Exception as e:
             if live:
@@ -128,4 +129,4 @@ if __name__ == "__main__":
     parser.add_argument("--mode", "-m", default="wifi", choices=["wifi", "ble", "serial"], help="Communication mode")
     parser.add_argument("--live", action="store_true", help="Force fail if physical device is not reachable")
     args = parser.parse_args()
-    run_funscript_tests(args.mode, args.live)
+    asyncio.run(run_funscript_tests(args.mode, args.live))

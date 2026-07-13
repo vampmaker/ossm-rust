@@ -6,7 +6,7 @@
 #     "python-dotenv>=1.0.0",
 #     "rich>=13.7.0",
 #     "pyserial>=3.5",
-#     "requests>=2.31.0",
+#     "httpx2>=0.1.0",
 #     "bleak>=0.21.0",
 #     "typer>=0.12.0",
 #     "pydantic>=2.0.0",
@@ -21,6 +21,7 @@ motor position telemetry, and renders a visual feedback curve.
 """
 
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -89,7 +90,7 @@ def print_ascii_curve(samples: List[Dict[str, Any]]):
     console.print("---------+----------------------------------------------------+\n")
 
 
-def run_verification(mode: str):
+async def run_verification(mode: str):
     backend = DeviceBackend(mode=mode)
     console.print(f"[bold cyan]Connecting to OSSM device via '{mode.upper()}' mode...[/bold cyan]")
 
@@ -186,20 +187,26 @@ def run_verification(mode: str):
         ws.close()
 
     else:
-        # 1. Start streaming mode
-        backend.set_config({"streaming": True, "paused": False, "depth": 1.0})
+        # 0. Reset timestamp explicitly
+        await backend.send_rpc("reset-timestamp")
+        time.sleep(0.1)
 
-        # 2. Feed initial chunk
-        initial_chunk = waypoints[:20]
-        backend.send_waypoints(initial_chunk, reset_timestamp=True)
-        time.sleep(0.2)
+        # 1. Feed initial chunk (< 250 bytes for BLE GATT/serial limits)
+        initial_size = 5 if mode in ("serial", "ble") else 20
+        initial_chunk = waypoints[:initial_size]
+        await backend.send_waypoints(initial_chunk, reset_timestamp=True)
+        time.sleep(0.1)
+
+        # 2. Start streaming mode
+        await backend.set_config({"streaming": True, "paused": False, "depth": 1.0})
+        time.sleep(0.1)
         next_wp_idx = len(initial_chunk)
         start_time = time.time()
 
         console.print("[bold green]Streaming live waypoints and collecting motor trajectory feedback...[/bold green]")
 
         while (time.time() - start_time) < (total_duration_s + 1.0):
-            st = backend.get_status()
+            st = await backend.get_status()
             state_data = st.get("state", st)
             stream_info = state_data.get("stream", {})
             buffered = stream_info.get("buffered", 0)
@@ -226,14 +233,14 @@ def run_verification(mode: str):
             })
 
             if buffered < 40 and next_wp_idx < total_waypoints:
-                chunk_size = 10 if mode == "serial" else 20
+                chunk_size = 5 if mode in ("serial", "ble") else 20
                 chunk = waypoints[next_wp_idx : next_wp_idx + chunk_size]
-                backend.send_waypoints(chunk, reset_timestamp=False)
+                await backend.send_waypoints(chunk, reset_timestamp=False)
                 next_wp_idx += len(chunk)
 
             time.sleep(0.1)
 
-        backend.set_config({"streaming": False, "paused": True})
+        await backend.set_config({"streaming": False, "paused": True})
 
     # Display telemetry summary table
     table = Table(title=f"OSSM Funscript Motion Feedback Verification ({mode.upper()})", show_lines=True)
@@ -286,4 +293,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Verify Funscript motion and monitor curve feedback.")
     parser.add_argument("--mode", "-m", default="wifi", choices=["wifi", "ble", "serial"], help="Communication mode")
     args = parser.parse_args()
-    run_verification(args.mode)
+    asyncio.run(run_verification(args.mode))

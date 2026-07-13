@@ -1,67 +1,97 @@
 [package]
 name = "ossm-rust"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["vampmaker <vampmaker@outlook.com>"]
 edition = "2021"
 resolver = "2"
-rust-version = "1.77"
 
 [[bin]]
 name = "ossm-rust"
-harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+harness = false
 
 [profile.release]
-opt-level = "s"
-# Symbols stay in the ELF (not flashed to the chip), so crash addresses can
-# still be decoded with addr2line at no cost to on-device size or speed.
+opt-level = 2
 debug = true
-# Keep panics on integer overflow instead of silent wrapping.
 overflow-checks = true
+lto = false
 
 [profile.dev]
-debug = true    # Symbols are nice, and they don't increase the size on Flash
+debug = true
 opt-level = "z"
 
-[features]
-default = []
+[profile.dev.package.esp-radio]
+opt-level = 3
 
-experimental = ["esp-idf-svc/experimental"]
+[features]
+default = ["esp32c6"]
+esp32c6 = [
+    "esp-hal/esp32c6",
+    "esp-rtos/esp32c6",
+    "esp-radio/esp32c6",
+    "esp-storage/esp32c6",
+    "esp-nvs/esp32c6",
+    "esp-alloc/esp32c6",
+    "esp-backtrace/esp32c6",
+    "esp-println/esp32c6",
+    "esp-bootloader-esp-idf/esp32c6",
+]
+esp32s3 = [
+    "esp-hal/esp32s3",
+    "esp-rtos/esp32s3",
+    "esp-radio/esp32s3",
+    "esp-storage/esp32s3",
+    "esp-nvs/esp32s3",
+    "esp-alloc/esp32s3",
+    "esp-backtrace/esp32s3",
+    "esp-println/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+]
 
 [dependencies]
-log = "0.4"
-esp-idf-svc = { version = "0.52", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+esp-hal = { version = "1.1", features = ["unstable", "rt", "log-04"] }
+esp-rtos = { version = "0.3", features = ["embassy", "esp-radio", "esp-alloc", "log-04"] }
+esp-radio = { version = "1.0.0-beta.0", features = ["wifi", "ble", "coex", "unstable", "log-04"] }
+esp-alloc = { version = "0.10", features = ["nightly"] }
+esp-backtrace = { version = "0.15", features = ["panic-handler", "println"] }
+esp-println = { version = "0.13", default-features = false, features = ["jtag-serial", "critical-section", "log"] }
 
-embassy-executor = { version = "0.10", features = ["executor-thread", "platform-std"] }
-# generic-queue-8: the HTTP server runs via block_on on its own thread (not the
-# Embassy executor), so embassy-time timers need the generic timer queue.
-embassy-time = { version = "0.5", features = ["generic-queue-8"] }
-embassy-sync = "0.8"
+esp-storage = "0.8"
+esp-nvs = "0.4"
+esp-bootloader-esp-idf = "0.5.0"
+
+embassy-executor = { version = "0.10" }
+embassy-time = "0.5"
+embassy-sync = "0.7"
 embassy-futures = "0.1"
+embassy-net = { version = "0.9", features = ["tcp", "dhcpv4", "medium-ethernet", "dns"] }
 static_cell = "2"
 
-edge-http = { version = "0.8", features = ["std"] }
-edge-nal = "0.7"
-edge-nal-std = { version = "0.7", features = ["async-io-mini"], default-features = false }
-edge-ws = { version = "0.8", features = ["io"] }
-esp32-nimble = "0.12"
+edge-http = { version = "0.8", default-features = false, features = ["io"] }
+edge-nal = { version = "0.7", default-features = false }
+edge-nal-embassy = { version = "0.9", default-features = false, features = ["tcp", "proto-ipv4", "medium-ethernet"] }
+edge-ws = { version = "0.8", default-features = false, features = ["io"] }
 
-rmodbus = { version = "0.9.10", features = ["fixedvec"] }
-anyhow = "1.0.100"
-fixedvec = "0.2.4"
+trouble-host = { version = "0.6", features = ["gatt", "derive", "peripheral"] }
+bt-hci = { version = "0.8", features = ["uuid"] }
+
+rmodbus = { version = "0.9", default-features = false, features = ["fixedvec"] }
+fixedvec = "0.2"
+
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+serde-json-core = "0.6"
+
 heapless = "0.9"
-serde = "1.0.228"
-serde_json = "1.0.145"
-esp-idf-sys = "0.37"
-libm = "0.2.8"
-embedded-cli = "0.2.1"
-embedded-io = { version = "0.6.1", features = ["std"] }
+embedded-cli = "0.2"
+embedded-io = "0.6"
 embedded-io-async = "0.7"
+libm = "0.2"
+log = "0.4"
+critical-section = "1.2"
+portable-atomic = "1.6"
+
 [build-dependencies]
-embuild = "0.33"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(esp32c6)', 'cfg(esp32s3)'] }
-
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/mdns", version = "^1.2" }

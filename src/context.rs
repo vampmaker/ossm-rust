@@ -1,11 +1,13 @@
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
+
 use crate::motion::MotorController;
 use crate::storage::StorageManager;
-use esp_idf_svc::hal::gpio::AnyIOPin;
-use std::sync::{Arc, Mutex};
 
-#[derive(Clone)]
+pub type CsMutex<T> = Mutex<CriticalSectionRawMutex, T>;
+
+#[derive(Clone, Copy)]
 pub struct AppContext {
-    pub storage_manager: Arc<Mutex<Box<StorageManager>>>,
-    pub motor_controller: Arc<Mutex<Option<Box<MotorController>>>>,
-    pub all_pins: Arc<Mutex<Vec<Option<AnyIOPin<'static>>>>>,
+    pub storage: &'static CsMutex<StorageManager>,
+    pub motor_controller: &'static CsMutex<Option<MotorController>>,
 }

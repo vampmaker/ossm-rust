@@ -1,20 +1,32 @@
-use core::fmt::{Debug, Display};
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::net::{Ipv4Addr, SocketAddr};
 
-use edge_http::io::server::{Connection, Handler, Server};
-use edge_http::io::Error;
-use edge_http::ws::MAX_BASE64_KEY_RESPONSE_LEN;
-use edge_http::Method;
-use edge_nal::{TcpBind, TcpSplit};
-use edge_ws::{FrameHeader, FrameType};
+use edge_http::io::server::Connection;
+use edge_http::io::{Body, Error as HttpError};
+use edge_http::{Method, DEFAULT_MAX_HEADERS_COUNT};
+use edge_nal::{Close, TcpBind, TcpShutdown, TcpSplit};
+use edge_nal_embassy::{Tcp, TcpBuffers, TcpSocket};
+use edge_ws::io::{recv as ws_recv, send as ws_send};
+use edge_ws::FrameType;
+use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either as SelectEither};
+use embassy_net::Stack;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_sync::mutex::Mutex;
+use embassy_sync::semaphore::{GreedySemaphore, Semaphore};
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read, Write};
 use serde::{Deserialize, Serialize};
+use static_cell::StaticCell;
 
 use crate::context::AppContext;
-use crate::motion::{MotionCommand, MotorControllerConfig, StreamWaypoint};
+use crate::motion::MotorControllerConfig;
+use crate::rpc::{self, RpcAction};
 use crate::storage::{NetworkConfiguration, PinConfiguration};
 
-// Requests accepted on the /ws/command websocket. AppendWaypoints/SetWaypoints/ResetTimestamp map
-// to MotionCommand; Status makes the device reply with a JSON status frame.
 #[derive(Deserialize)]
 pub struct WsMessage {
     #[serde(default)]
@@ -46,21 +58,24 @@ impl WsMessage {
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum WaypointsInput {
-    List(Vec<StreamWaypoint>),
+    List(Vec<crate::motion::StreamWaypoint>),
     Object {
-        waypoints: Vec<StreamWaypoint>,
+        waypoints: Vec<crate::motion::StreamWaypoint>,
         #[serde(default, alias = "reset-timestamp", alias = "reset")]
         reset_timestamp: Option<bool>,
     },
-    Single(StreamWaypoint),
+    Single(crate::motion::StreamWaypoint),
 }
 
 impl WaypointsInput {
-    pub fn into_parts(self) -> (Vec<StreamWaypoint>, bool) {
+    pub fn into_parts(self) -> (Vec<crate::motion::StreamWaypoint>, bool) {
         match self {
             WaypointsInput::List(list) => (list, false),
-            WaypointsInput::Object { waypoints, reset_timestamp } => (waypoints, reset_timestamp.unwrap_or(false)),
-            WaypointsInput::Single(wp) => (vec![wp], false),
+            WaypointsInput::Object {
+                waypoints,
+                reset_timestamp,
+            } => (waypoints, reset_timestamp.unwrap_or(false)),
+            WaypointsInput::Single(wp) => (alloc::vec![wp], false),
         }
     }
 }
@@ -71,124 +86,11 @@ pub struct SubscribeParams {
     pub interval_ms: Option<u64>,
 }
 
-#[derive(Serialize)]
-pub struct RpcResponse<'a, T: Serialize> {
-    pub jsonrpc: &'static str,
-    pub id: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<&'a T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<RpcError<'a>>,
-}
-
-#[derive(Serialize)]
-pub struct RpcError<'a> {
-    pub code: i32,
-    pub message: &'a str,
-}
-
-#[derive(Serialize)]
-pub struct WsNotification<'a, T: Serialize> {
-    pub jsonrpc: &'static str,
-    pub method: &'a str,
-    pub cmd: &'a str,
-    pub params: &'a T,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<&'a T>,
-}
-
-async fn send_ws_text<S>(
-    socket: &mut S,
-    json: &str,
-) -> Result<(), ()>
-where
-    S: Read + Write + TcpSplit,
-{
-    let reply = FrameHeader {
-        frame_type: FrameType::Text(false),
-        payload_len: json.len() as u64,
-        mask_key: None,
-    };
-    if reply.send(&mut *socket).await.is_err()
-        || reply.send_payload(&mut *socket, json.as_bytes()).await.is_err()
-    {
-        return Err(());
-    }
-    Ok(())
-}
-
-async fn send_rpc_result<S, T>(
-    socket: &mut S,
-    id: Option<&serde_json::Value>,
-    result: &T,
-) -> Result<(), ()>
-where
-    S: Read + Write + TcpSplit,
-    T: Serialize,
-{
-    let resp = RpcResponse {
-        jsonrpc: "2.0",
-        id: id.cloned().unwrap_or(serde_json::Value::Null),
-        result: Some(result),
-        error: None,
-    };
-    let json = match serde_json::to_string(&resp) {
-        Ok(j) => j,
-        Err(_) => return Err(()),
-    };
-    send_ws_text(socket, &json).await
-}
-
-async fn send_rpc_error<S>(
-    socket: &mut S,
-    id: Option<&serde_json::Value>,
-    code: i32,
-    message: &str,
-) -> Result<(), ()>
-where
-    S: Read + Write + TcpSplit,
-{
-    let resp = RpcResponse::<()> {
-        jsonrpc: "2.0",
-        id: id.cloned().unwrap_or(serde_json::Value::Null),
-        result: None,
-        error: Some(RpcError { code, message }),
-    };
-    let json = match serde_json::to_string(&resp) {
-        Ok(j) => j,
-        Err(_) => return Err(()),
-    };
-    send_ws_text(socket, &json).await
-}
-
-async fn send_ws_notification<S, T>(
-    socket: &mut S,
-    method: &str,
-    params: &T,
-) -> Result<(), ()>
-where
-    S: Read + Write + TcpSplit,
-    T: Serialize,
-{
-    let notif = WsNotification {
-        jsonrpc: "2.0",
-        method,
-        cmd: method,
-        params,
-        state: None,
-    };
-    let json = match serde_json::to_string(&notif) {
-        Ok(j) => j,
-        Err(_) => return Err(()),
-    };
-    send_ws_text(socket, &json).await
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct PausedControl {
-    pub paused: Option<bool>,              // Set paused state
-    pub position: Option<f32>,             // Set absolute position
-    pub adjust: Option<f32>,               // Adjust position relatively (positive or negative)
+    pub paused: Option<bool>,
+    pub position: Option<f32>,
+    pub adjust: Option<f32>,
 }
 
 const APP_HTML_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
@@ -198,748 +100,740 @@ const NO_GZIP_HTML: &[u8] = b"\
 <title>OSSM</title></head><body style=\"font-family:sans-serif;text-align:center;padding:2em\">\
 <h1>Browser Not Supported</h1>\
 <p>This device serves a compressed interface that requires <code>Accept-Encoding: gzip</code>.</p>\
-<p>Please use a modern browser (Chrome, Firefox, Safari, Edge).</p>\
-<p>If using curl, use <code>curl --compressed</code>.</p>\
 </body></html>";
 
-// Bodies must be fully buffered because serde_json needs a contiguous slice;
-// all POST payloads are small JSON objects, so 1 KiB is plenty. Note this
-// array is held across await points, so it is part of each handler future.
+pub const HTTP_BUFFER_SIZE: usize = 2048;
+pub const TCP_BUFFER_SIZE: usize = 1024;
+pub const WEB_TASK_POOL_SIZE: usize = 1;
+const TCP_POOL_SIZE: usize = 10;
+const Q_ACCEPTORS: usize = 4;
+const WS_MAX: usize = 3;
 const MAX_BODY_LEN: usize = 1024;
-// Keep this low: the whole HTTP server future (including one handler future per
-// task) lives inside net_task, which Embassy allocates statically in .bss.
-const HANDLER_TASKS: usize = 2;
-const HTTP_BUF_SIZE: usize = 2048;
 
-const CORS_ORIGIN: (&str, &str) = ("Access-Control-Allow-Origin", "*");
-const CONNECTION_CLOSE: (&str, &str) = ("Connection", "close");
+type HttpConn<'a> = Connection<'a, TcpSocket<'static>, DEFAULT_MAX_HEADERS_COUNT>;
 
-type HttpServer = Server<HANDLER_TASKS, HTTP_BUF_SIZE>;
+struct SyncTcpSocket(TcpSocket<'static>);
 
-pub async fn run_server(app_context: AppContext) -> anyhow::Result<()> {
-    let addr = "0.0.0.0:80";
-    log::info!("Starting HTTP server on {}", addr);
+// SAFETY: OSSM runs HTTP on a single Embassy executor thread/core.
+unsafe impl Send for SyncTcpSocket {}
+unsafe impl Sync for SyncTcpSocket {}
 
-    let acceptor = edge_nal_std::Stack::new().bind(addr.parse().unwrap()).await?;
+impl SyncTcpSocket {
+    fn new(socket: TcpSocket<'_>) -> Self {
+        // SAFETY: Embassy stack and TCP buffer pool live in StaticCell for the firmware lifetime.
+        let socket = unsafe { core::mem::transmute::<TcpSocket<'_>, TcpSocket<'static>>(socket) };
+        Self(socket)
+    }
 
-    // The server run future is ~29KB (handler futures embed per-task buffers).
-    // Box::pin it: keeping it on the stack was tried and overflows even a
-    // 128KB thread stack, because at low opt levels every by-value move
-    // (into block_on, into its pinned slot) leaves another ~29KB dead copy in
-    // a live stack frame, on top of the deep poll call chain. Boxing pays one
-    // transient stack copy during construction, then the stack is free for
-    // polling, so total memory is lower (64KB stack + ~29KB heap).
-    let mut server: Box<HttpServer> = Box::new(HttpServer::new());
-    Box::pin(server.run(Some(50_000), acceptor, HttpHandler { app_context })).await?;
+    fn into_inner(self) -> TcpSocket<'static> {
+        self.0
+    }
+}
 
+static TCP_BUFFERS: StaticCell<TcpBuffers<TCP_POOL_SIZE, TCP_BUFFER_SIZE, TCP_BUFFER_SIZE>> =
+    StaticCell::new();
+static TCP_FACTORY: StaticCell<Tcp<'static>> = StaticCell::new();
+static SOCKET_QUEUE: Channel<CriticalSectionRawMutex, (SyncTcpSocket, usize), Q_ACCEPTORS> =
+    Channel::new();
+static WS_SOCKET_CH: Channel<CriticalSectionRawMutex, (SyncTcpSocket, usize), WS_MAX> =
+    Channel::new();
+static REST_GATE: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
+static WS_SLOTS: GreedySemaphore<CriticalSectionRawMutex> = GreedySemaphore::new(WS_MAX);
+static ACCEPT_SIGNALS: [Signal<CriticalSectionRawMutex, ()>; Q_ACCEPTORS] =
+    [const { Signal::new() }; Q_ACCEPTORS];
+
+fn normalize_path(path: &str) -> &str {
+    path.split('?').next().unwrap_or(path)
+}
+
+fn header_value<'a, const N: usize>(
+    headers: &'a edge_http::RequestHeaders<'a, N>,
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
+fn accepts_gzip<const N: usize>(headers: &edge_http::RequestHeaders<'_, N>) -> bool {
+    header_value(headers, "accept-encoding").is_some_and(|v| v.contains("gzip"))
+}
+
+async fn write_all_conn(conn: &mut HttpConn<'_>, data: &[u8]) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let written = conn.write(&data[offset..]).await?;
+        if written == 0 {
+            break;
+        }
+        offset += written;
+    }
+    conn.flush().await?;
     Ok(())
 }
 
-struct HttpHandler {
-    app_context: AppContext,
+async fn send_json(
+    conn: &mut HttpConn<'_>,
+    status: u16,
+    reason: &'static str,
+    body: &str,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    conn.initiate_response(
+        status,
+        Some(reason),
+        &[
+            ("Content-Type", "application/json"),
+            ("Access-Control-Allow-Origin", "*"),
+            ("Connection", "close"),
+        ],
+    )
+    .await?;
+    write_all_conn(conn, body.as_bytes()).await
 }
 
-impl Handler for HttpHandler {
-    type Error<E>
-        = Error<E>
-    where
-        E: Debug;
-
-    async fn handle<T, const N: usize>(
-        &self,
-        _task_id: impl Display + Copy,
-        conn: &mut Connection<'_, T, N>,
-    ) -> Result<(), Self::Error<T::Error>>
-    where
-        T: Read + Write + TcpSplit,
-    {
-        let headers = conn.headers()?;
-        let method = headers.method;
-        let path = headers.path;
-
-        match (method, path) {
-            (Method::Get, "/") => {
-                let accept_encoding = headers.headers.get("Accept-Encoding").unwrap_or("");
-                if accept_encoding.contains("gzip") {
-                    conn.initiate_response(
-                        200,
-                        Some("OK"),
-                        &[
-                            CORS_ORIGIN,
-                            ("Content-Type", "text/html"),
-                            ("Content-Encoding", "gzip"),
-                        ],
-                    )
-                    .await?;
-                    conn.write_all(APP_HTML_GZ).await?;
-                } else {
-                    conn.initiate_response(200, Some("OK"), &[CORS_ORIGIN, ("Content-Type", "text/html")])
-                        .await?;
-                    conn.write_all(NO_GZIP_HTML).await?;
-                }
-            }
-
-            (Method::Options, "/config") => cors_preflight(conn, "GET, POST, OPTIONS").await?,
-            (Method::Options, "/paused") => cors_preflight(conn, "POST, OPTIONS").await?,
-            (Method::Options, "/state") => cors_preflight(conn, "GET, OPTIONS").await?,
-            (Method::Options, "/pin-config") => cors_preflight(conn, "GET, POST, OPTIONS").await?,
-            (Method::Options, "/network-config") => cors_preflight(conn, "GET, POST, OPTIONS").await?,
-            (Method::Options, "/restart") => cors_preflight(conn, "POST, OPTIONS").await?,
-
-            (Method::Get, "/config") => {
-                let config = {
-                    let mc_opt = self.app_context.motor_controller.lock().unwrap();
-                    mc_opt.as_ref().map(|mc| mc.get_config())
-                };
-                let json = config.map(|c| serde_json::to_string(&c).unwrap());
-                match json {
-                    Some(json) => respond_json(conn, &json).await?,
-                    None => respond_unavailable(conn).await?,
-                }
-            }
-
-            (Method::Post, "/config") => {
-                let mut body = [0u8; MAX_BODY_LEN];
-                let Some(len) = read_body(conn, &mut body).await? else {
-                    respond_bad_request(conn, "Request too large").await?;
-                    return Ok(());
-                };
-                match serde_json::from_slice::<MotorControllerConfig>(&body[..len]) {
-                    Ok(config) => {
-                        let json = serde_json::to_string(&config).unwrap();
-                        let applied = {
-                            let mut mc_opt = self.app_context.motor_controller.lock().unwrap();
-                            if let Some(mc) = mc_opt.as_mut() {
-                                mc.set_config(config).unwrap();
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if applied {
-                            respond_json(conn, &json).await?;
-                        } else {
-                            respond_unavailable(conn).await?;
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to parse config: {}", e);
-                        respond_bad_request(conn, "Bad Request").await?;
-                    }
-                }
-            }
-
-            (Method::Post, "/paused") => {
-                let mut body = [0u8; MAX_BODY_LEN];
-                let Some(len) = read_body(conn, &mut body).await? else {
-                    respond_bad_request(conn, "Request too large").await?;
-                    return Ok(());
-                };
-                match serde_json::from_slice::<PausedControl>(&body[..len]) {
-                    Ok(control) => {
-                        let updated_cfg = {
-                            let mut mc_opt = self.app_context.motor_controller.lock().unwrap();
-                            if let Some(mc) = mc_opt.as_mut() {
-                                let mut config = mc.get_config();
-
-                                if let Some(paused) = control.paused {
-                                    config.paused = paused;
-                                }
-                                if let Some(position) = control.position {
-                                    config.paused_position = position.clamp(0.0, 1.0);
-                                }
-                                if let Some(adjust) = control.adjust {
-                                    config.paused_position = (config.paused_position + adjust).clamp(0.0, 1.0);
-                                }
-
-                                mc.set_config(config.clone()).unwrap();
-                                Some(config)
-                            } else {
-                                None
-                            }
-                        };
-                        let json = updated_cfg.map(|c| serde_json::to_string(&c).unwrap());
-                        match json {
-                            Some(json) => respond_json(conn, &json).await?,
-                            None => respond_unavailable(conn).await?,
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to parse paused control: {}", e);
-                        respond_bad_request(conn, "Bad Request").await?;
-                    }
-                }
-            }
-
-            (Method::Get, "/state") => {
-                let state = {
-                    let mut mc_opt = self.app_context.motor_controller.lock().unwrap();
-                    mc_opt.as_mut().map(|mc| mc.get_current_state())
-                };
-                let json = state.map(|s| serde_json::to_string(&s).unwrap());
-                match json {
-                    Some(json) => respond_json(conn, &json).await?,
-                    None => respond_unavailable(conn).await?,
-                }
-            }
-
-            (Method::Get, "/pin-config") => {
-                let config = self.app_context.storage_manager.lock().unwrap().get_pin_configuration().unwrap_or_default();
-                let json = serde_json::to_string(&config).unwrap();
-                respond_json(conn, &json).await?;
-            }
-
-            (Method::Post, "/pin-config") => {
-                let mut body = [0u8; MAX_BODY_LEN];
-                let Some(len) = read_body(conn, &mut body).await? else {
-                    respond_bad_request(conn, "Request too large").await?;
-                    return Ok(());
-                };
-                match serde_json::from_slice::<PinConfiguration>(&body[..len]) {
-                    Ok(config) => {
-                        if config.modbus_timeout_ms > 1000 {
-                            respond_bad_request(conn, "modbus_timeout_ms must be 0..=1000").await?;
-                            return Ok(());
-                        }
-                        if config.modbus_scan_delay_us > 200000 {
-                            respond_bad_request(conn, "modbus_scan_delay_us must be 0..=200000").await?;
-                            return Ok(());
-                        }
-                        let result = self.app_context.storage_manager.lock().unwrap().set_pin_configuration(&config);
-                        match result {
-                            Ok(()) => {
-                                let json = serde_json::to_string(&config).unwrap();
-                                respond_json(conn, &json).await?;
-                            }
-                            Err(e) => {
-                                log::error!("Failed to save pin config: {}", e);
-                                conn.initiate_response(500, Some("Internal Server Error"), &[CORS_ORIGIN]).await?;
-                                conn.write_all("Failed to save pin config".as_bytes()).await?;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to parse pin config: {}", e);
-                        respond_bad_request(conn, "Bad Request").await?;
-                    }
-                }
-            }
-
-            (Method::Get, "/network-config") => {
-                let config = self.app_context.storage_manager.lock().unwrap().get_network_configuration().unwrap_or_default();
-                let json = serde_json::to_string(&config).unwrap();
-                respond_json(conn, &json).await?;
-            }
-
-            (Method::Post, "/network-config") => {
-                let mut body = [0u8; MAX_BODY_LEN];
-                let Some(len) = read_body(conn, &mut body).await? else {
-                    respond_bad_request(conn, "Request too large").await?;
-                    return Ok(());
-                };
-                match serde_json::from_slice::<NetworkConfiguration>(&body[..len]) {
-                    Ok(config) => {
-                        let result = self.app_context.storage_manager.lock().unwrap().set_network_configuration(&config);
-                        match result {
-                            Ok(()) => {
-                                let json = serde_json::to_string(&config).unwrap();
-                                respond_json(conn, &json).await?;
-                            }
-                            Err(e) => {
-                                log::error!("Failed to save network config: {}", e);
-                                conn.initiate_response(500, Some("Internal Server Error"), &[CORS_ORIGIN]).await?;
-                                conn.write_all("Failed to save network config".as_bytes()).await?;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to parse network config: {}", e);
-                        respond_bad_request(conn, "Bad Request").await?;
-                    }
-                }
-            }
-
-            (Method::Post, "/restart") => {
-                conn.initiate_response(200, Some("OK"), &[CORS_ORIGIN]).await?;
-                conn.write_all("Restarting device".as_bytes()).await?;
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    esp_idf_svc::hal::reset::restart();
-                });
-            }
-
-            (Method::Get, "/ws/command") => {
-                self.handle_ws_command(conn).await?;
-            }
-
-            _ => {
-                conn.initiate_response(404, Some("Not Found"), &[CORS_ORIGIN]).await?;
-            }
-        }
-
-        Ok(())
+async fn send_json_obj<T: serde::Serialize>(
+    conn: &mut HttpConn<'_>,
+    status: u16,
+    reason: &'static str,
+    obj: &T,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
+    if let Ok(len) = serde_json_core::to_slice(obj, &mut *lease) {
+        conn.initiate_response(
+            status,
+            Some(reason),
+            &[
+                ("Content-Type", "application/json"),
+                ("Access-Control-Allow-Origin", "*"),
+                ("Connection", "close"),
+            ],
+        )
+        .await?;
+        write_all_conn(conn, &lease[..len]).await
+    } else {
+        send_json(conn, 500, "Internal Server Error", "Serialization failed").await
     }
 }
 
-impl HttpHandler {
-    async fn handle_ws_command<T, const N: usize>(
-        &self,
-        conn: &mut Connection<'_, T, N>,
-    ) -> Result<(), Error<T::Error>>
-    where
-        T: Read + Write + TcpSplit,
-    {
-        if !conn.is_ws_upgrade_request()? {
-            conn.initiate_response(400, Some("Bad Request"), &[CORS_ORIGIN]).await?;
-            conn.write_all("Expected WebSocket upgrade request".as_bytes()).await?;
-            return Ok(());
-        }
-
-        let command_tx = {
-            let mut mc_opt = self.app_context.motor_controller.lock().unwrap();
-            mc_opt.as_mut().map(|mc| mc.get_command_sender())
-        };
-        let Some(command_tx) = command_tx else {
-            log::error!("Motor controller not initialized");
-            conn.initiate_response(503, Some("Service Unavailable"), &[CORS_ORIGIN]).await?;
-            return Ok(());
-        };
-
-        let mut upgrade_buf = [0u8; MAX_BASE64_KEY_RESPONSE_LEN];
-        conn.initiate_ws_upgrade_response(&mut upgrade_buf).await?;
-        conn.complete().await?;
-
-        let socket = conn.unbind()?;
-        let mut frame_data = [0u8; 2048];
-        let mut subscribed = false;
-        let mut push_interval_ms = 500u64;
-        let mut next_push = embassy_time::Instant::now() + embassy_time::Duration::from_millis(push_interval_ms);
-
-        loop {
-            if subscribed {
-                let now = embassy_time::Instant::now();
-                if now >= next_push {
-                    next_push = now + embassy_time::Duration::from_millis(push_interval_ms);
-                    let state = {
-                        let mut mc_opt = self.app_context.motor_controller.lock().unwrap();
-                        mc_opt.as_mut().map(|mc| mc.get_current_state())
-                    };
-                    if let Some(state) = state {
-                        if send_ws_notification(&mut *socket, "state", &state).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            let header_res = if subscribed {
-                match embassy_futures::select::select(
-                    FrameHeader::recv(&mut *socket),
-                    embassy_time::Timer::at(next_push),
-                )
-                .await
-                {
-                    embassy_futures::select::Either::First(res) => Some(res),
-                    embassy_futures::select::Either::Second(_) => None,
-                }
-            } else {
-                Some(FrameHeader::recv(&mut *socket).await)
-            };
-
-            let header = match header_res {
-                Some(Ok(header)) => header,
-                Some(Err(e)) => {
-                    log::info!("WebSocket closed: {:?}", e);
-                    return Ok(());
-                }
-                None => continue,
-            };
-
-            let payload = match header.recv_payload(&mut *socket, &mut frame_data).await {
-                Ok(payload) => payload,
-                Err(e) => {
-                    log::info!("WebSocket payload error: {:?}", e);
-                    return Ok(());
-                }
-            };
-
-            match header.frame_type {
-                FrameType::Text(false) | FrameType::Binary(false) => {
-                    let request = match serde_json::from_slice::<WsMessage>(payload) {
-                        Ok(request) => request,
-                        Err(e) => {
-                            log::error!("Failed to parse command ({}): {}", e, String::from_utf8_lossy(payload));
-                            let _ = send_rpc_error(&mut *socket, None, -32700, "Parse error").await;
-                            continue;
-                        }
-                    };
-
-                    match request.cmd.as_str() {
-                        "append-waypoints" | "append_waypoints" => {
-                            match request.parse_params::<WaypointsInput>() {
-                                Ok(input) => {
-                                    let (waypoints, _) = input.into_parts();
-                                    let cmd = MotionCommand::AppendWaypoints(waypoints);
-                                    if command_tx.lock().unwrap().enqueue(cmd).is_err() {
-                                        log::warn!("Command queue full, dropping command");
-                                    }
-                                    if request.id.is_some()
-                                        && send_rpc_result(&mut *socket, request.id.as_ref(), &"ok").await.is_err()
-                                    {
-                                        return Ok(());
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to parse append-waypoints params: {}", e);
-                                    if request.id.is_some()
-                                        && send_rpc_error(&mut *socket, request.id.as_ref(), -32602, "Invalid params")
-                                            .await
-                                            .is_err()
-                                    {
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                        "set-waypoints" | "set_waypoints" => {
-                            match request.parse_params::<WaypointsInput>() {
-                                Ok(input) => {
-                                    let (waypoints, reset_timestamp) = input.into_parts();
-                                    let cmd = MotionCommand::SetWaypoints { waypoints, reset_timestamp };
-                                    if command_tx.lock().unwrap().enqueue(cmd).is_err() {
-                                        log::warn!("Command queue full, dropping command");
-                                    }
-                                    if request.id.is_some()
-                                        && send_rpc_result(&mut *socket, request.id.as_ref(), &"ok").await.is_err()
-                                    {
-                                        return Ok(());
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to parse set-waypoints params: {}", e);
-                                    if request.id.is_some()
-                                        && send_rpc_error(&mut *socket, request.id.as_ref(), -32602, "Invalid params")
-                                            .await
-                                            .is_err()
-                                    {
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                        "reset_timestamp" | "reset-timestamp" => {
-                            let cmd = MotionCommand::ResetTimestamp;
-                            if command_tx.lock().unwrap().enqueue(cmd).is_err() {
-                                log::warn!("Command queue full, dropping command");
-                            }
-                            if request.id.is_some()
-                                && send_rpc_result(&mut *socket, request.id.as_ref(), &"ok").await.is_err()
-                            {
-                                return Ok(());
-                            }
-                        }
-                        "status" => {
-                            let status = {
-                                let mc_opt = self.app_context.motor_controller.lock().unwrap();
-                                mc_opt.as_ref().map(|mc| mc.get_stream_status())
-                            };
-                            let Some(status) = status else {
-                                log::error!("Motor controller not initialized");
-                                if request.id.is_some() {
-                                    let _ = send_rpc_error(&mut *socket, request.id.as_ref(), -32603, "Motor controller not initialized").await;
-                                }
-                                continue;
-                            };
-                            if request.id.is_some() {
-                                if send_rpc_result(&mut *socket, request.id.as_ref(), &status).await.is_err() {
-                                    return Ok(());
-                                }
-                            } else {
-                                let json = serde_json::to_string(&status).unwrap();
-                                if send_ws_text(&mut *socket, &json).await.is_err() {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        "ping" => {
-                            if send_rpc_result(&mut *socket, request.id.as_ref(), &"pong").await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        "get_state" | "get-state" => {
-                            let state = {
-                                let mut mc_opt = self.app_context.motor_controller.lock().unwrap();
-                                mc_opt.as_mut().map(|mc| mc.get_current_state())
-                            };
-                            if let Some(state) = state {
-                                if send_rpc_result(&mut *socket, request.id.as_ref(), &state).await.is_err() {
-                                    return Ok(());
-                                }
-                            } else if send_rpc_error(&mut *socket, request.id.as_ref(), -32603, "Motor controller not initialized").await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        "set_config" | "set-config" => {
-                            match request.parse_params::<MotorControllerConfig>() {
-                                Ok(config) => {
-                                    let applied = {
-                                        let mut mc_opt = self.app_context.motor_controller.lock().unwrap();
-                                        if let Some(mc) = mc_opt.as_mut() {
-                                            mc.set_config(config.clone()).is_ok()
-                                        } else {
-                                            false
-                                        }
-                                    };
-                                    if applied {
-                                        if send_rpc_result(&mut *socket, request.id.as_ref(), &config).await.is_err() {
-                                            return Ok(());
-                                        }
-                                    } else if send_rpc_error(&mut *socket, request.id.as_ref(), -32603, "Failed to apply config").await.is_err() {
-                                        return Ok(());
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to parse config for set_config: {}", e);
-                                    if send_rpc_error(&mut *socket, request.id.as_ref(), -32602, "Invalid params").await.is_err() {
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                        "subscribe_state" | "subscribe-state" => {
-                            let params = request.parse_params::<SubscribeParams>().unwrap_or_default();
-                            let interval = params.interval_ms.unwrap_or(33).clamp(20, 60000);
-                            push_interval_ms = interval;
-                            subscribed = true;
-                            next_push = embassy_time::Instant::now() + embassy_time::Duration::from_millis(push_interval_ms);
-                            if send_rpc_result(&mut *socket, request.id.as_ref(), &"subscribed").await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        "unsubscribe_state" | "unsubscribe-state" => {
-                            subscribed = false;
-                            if send_rpc_result(&mut *socket, request.id.as_ref(), &"unsubscribed").await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        "get_network_config" | "get-network-config" => {
-                            let config = self.app_context.storage_manager.lock().unwrap().get_network_configuration().unwrap_or_default();
-                            if send_rpc_result(&mut *socket, request.id.as_ref(), &config).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        "set_network_config" | "set-network-config" => {
-                            match request.parse_params::<NetworkConfiguration>() {
-                                Ok(config) => {
-                                    if self.app_context.storage_manager.lock().unwrap().set_network_configuration(&config).is_ok() {
-                                        if send_rpc_result(&mut *socket, request.id.as_ref(), &config).await.is_err() {
-                                            return Ok(());
-                                        }
-                                    } else if send_rpc_error(&mut *socket, request.id.as_ref(), -32603, "Failed to apply config").await.is_err() {
-                                        return Ok(());
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to parse config for set-network-config: {}", e);
-                                    if send_rpc_error(&mut *socket, request.id.as_ref(), -32602, "Invalid params").await.is_err() {
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                        other => {
-                            log::warn!("Unknown WS command: {}", other);
-                            if send_rpc_error(&mut *socket, request.id.as_ref(), -32601, "Method not found").await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                FrameType::Ping => {
-                    let pong = FrameHeader {
-                        frame_type: FrameType::Pong,
-                        payload_len: payload.len() as u64,
-                        mask_key: None,
-                    };
-                    if pong.send(&mut *socket).await.is_err()
-                        || pong.send_payload(&mut *socket, payload).await.is_err()
-                    {
-                        return Ok(());
-                    }
-                }
-                FrameType::Close => {
-                    log::info!("WebSocket close requested");
-                    return Ok(());
-                }
-                _ => (),
-            }
-        }
-    }
-}
-
-async fn cors_preflight<T, const N: usize>(
-    conn: &mut Connection<'_, T, N>,
-    methods: &str,
-) -> Result<(), Error<T::Error>>
-where
-    T: Read + Write + TcpSplit,
-{
+async fn cors_preflight(
+    conn: &mut HttpConn<'_>,
+    methods: &'static str,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
     conn.initiate_response(
         200,
         Some("OK"),
         &[
-            CORS_ORIGIN,
+            ("Access-Control-Allow-Origin", "*"),
             ("Access-Control-Allow-Methods", methods),
-            ("Access-Control-Allow-Headers", "*"),
+            ("Access-Control-Allow-Headers", "Content-Type"),
+            ("Connection", "close"),
         ],
     )
     .await
 }
 
-async fn respond_json<T, const N: usize>(
-    conn: &mut Connection<'_, T, N>,
-    json: &str,
-) -> Result<(), Error<T::Error>>
-where
-    T: Read + Write + TcpSplit,
-{
-    conn.initiate_response(
-        200,
-        Some("OK"),
-        &[CORS_ORIGIN, CONNECTION_CLOSE, ("Content-Type", "application/json")],
-    )
-    .await?;
-    conn.write_all(json.as_bytes()).await
-}
-
-async fn respond_unavailable<T, const N: usize>(
-    conn: &mut Connection<'_, T, N>,
-) -> Result<(), Error<T::Error>>
-where
-    T: Read + Write + TcpSplit,
-{
-    conn.initiate_response(503, Some("Service Unavailable"), &[CORS_ORIGIN, CONNECTION_CLOSE])
-        .await?;
-    conn.write_all("Motor controller not initialized".as_bytes()).await
-}
-
-async fn respond_bad_request<T, const N: usize>(
-    conn: &mut Connection<'_, T, N>,
-    message: &str,
-) -> Result<(), Error<T::Error>>
-where
-    T: Read + Write + TcpSplit,
-{
-    conn.initiate_response(400, Some("Bad Request"), &[CORS_ORIGIN, CONNECTION_CLOSE])
-        .await?;
-    conn.write_all(message.as_bytes()).await
-}
-
-// Reads the request body into `buf`. Returns `None` if the body exceeds the buffer.
-async fn read_body<T, const N: usize>(
-    conn: &mut Connection<'_, T, N>,
-    buf: &mut [u8],
-) -> Result<Option<usize>, Error<T::Error>>
-where
-    T: Read + Write + TcpSplit,
-{
-    let mut len = 0;
+async fn read_body_limited(
+    body: &mut Body<'_, TcpSocket<'static>>,
+    max_len: usize,
+) -> Result<Vec<u8>, HttpError<edge_nal_embassy::TcpError>> {
+    let mut out = Vec::new();
+    let mut scratch = [0u8; 256];
     loop {
-        if len == buf.len() {
-            // Check whether there is more data than fits in the buffer
-            let mut probe = [0u8; 1];
-            let n = conn.read(&mut probe).await?;
-            if n == 0 {
-                return Ok(Some(len));
+        let read = body.read(&mut scratch).await?;
+        if read == 0 {
+            break;
+        }
+        if out.len() + read > max_len {
+            return Err(HttpError::TooLongBody);
+        }
+        out.extend_from_slice(&scratch[..read]);
+    }
+    Ok(out)
+}
+
+async fn finish_connection(conn: &mut HttpConn<'_>) {
+    let needs_close = conn.needs_close();
+    let _ = conn.complete().await;
+    if needs_close {
+        if let Ok(socket) = conn.unbind() {
+            let _ = socket.close(Close::Both).await;
+        }
+    }
+}
+
+async fn serve_html(conn: &mut HttpConn<'_>) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    let headers = conn.headers()?;
+    if accepts_gzip(headers) {
+        conn.initiate_response(
+            200,
+            Some("OK"),
+            &[
+                ("Content-Type", "text/html"),
+                ("Content-Encoding", "gzip"),
+                ("Access-Control-Allow-Origin", "*"),
+            ],
+        )
+        .await?;
+        write_all_conn(conn, APP_HTML_GZ).await
+    } else {
+        conn.initiate_response(
+            200,
+            Some("OK"),
+            &[
+                ("Content-Type", "text/html"),
+                ("Access-Control-Allow-Origin", "*"),
+                ("Connection", "close"),
+            ],
+        )
+        .await?;
+        write_all_conn(conn, NO_GZIP_HTML).await
+    }
+}
+
+async fn get_config(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    let config = {
+        let mc_opt = ctx.motor_controller.lock().await;
+        mc_opt.as_ref().map(|mc| mc.get_config())
+    };
+    match config {
+        Some(c) => send_json_obj(conn, 200, "OK", &c).await,
+        None => send_json(conn, 503, "Service Unavailable", "Motor controller not initialized").await,
+    }
+}
+
+async fn post_config(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+    body: Vec<u8>,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    if body.len() > 1024 {
+        return send_json(conn, 400, "Bad Request", "Request too large").await;
+    }
+    let config_res = serde_json::from_slice::<MotorControllerConfig>(&body);
+
+    match config_res {
+        Ok(config) => {
+            let res = {
+                let mut mc_opt = ctx.motor_controller.lock().await;
+                mc_opt.as_mut().map(|mc| mc.set_config(config))
+            };
+            match res {
+                Some(Ok(new_config)) => send_json_obj(conn, 200, "OK", &new_config).await,
+                Some(Err(_)) | None => {
+                    send_json(conn, 503, "Service Unavailable", "Motor controller not initialized").await
+                }
             }
-            return Ok(None);
         }
-        let n = conn.read(&mut buf[len..]).await?;
-        if n == 0 {
-            return Ok(Some(len));
-        }
-        len += n;
+        Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
     }
 }
 
-#[cfg(test)]
-#[allow(unused_imports, dead_code)]
-mod tests {
-    use super::{RpcResponse, SubscribeParams, WaypointsInput, WsMessage};
-
-    #[test]
-    fn test_ws_message_append_waypoints_jsonrpc_style() {
-        let json = r#"{"jsonrpc":"2.0","method":"append-waypoints","params":[{"ts":100,"pos":0.5,"vel":0.1},{"ts":150,"pos":0.7}],"id":1}"#;
-        let msg: WsMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.cmd, "append-waypoints");
-        assert_eq!(msg.id, Some(serde_json::Value::from(1)));
-
-        let input: WaypointsInput = msg.parse_params().unwrap();
-        let (waypoints, reset) = input.into_parts();
-        assert_eq!(waypoints.len(), 2);
-        assert!(!reset);
-        assert_eq!(waypoints[0].ts, 100);
-        assert_eq!(waypoints[0].pos, 0.5);
-        assert_eq!(waypoints[0].vel, Some(0.1));
-        assert_eq!(waypoints[1].ts, 150);
-        assert_eq!(waypoints[1].pos, 0.7);
-        assert_eq!(waypoints[1].vel, None);
-    }
-
-    #[test]
-    fn test_ws_message_set_waypoints_flat_style() {
-        let json = r#"{"cmd":"set-waypoints","waypoints":[{"ts":200,"pos":0.8}]}"#;
-        let msg: WsMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.cmd, "set-waypoints");
-        assert_eq!(msg.id, None);
-
-        let input: WaypointsInput = msg.parse_params().unwrap();
-        let (waypoints, reset) = input.into_parts();
-        assert_eq!(waypoints.len(), 1);
-        assert!(!reset);
-        assert_eq!(waypoints[0].ts, 200);
-        assert_eq!(waypoints[0].pos, 0.8);
-        assert_eq!(waypoints[0].vel, None);
-    }
-
-    #[test]
-    fn test_ws_message_set_waypoints_with_reset_timestamp() {
-        let json = r#"{"jsonrpc":"2.0","method":"set-waypoints","params":{"waypoints":[{"ts":300,"pos":0.1}],"reset-timestamp":true},"id":1}"#;
-        let msg: WsMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.cmd, "set-waypoints");
-
-        let input: WaypointsInput = msg.parse_params().unwrap();
-        let (waypoints, reset) = input.into_parts();
-        assert_eq!(waypoints.len(), 1);
-        assert!(reset);
-        assert_eq!(waypoints[0].ts, 300);
-    }
-
-    #[test]
-    fn test_ws_message_subscribe_params() {
-        let json1 = r#"{"method":"subscribe-state","params":{"interval_ms":250},"id":"sub1"}"#;
-        let msg1: WsMessage = serde_json::from_str(json1).unwrap();
-        assert_eq!(msg1.cmd, "subscribe-state");
-        let p1: SubscribeParams = msg1.parse_params().unwrap();
-        assert_eq!(p1.interval_ms, Some(250));
-
-        let json2 = r#"{"cmd":"subscribe_state"}"#;
-        let msg2: WsMessage = serde_json::from_str(json2).unwrap();
-        let p2: SubscribeParams = msg2.parse_params().unwrap_or_default();
-        assert_eq!(p2.interval_ms, None);
-    }
-
-    #[test]
-    fn test_rpc_response_serialization() {
-        let resp = RpcResponse {
-            jsonrpc: "2.0",
-            id: serde_json::Value::from(1),
-            result: Some(&"pong"),
-            error: None,
-        };
-        let serialized = serde_json::to_string(&resp).unwrap();
-        assert_eq!(serialized, r#"{"jsonrpc":"2.0","id":1,"result":"pong"}"#);
+async fn get_state(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    let state = {
+        let mut mc_opt = ctx.motor_controller.lock().await;
+        mc_opt.as_mut().map(|mc| mc.get_current_state())
+    };
+    match state {
+        Some(s) => send_json_obj(conn, 200, "OK", &s).await,
+        None => send_json(conn, 503, "Service Unavailable", "Motor controller not initialized").await,
     }
 }
 
+async fn post_paused(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+    body: Vec<u8>,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    if body.len() > MAX_BODY_LEN {
+        return send_json(conn, 400, "Bad Request", "Request too large").await;
+    }
+    match serde_json::from_slice::<PausedControl>(&body) {
+        Ok(control) => {
+            let updated = {
+                let mut mc_opt = ctx.motor_controller.lock().await;
+                if let Some(mc) = mc_opt.as_mut() {
+                    let mut config = mc.get_config();
+                    if let Some(paused) = control.paused {
+                        config.paused = paused;
+                    }
+                    if let Some(position) = control.position {
+                        config.paused_position = position.clamp(0.0, 1.0);
+                    }
+                    if let Some(adjust) = control.adjust {
+                        config.paused_position =
+                            (config.paused_position + adjust).clamp(0.0, 1.0);
+                    }
+                    let _ = mc.set_config(config.clone());
+                    Some(config)
+                } else {
+                    None
+                }
+            };
+            match updated {
+                Some(config) => send_json_obj(conn, 200, "OK", &config).await,
+                None => {
+                    send_json(conn, 503, "Service Unavailable", "Motor controller not initialized")
+                        .await
+                }
+            }
+        }
+        Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
+    }
+}
+
+async fn get_pin_config(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    let config = ctx
+        .storage
+        .lock()
+        .await
+        .get_pin_configuration()
+        .unwrap_or_default();
+    send_json_obj(conn, 200, "OK", &config).await
+}
+
+async fn post_pin_config(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+    body: Vec<u8>,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    if body.len() > MAX_BODY_LEN {
+        return send_json(conn, 400, "Bad Request", "Request too large").await;
+    }
+    match serde_json::from_slice::<PinConfiguration>(&body) {
+        Ok(config) => {
+            if config.modbus_timeout_ms > 1000
+                || config.modbus_scan_delay_us > 200_000
+                || config.modbus_inter_frame_delay_us > 200_000
+            {
+                return send_json(conn, 400, "Bad Request", "Invalid pin config").await;
+            }
+            match ctx.storage.lock().await.set_pin_configuration(&config) {
+                Ok(()) => send_json_obj(conn, 200, "OK", &config).await,
+                Err(_) => send_json(conn, 500, "Internal Server Error", "Save failed").await,
+            }
+        }
+        Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
+    }
+}
+
+async fn get_network_config(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    let config = ctx
+        .storage
+        .lock()
+        .await
+        .get_network_configuration()
+        .unwrap_or_default();
+    send_json_obj(conn, 200, "OK", &config).await
+}
+
+async fn post_network_config(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+    body: Vec<u8>,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    if body.len() > MAX_BODY_LEN {
+        return send_json(conn, 400, "Bad Request", "Request too large").await;
+    }
+    match serde_json::from_slice::<NetworkConfiguration>(&body) {
+        Ok(config) => match ctx.storage.lock().await.set_network_configuration(&config) {
+            Ok(()) => send_json_obj(conn, 200, "OK", &config).await,
+            Err(_) => send_json(conn, 500, "Internal Server Error", "Save failed").await,
+        },
+        Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
+    }
+}
+
+async fn post_restart(conn: &mut HttpConn<'_>) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    let spawner = unsafe { embassy_executor::Spawner::for_current_executor().await };
+    spawner.spawn(delayed_reset_task().unwrap());
+    send_json(conn, 200, "OK", "{\"ok\":true}").await
+}
+
+#[embassy_executor::task]
+async fn delayed_reset_task() {
+    Timer::after(Duration::from_millis(100)).await;
+    esp_hal::system::software_reset();
+}
+
+async fn handle_rest(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    let (method, path) = {
+        let headers = conn.headers()?;
+        (headers.method, normalize_path(headers.path))
+    };
+
+    match (method, path) {
+        (Method::Get, "/") => serve_html(conn).await,
+        (Method::Get, "/config") => get_config(conn, ctx).await,
+        (Method::Post, "/config") => {
+            let (_, body) = conn.split();
+            let payload = read_body_limited(body, MAX_BODY_LEN).await?;
+            post_config(conn, ctx, payload).await
+        }
+        (Method::Options, "/config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
+        (Method::Get, "/state") => get_state(conn, ctx).await,
+        (Method::Options, "/state") => cors_preflight(conn, "GET, OPTIONS").await,
+        (Method::Post, "/paused") => {
+            let (_, body) = conn.split();
+            let payload = read_body_limited(body, MAX_BODY_LEN).await?;
+            post_paused(conn, ctx, payload).await
+        }
+        (Method::Options, "/paused") => cors_preflight(conn, "POST, OPTIONS").await,
+        (Method::Get, "/pin-config") => get_pin_config(conn, ctx).await,
+        (Method::Post, "/pin-config") => {
+            let (_, body) = conn.split();
+            let payload = read_body_limited(body, MAX_BODY_LEN).await?;
+            post_pin_config(conn, ctx, payload).await
+        }
+        (Method::Options, "/pin-config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
+        (Method::Get, "/network-config") => get_network_config(conn, ctx).await,
+        (Method::Post, "/network-config") => {
+            let (_, body) = conn.split();
+            let payload = read_body_limited(body, MAX_BODY_LEN).await?;
+            post_network_config(conn, ctx, payload).await
+        }
+        (Method::Options, "/network-config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
+        (Method::Post, "/restart") => post_restart(conn).await,
+        (Method::Options, "/restart") => cors_preflight(conn, "POST, OPTIONS").await,
+        _ => {
+            conn.initiate_response(
+                404,
+                Some("Not Found"),
+                &[("Connection", "close")],
+            )
+            .await
+        }
+    }
+}
+
+fn extract_unbound_socket(conn: HttpConn<'_>) -> TcpSocket<'static> {
+    match conn {
+        Connection::Unbound(socket) => socket,
+        _ => unreachable!(),
+    }
+}
+
+async fn process_connection(
+    socket: TcpSocket<'static>,
+    acceptor_id: usize,
+    ctx: AppContext,
+) {
+    let mut http_buf = [0u8; HTTP_BUFFER_SIZE];
+    let mut conn = match Connection::new(&mut http_buf, socket).await {
+        Ok(conn) => conn,
+        Err(_) => return,
+    };
+
+    let is_ws = conn
+        .is_ws_upgrade_request()
+        .unwrap_or(false)
+        && conn
+            .headers()
+            .map(|h| normalize_path(h.path) == "/ws/command")
+            .unwrap_or(false);
+
+    if is_ws {
+        if WS_SLOTS.try_acquire(1).is_none() {
+            let _ = conn
+                .initiate_response(
+                    503,
+                    Some("Service Unavailable"),
+                    &[
+                        ("Connection", "close"),
+                        ("Content-Type", "text/plain"),
+                    ],
+                )
+                .await;
+            finish_connection(&mut conn).await;
+            return;
+        }
+
+        let mut key_buf = [0u8; edge_http::ws::MAX_BASE64_KEY_RESPONSE_LEN];
+        if conn
+            .initiate_ws_upgrade_response(&mut key_buf)
+            .await
+            .is_err()
+        {
+            WS_SLOTS.release(1);
+            finish_connection(&mut conn).await;
+            return;
+        }
+        if conn.complete().await.is_err() {
+            WS_SLOTS.release(1);
+            finish_connection(&mut conn).await;
+            return;
+        }
+        let _ = conn.unbind();
+        let socket = extract_unbound_socket(conn);
+        match WS_SOCKET_CH.try_send((SyncTcpSocket::new(socket), acceptor_id)) {
+            Ok(()) => {}
+            Err(embassy_sync::channel::TrySendError::Full((wrapped, _))) => {
+                WS_SLOTS.release(1);
+                let mut socket = wrapped.into_inner();
+                let _ = socket.close(Close::Both).await;
+            }
+        }
+        return;
+    }
+
+    {
+        let _guard = REST_GATE.lock().await;
+        if handle_rest(&mut conn, ctx).await.is_err() {
+            let _ = conn.complete_err("INTERNAL ERROR").await;
+        }
+    }
+    finish_connection(&mut conn).await;
+}
+
+enum WsTxMsg {
+    Text(String),
+    Pong(String),
+    Subscribe { id: serde_json::Value, interval_ms: u64 },
+    Unsubscribe { id: serde_json::Value },
+    Restart { id: serde_json::Value },
+    Close,
+}
+
+async fn run_ws_session(mut socket: TcpSocket<'static>, ctx: AppContext) {
+    let (mut rx, mut tx) = socket.split();
+    let tx_ch = Channel::<CriticalSectionRawMutex, WsTxMsg, 2>::new();
+
+    let rx_task = async {
+        let mut buf = [0u8; HTTP_BUFFER_SIZE];
+        loop {
+            match ws_recv(&mut rx, &mut buf).await {
+                Ok((frame_type, len)) => match frame_type {
+                    FrameType::Text(_) | FrameType::Binary(_) => {
+                        let payload = &buf[..len];
+                        let request = match serde_json::from_slice::<WsMessage>(payload) {
+                            Ok(request) => request,
+                            Err(_) => continue,
+                        };
+
+                        let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+                        match rpc::dispatch_rpc(&request, ctx).await {
+                            RpcAction::Respond(json) => {
+                                let _ = tx_ch.send(WsTxMsg::Text(json)).await;
+                            }
+                            RpcAction::Subscribe { interval_ms } => {
+                                let _ = tx_ch.send(WsTxMsg::Subscribe { id, interval_ms }).await;
+                            }
+                            RpcAction::Unsubscribe => {
+                                let _ = tx_ch.send(WsTxMsg::Unsubscribe { id }).await;
+                            }
+                            RpcAction::Restart => {
+                                let _ = tx_ch.send(WsTxMsg::Restart { id }).await;
+                            }
+                        }
+                    }
+                    FrameType::Ping => {
+                        let pong_str = core::str::from_utf8(&buf[..len])
+                            .map(String::from)
+                            .unwrap_or_default();
+                        let _ = tx_ch.send(WsTxMsg::Pong(pong_str)).await;
+                    }
+                    FrameType::Close => {
+                        let _ = tx_ch.send(WsTxMsg::Close).await;
+                        break;
+                    }
+                    _ => {}
+                },
+                Err(_) => {
+                    let _ = tx_ch.send(WsTxMsg::Close).await;
+                    break;
+                }
+            }
+        }
+    };
+
+    let tx_task = async {
+        let mut subscribed = false;
+        let mut push_interval_ms = 500u64;
+        let mut next_push = Instant::now() + Duration::from_millis(push_interval_ms);
+
+        loop {
+            let timer_fut = async {
+                if subscribed {
+                    Timer::at(next_push).await;
+                } else {
+                    core::future::pending::<()>().await;
+                }
+            };
+
+            match select(tx_ch.receive(), timer_fut).await {
+                SelectEither::First(msg) => match msg {
+                    WsTxMsg::Text(json) => {
+                        if ws_send(&mut tx, FrameType::Text(false), None, json.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    WsTxMsg::Pong(pong_str) => {
+                        if ws_send(&mut tx, FrameType::Pong, None, pong_str.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    WsTxMsg::Subscribe { id, interval_ms } => {
+                        push_interval_ms = interval_ms;
+                        subscribed = true;
+                        next_push = Instant::now() + Duration::from_millis(push_interval_ms);
+                        let ack = rpc::subscribe_ack(id, interval_ms);
+                        if ws_send(&mut tx, FrameType::Text(false), None, ack.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    WsTxMsg::Unsubscribe { id } => {
+                        subscribed = false;
+                        let ack = rpc::unsubscribe_ack(id);
+                        if ws_send(&mut tx, FrameType::Text(false), None, ack.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    WsTxMsg::Restart { id } => {
+                        let ack = rpc::restart_ack(id);
+                        let _ =
+                            ws_send(&mut tx, FrameType::Text(false), None, ack.as_bytes()).await;
+                        Timer::after(Duration::from_millis(100)).await;
+                        esp_hal::system::software_reset();
+                    }
+                    WsTxMsg::Close => break,
+                },
+                SelectEither::Second(()) => {
+                    next_push += Duration::from_millis(push_interval_ms);
+                    if let Some(json) = rpc::build_state_notification(ctx).await {
+                        if ws_send(&mut tx, FrameType::Text(false), None, json.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    embassy_futures::join::join(rx_task, tx_task).await;
+}
+
+#[embassy_executor::task(pool_size = 3)]
+async fn ws_session_task(ctx: AppContext) {
+    loop {
+        let (wrapped, _acceptor_id) = WS_SOCKET_CH.receive().await;
+        run_ws_session(wrapped.into_inner(), ctx).await;
+        WS_SLOTS.release(1);
+    }
+}
+
+async fn acceptor_loop(acceptor_id: usize, acceptor: edge_nal_embassy::TcpAccept<'static>) {
+    use edge_nal::TcpAccept;
+    loop {
+        ACCEPT_SIGNALS[acceptor_id].wait().await;
+        match acceptor.accept().await {
+            Ok((_, socket)) => {
+                SOCKET_QUEUE
+                    .send((SyncTcpSocket::new(socket), acceptor_id))
+                    .await;
+            }
+            Err(e) => {
+                log::warn!("HTTP acceptor {} error: {:?}", acceptor_id, e);
+                ACCEPT_SIGNALS[acceptor_id].signal(());
+            }
+        }
+    }
+}
+
+async fn dispatcher_loop(ctx: AppContext) {
+    loop {
+        let (wrapped, acceptor_id) = SOCKET_QUEUE.receive().await;
+        let socket = wrapped.into_inner();
+        process_connection(socket, acceptor_id, ctx).await;
+        ACCEPT_SIGNALS[acceptor_id].signal(());
+    }
+}
+
+async fn http_server_main(stack: &'static Stack<'static>, ctx: AppContext) {
+    let buffers = TCP_BUFFERS.init(TcpBuffers::new());
+    let tcp = TCP_FACTORY.init(Tcp::new(*stack, buffers));
+    let acceptor: edge_nal_embassy::TcpAccept<'static> = match tcp
+        .bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)))
+        .await
+    {
+        Ok(acceptor) => {
+            #[allow(clippy::missing_transmute_annotations)]
+            unsafe {
+                core::mem::transmute(acceptor)
+            }
+        }
+        Err(e) => {
+            log::error!("HTTP bind failed: {:?}", e);
+            return;
+        }
+    };
+
+    log::info!(
+        "HTTP edge server: acceptors={}, ws_max={}, tcp_pool={}, dispatcher_tasks={}",
+        Q_ACCEPTORS,
+        WS_MAX,
+        TCP_POOL_SIZE,
+        WEB_TASK_POOL_SIZE
+    );
+
+    for signal in ACCEPT_SIGNALS.iter() {
+        signal.signal(());
+    }
+
+    embassy_futures::join::join(
+        embassy_futures::join::join4(
+            acceptor_loop(0, acceptor),
+            acceptor_loop(1, acceptor),
+            acceptor_loop(2, acceptor),
+            acceptor_loop(3, acceptor),
+        ),
+        dispatcher_loop(ctx),
+    )
+    .await;
+}
+
+#[embassy_executor::task]
+async fn http_server_task(stack: &'static Stack<'static>, app_context: AppContext) {
+    http_server_main(stack, app_context).await;
+}
+
+pub async fn run_server(
+    stack: &'static Stack<'static>,
+    app_context: AppContext,
+    spawner: &Spawner,
+) {
+    for _ in 0..WS_MAX {
+        spawner.spawn(ws_session_task(app_context).unwrap());
+    }
+    spawner.spawn(http_server_task(stack, app_context).unwrap());
+}

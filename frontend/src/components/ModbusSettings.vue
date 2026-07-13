@@ -105,7 +105,7 @@ const averageUpdateRate = computed(() => {
       <div>
         <label for="modbus-timeout-ms" class="mb-1 block text-sm">
           Read timeout (ms)
-          <span class="text-gray-400">0 = baud default</span>
+          <span class="text-gray-400">0 = Auto (15ms @ 115200)</span>
         </label>
         <input
           id="modbus-timeout-ms"
@@ -116,6 +116,38 @@ const averageUpdateRate = computed(() => {
           class="w-full rounded border border-gray-300 px-3 py-2 font-mono text-sm"
           :disabled="!connected || saving"
           @input="updateField('modbus_timeout_ms', Number.parseInt(($event.target as HTMLInputElement).value) || 0)"
+        >
+      </div>
+      <div>
+        <label for="modbus-rx-timeout-us" class="mb-1 block text-sm">
+          RX inter-byte timeout (µs)
+          <span class="text-gray-400">0 = Auto (1750µs @ 115200)</span>
+        </label>
+        <input
+          id="modbus-rx-timeout-us"
+          type="number"
+          min="0"
+          max="200000"
+          :value="modelValue.modbus_rx_timeout_us || 0"
+          class="w-full rounded border border-gray-300 px-3 py-2 font-mono text-sm"
+          :disabled="!connected || saving"
+          @input="updateField('modbus_rx_timeout_us', Number.parseInt(($event.target as HTMLInputElement).value) || 0)"
+        >
+      </div>
+      <div>
+        <label for="modbus-inter-frame-delay-us" class="mb-1 block text-sm">
+          Inter-frame quiet interval (µs)
+          <span class="text-gray-400">0 = Auto (350µs @ 115200)</span>
+        </label>
+        <input
+          id="modbus-inter-frame-delay-us"
+          type="number"
+          min="0"
+          max="200000"
+          :value="modelValue.modbus_inter_frame_delay_us"
+          class="w-full rounded border border-gray-300 px-3 py-2 font-mono text-sm"
+          :disabled="!connected || saving"
+          @input="updateField('modbus_inter_frame_delay_us', Number.parseInt(($event.target as HTMLInputElement).value) || 0)"
         >
       </div>
       <div>

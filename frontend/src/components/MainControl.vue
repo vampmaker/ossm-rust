@@ -1,10 +1,12 @@
 <script setup lang="ts">
+import { Loader2 } from '@lucide/vue'
 import type { MotorControllerConfig, PauseMode, WaveFunc } from '../types'
 
 const props = defineProps<{
   modelValue: MotorControllerConfig
   connected: boolean
   pauseMode: PauseMode
+  isMutating?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -36,7 +38,18 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
 <template>
   <div class="space-y-4 bg-white p-4 shadow-md">
     <div class="flex items-center justify-between">
-      <h2 class="text-xl font-bold">Main Control</h2>
+      <div class="flex items-center space-x-2.5">
+        <h2 class="text-xl font-bold">Main Control</h2>
+        <span
+          v-if="isMutating"
+          id="control-busy-indicator"
+          class="flex items-center space-x-1.5 rounded-full bg-blue-50 px-2.5 py-0.5 text-xs font-semibold text-blue-600 border border-blue-200 shadow-sm"
+          title="Control request in progress"
+        >
+          <Loader2 class="h-3.5 w-3.5 animate-spin" />
+          <span>Updating...</span>
+        </span>
+      </div>
       <button
         class="px-4 py-2 font-bold text-white"
         :class="modelValue.paused ? 'bg-green-500 hover:bg-green-600' : 'bg-red-500 hover:bg-red-600'"

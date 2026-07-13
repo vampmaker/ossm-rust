@@ -5,7 +5,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 fn main() {
-    embuild::espidf::sysenv::output();
+    println!("cargo:rustc-link-arg=-Tlinkall.x");
 
     println!("cargo:rerun-if-changed=frontend/dist/index.html");
 

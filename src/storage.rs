@@ -1,11 +1,18 @@
-use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
+use alloc::string::String;
 
+use esp_nvs::{Key, Nvs};
+use esp_storage::FlashStorage;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use anyhow::Result;
+
+use crate::error::{FirmwareError, Result};
 use crate::motion::MotorControllerConfig;
 
+const NVS_PARTITION_OFFSET: usize = 0x9000;
+const NVS_PARTITION_SIZE: usize = 0x6000;
+const NVS_NAMESPACE: Key = Key::from_str("ossm");
+
 pub struct StorageManager {
-    nvs: EspNvs<NvsDefault>,
+    nvs: Nvs<FlashStorage<'static>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -16,7 +23,11 @@ pub struct PinConfiguration {
     #[serde(default)]
     pub modbus_timeout_ms: u32,
     #[serde(default)]
+    pub modbus_rx_timeout_us: u32,
+    #[serde(default)]
     pub modbus_scan_delay_us: u32,
+    #[serde(default)]
+    pub modbus_inter_frame_delay_us: u32,
     #[serde(default = "default_ble_enabled")]
     pub ble_enabled: bool,
 }
@@ -32,7 +43,9 @@ impl Default for PinConfiguration {
             modbus_rx: 19,
             modbus_de_re: 20,
             modbus_timeout_ms: 0,
+            modbus_rx_timeout_us: 0,
             modbus_scan_delay_us: 0,
+            modbus_inter_frame_delay_us: 0,
             ble_enabled: true,
         }
     }
@@ -40,6 +53,12 @@ impl Default for PinConfiguration {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkConfiguration {
+    #[serde(default = "default_wifi_enabled")]
+    pub wifi_enabled: bool,
+    #[serde(default)]
+    pub ssid: String,
+    #[serde(default)]
+    pub password: String,
     #[serde(default = "default_hostname")]
     pub hostname: String,
     #[serde(default = "default_dhcp_enabled")]
@@ -54,8 +73,12 @@ pub struct NetworkConfiguration {
     pub static_dns: String,
 }
 
+fn default_wifi_enabled() -> bool {
+    true
+}
+
 fn default_hostname() -> String {
-    "ossm".to_string()
+    String::from("ossm")
 }
 
 fn default_dhcp_enabled() -> bool {
@@ -63,24 +86,27 @@ fn default_dhcp_enabled() -> bool {
 }
 
 fn default_static_ip() -> String {
-    "192.168.1.100".to_string()
+    String::from("192.168.1.100")
 }
 
 fn default_static_mask() -> String {
-    "255.255.255.0".to_string()
+    String::from("255.255.255.0")
 }
 
 fn default_static_gateway() -> String {
-    "192.168.1.1".to_string()
+    String::from("192.168.1.1")
 }
 
 fn default_static_dns() -> String {
-    "8.8.8.8".to_string()
+    String::from("8.8.8.8")
 }
 
 impl Default for NetworkConfiguration {
     fn default() -> Self {
         Self {
+            wifi_enabled: default_wifi_enabled(),
+            ssid: String::new(),
+            password: String::new(),
             hostname: default_hostname(),
             dhcp_enabled: default_dhcp_enabled(),
             static_ip: default_static_ip(),
@@ -92,94 +118,100 @@ impl Default for NetworkConfiguration {
 }
 
 impl StorageManager {
-    pub fn new(nvs_partition: EspDefaultNvsPartition) -> Self {
-        let nvs = EspNvs::new(nvs_partition, "ossm", true).unwrap();
+    pub fn new(flash: esp_hal::peripherals::FLASH<'static>) -> Self {
+        let storage = FlashStorage::new(flash);
+        let nvs = Nvs::new(NVS_PARTITION_OFFSET, NVS_PARTITION_SIZE, storage)
+            .expect("Failed to initialize NVS");
         Self { nvs }
     }
 
-    fn get_string(&self, key: &str) -> Result<String> {
-        let mut buf = vec![0u8; 1024];
-        let str_value = self.nvs.get_str(key, &mut buf).map_err(|e| anyhow::anyhow!("Failed to get string by key {}: {}", key, e))?;
-        match str_value {
-            Some(s) => {
-                Ok(s.to_string())
-            }
-            None => {
-                Err(anyhow::anyhow!("String value not found by key: {}", key))
-            }
-        }
+    fn key(name: &str) -> Key {
+        Key::from_str(name)
+    }
+
+    fn get_string(&mut self, key: &str) -> Result<String> {
+        self.nvs
+            .get(&NVS_NAMESPACE, &Self::key(key))
+            .map_err(|_| FirmwareError::Storage("read failed"))
+    }
+
+    fn set_string(&mut self, key: &str, value: &str) -> Result<()> {
+        self.nvs
+            .set(&NVS_NAMESPACE, &Self::key(key), value)
+            .map_err(|_| FirmwareError::Storage("write failed"))
     }
 
     fn set_json<T: Serialize>(&mut self, key: &str, value: &T) -> Result<()> {
-        let json = serde_json::to_string(value)?;
-        self.nvs.set_str(key, &json)?;
-        Ok(())
+        crate::buffers::serialize_to_scratchpad(value, |json_str| self.set_string(key, json_str))
+            .map_err(|_| FirmwareError::Json)?
     }
 
-    fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
+    fn get_json<T: DeserializeOwned>(&mut self, key: &str) -> Result<T> {
         let string = self.get_string(key)?;
-        serde_json::from_str(&string).map_err(|e| anyhow::anyhow!("Failed to get JSON by key {}: {}", key, e))
+        serde_json::from_str(&string).map_err(|_| FirmwareError::Json)
     }
 
     pub fn set_ssid(&mut self, ssid: &str) -> Result<()> {
-        self.nvs.set_str("ssid", ssid)?;
-        Ok(())
+        self.set_string("ssid", ssid)
     }
 
-    pub fn get_ssid(&self) -> Result<String> {
-        let mut buf = [0u8; 32];
-        self.nvs.get_str("ssid", &mut buf)?;
-        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let ssid = core::str::from_utf8(&buf[..end]).map_err(|e| anyhow::anyhow!("Failed to get SSID: {}", e))?;
-        Ok(ssid.to_string())
+    pub fn get_ssid(&mut self) -> Result<String> {
+        self.get_string("ssid")
     }
 
     pub fn set_password(&mut self, password: &str) -> Result<()> {
-        self.nvs.set_str("password", password)?;
-        Ok(())
+        self.set_string("password", password)
     }
 
-    pub fn get_password(&self) -> Result<String> {
-        let mut buf = [0u8; 64];
-        self.nvs.get_str("password", &mut buf)?;
-        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let password = core::str::from_utf8(&buf[..end]).map_err(|e| anyhow::anyhow!("Failed to get Password: {}", e))?;
-        Ok(password.to_string())
+    pub fn get_password(&mut self) -> Result<String> {
+        self.get_string("password")
     }
 
     pub fn set_motor_config(&mut self, config: &MotorControllerConfig) -> Result<()> {
-        let config = {
-            let mut config = config.clone();
-            config.depth = config.depth.clamp(0.0, 1.0);
-            config.bpm = config.bpm.clamp(1.0, 500.0);
-            config.sharpness = config.sharpness.clamp(0.0, 1.0);
-            config.paused_position = config.paused_position.clamp(0.0, 1.0);
-            config
-        };
-
-        self.set_json("motor_config", &config)?;
-        Ok(())
+        let mut config = config.clone();
+        config.depth = config.depth.clamp(0.0, 1.0);
+        config.bpm = config.bpm.clamp(1.0, 500.0);
+        config.sharpness = config.sharpness.clamp(0.0, 1.0);
+        config.paused_position = config.paused_position.clamp(0.0, 1.0);
+        self.set_json("motor_config", &config)
     }
 
-    pub fn get_motor_config(&self) -> Result<MotorControllerConfig> {
+    pub fn get_motor_config(&mut self) -> Result<MotorControllerConfig> {
         self.get_json("motor_config")
     }
 
     pub fn set_pin_configuration(&mut self, config: &PinConfiguration) -> Result<()> {
-        self.set_json("pin_conf", &config)?;
-        Ok(())
+        self.set_json("pin_conf", config)
     }
 
-    pub fn get_pin_configuration(&self) -> Result<PinConfiguration> {
+    pub fn get_pin_configuration(&mut self) -> Result<PinConfiguration> {
         self.get_json("pin_conf")
     }
 
     pub fn set_network_configuration(&mut self, config: &NetworkConfiguration) -> Result<()> {
-        self.set_json("net_conf", config)?;
-        Ok(())
+        if !config.ssid.is_empty() {
+            let _ = self.set_ssid(&config.ssid);
+        }
+        if !config.password.is_empty() {
+            let _ = self.set_password(&config.password);
+        }
+        self.set_json("net_conf", config)
     }
 
-    pub fn get_network_configuration(&self) -> Result<NetworkConfiguration> {
-        self.get_json("net_conf").or_else(|_| Ok(NetworkConfiguration::default()))
+    pub fn get_network_configuration(&mut self) -> Result<NetworkConfiguration> {
+        let mut config = self
+            .get_json::<NetworkConfiguration>("net_conf")
+            .unwrap_or_default();
+        if config.ssid.is_empty() {
+            if let Ok(ssid) = self.get_ssid() {
+                config.ssid = ssid;
+            }
+        }
+        if config.password.is_empty() {
+            if let Ok(password) = self.get_password() {
+                config.password = password;
+            }
+        }
+        Ok(config)
     }
 }

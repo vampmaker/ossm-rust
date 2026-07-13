@@ -82,11 +82,24 @@ Finally, connect your ESP32 board to a standard 5V USB charger or your computer 
 
 ### Building from Source (Optional for Developers)
 
-You don't need to build the code yourself—pre-compiled firmware is provided in Part 3! But if you are a developer and wish to compile from source, the project requires the Espressif `esp` Rust toolchain (configured in `rust-toolchain.toml`). Both targets are supported via cargo aliases defined in `.cargo/config.toml`:
+You don't need to build the code yourself—pre-compiled firmware is provided in Part 3! But if you are a developer and wish to compile from source:
 
+The firmware is built on **`esp-hal`** (bare-metal) with **Embassy** async and **`esp-rtos`** for task scheduling, targeting `no_std`. Both targets are supported via cargo aliases defined in `.cargo/config.toml`:
+
+```bash
+# ESP32-C6 (RISC-V) — builds with the standard Rust nightly toolchain
+cargo b-c6 --release
+
+# ESP32-S3 (Xtensa) — requires the Espressif `esp` toolchain
+source ~/export-esp.sh
+RUSTUP_TOOLCHAIN=esp cargo b-s3 --release
 ```
-cargo b-c6    # Build for ESP32-C6
-cargo b-s3    # Build for ESP32-S3
+
+Install the `esp` toolchain with [espup](https://github.com/esp-rs/espup): `espup install --targets esp32s3`.
+
+To build everything (frontend, flasher, both firmware targets) and produce merged flash images:
+```bash
+./scripts/release.sh
 ```
 
 The firmware automatically adapts its pin layout based on the selected MCU.
@@ -140,7 +153,7 @@ Example: `http://192.168.1.123` or `http://ossm.local`
 
 Key interface features include:
 - **Toggleable Real-Time Motor Position Diagram**: Visualizes the full stroke range (`0% – 100%`), physical hardware limits (`pos_min` / `pos_max`), active stroke window with distinct **Left Limit** and **Right Limit** boundaries, and an animated puck showing live motor position at 30 FPS. Can be toggled on or off using the Activity icon in the header, with toggle state persisted across browser sessions.
-- **Resilient High-Frequency Live Telemetry (`WsDataManager`)**: Uses a single-owner WebSocket client (`client.ts`) to stream real-time motor updates and loop statistics (`ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, `dt_mdev_ms`) at up to **30 FPS (`33ms`)** over WebSocket or BLE. Includes automatic idle connection cleanup after 3 seconds of inactivity, application-level watchdog silent-failure detection, and automatic reconnection loops.
+- **Resilient High-Frequency Live Telemetry (`WsDataManager`)**: Uses a single-owner WebSocket client (`client.ts`) to stream real-time motor updates and loop statistics (`ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, `dt_mdev_ms`) at up to **30 FPS (`33ms`)** over WebSocket or BLE. On the firmware side, WebSocket sessions use **split asynchronous RX/TX tasks** (`edge_nal::TcpSplit`) and heap-allocated string payloads (`alloc::string::String`) backed by a **4-buffer shared pool (`NET_BUFFER_POOL`)**, preventing buffer starvation or connection drops when concurrent HTTP REST requests arrive during active streaming.
 - **Interactive Motion Control & Spline Editor**: Adjust BPM (speed), stroke depth, top/bottom depth anchoring, stroke reversal, pause/resume modes, or design custom periodic trajectories with interactive spline control points.
 
 ### Serial Commands
@@ -361,15 +374,18 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
   "modbus_rx": 19,
   "modbus_de_re": 20,
   "modbus_timeout_ms": 0,
-  "modbus_scan_delay_us": 0
+  "modbus_scan_delay_us": 0,
+  "modbus_inter_frame_delay_us": 0
 }
 ```
 
 *   `modbus_tx` (number): GPIO pin number assigned to Modbus TX (DI).
 *   `modbus_rx` (number): GPIO pin number assigned to Modbus RX (RO).
 *   `modbus_de_re` (number): GPIO pin number assigned to Modbus DE/RE control.
-*   `modbus_timeout_ms` (number): Modbus per-read timeout in milliseconds (`0` = use default based on baud rate, up to `1000`).
+*   `modbus_timeout_ms` (number): Modbus per-read timeout in milliseconds (`0` = auto based on baud rate: 15ms @ 115200 baud).
+*   `modbus_rx_timeout_us` (number): Modbus RX inter-byte timeout ($t_{1.5}$) in microseconds (`0` = auto: 1750µs @ 115200 baud to accommodate slave MCU response jitter without mid-frame timeouts).
 *   `modbus_scan_delay_us` (number): Modbus scan inter-probe delay in microseconds (`0` = use Modbus t3.5 timing only, up to `200000`).
+*   `modbus_inter_frame_delay_us` (number): Modbus inter-frame quiet interval ($t_{3.5}$) in microseconds (`0` = auto based on baud rate: 350µs @ 115200 baud, enabling <3ms total end-to-end request-response cycle time for >300 Hz position updates).
 
 #### `POST /pin-config`
 
@@ -475,6 +491,8 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 }
 ```
         *   When subscribed, the server periodically pushes lightweight JSON-RPC notifications of the form `{"jsonrpc": "2.0", "method": "state", "params": { ...StateResponse... }}`. Supports intervals down to `20ms` (`50 FPS`).
+        *   **Asynchronous RX/TX Architecture**: WebSocket sessions split the underlying TCP connection into separate read (`ws_recv`) and write (`ws_send`) tasks communicating via an Embassy channel with heap-allocated strings (`alloc::string::String`). High-frequency state pushes never block or delay incoming JSON-RPC command processing.
+        *   **Compact GATT vs. Full Push State**: Over Bluetooth Low Energy (BLE), direct GATT reads of the state characteristic (`CHAR_STATE`) return a compact representation (<120 bytes) to fit cleanly within a single BLE ATT packet without truncation. Full state payloads (including loop telemetry and history arrays) are streamed via `subscribe-state` push notifications.
         *   **Idle Auto-Disconnect**: To conserve device memory and TCP connection handler slots (`HANDLER_TASKS`), the embedded web interface automatically disconnects the WebSocket after 3 seconds of inactivity when no active listeners remain.
         *   **Persistent Position Diagram Toggle**: The UI remembers the visibility toggle state of the Motor Position Diagram in browser `localStorage`.
     *   **Unsubscribe State**: Stops periodic state pushing.

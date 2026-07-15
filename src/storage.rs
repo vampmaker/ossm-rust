@@ -15,6 +15,9 @@ pub struct StorageManager {
     nvs: Nvs<FlashStorage<'static>>,
 }
 
+pub const OPERATING_MODE_SERVO: &str = "servo";
+pub const OPERATING_MODE_RTU_RELAY: &str = "rtu_relay";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PinConfiguration {
     pub modbus_tx: u32,
@@ -30,10 +33,30 @@ pub struct PinConfiguration {
     pub modbus_inter_frame_delay_us: u32,
     #[serde(default = "default_ble_enabled")]
     pub ble_enabled: bool,
+    #[serde(default = "default_operating_mode")]
+    pub operating_mode: String,
 }
 
 fn default_ble_enabled() -> bool {
     true
+}
+
+fn default_operating_mode() -> String {
+    String::from(OPERATING_MODE_SERVO)
+}
+
+impl PinConfiguration {
+    pub fn is_rtu_relay(&self) -> bool {
+        self.operating_mode.eq_ignore_ascii_case(OPERATING_MODE_RTU_RELAY)
+    }
+
+    pub fn normalize_operating_mode(&mut self) {
+        if self.is_rtu_relay() {
+            self.operating_mode = String::from(OPERATING_MODE_RTU_RELAY);
+        } else {
+            self.operating_mode = String::from(OPERATING_MODE_SERVO);
+        }
+    }
 }
 
 impl Default for PinConfiguration {
@@ -47,6 +70,7 @@ impl Default for PinConfiguration {
             modbus_scan_delay_us: 0,
             modbus_inter_frame_delay_us: 0,
             ble_enabled: true,
+            operating_mode: default_operating_mode(),
         }
     }
 }
@@ -181,7 +205,9 @@ impl StorageManager {
     }
 
     pub fn set_pin_configuration(&mut self, config: &PinConfiguration) -> Result<()> {
-        self.set_json("pin_conf", config)
+        let mut config = config.clone();
+        config.normalize_operating_mode();
+        self.set_json("pin_conf", &config)
     }
 
     pub fn get_pin_configuration(&mut self) -> Result<PinConfiguration> {

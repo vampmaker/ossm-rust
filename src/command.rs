@@ -46,6 +46,8 @@ enum CliCommand {
     GetModbusInterFrameDelayUs,
     SetBleEnabled(bool),
     GetBleEnabled,
+    SetOperatingMode(String),
+    GetOperatingMode,
     SetWifiEnabled(bool),
     GetWifiEnabled,
     SetHostname(String),
@@ -93,6 +95,8 @@ enum BaseCommand<'a> {
     GetModbusInterFrameDelayUs,
     SetBleEnabled { value: bool },
     GetBleEnabled,
+    SetOperatingMode { mode: &'a str },
+    GetOperatingMode,
     SetWifiEnabled { value: bool },
     GetWifiEnabled,
     SetHostname { hostname: &'a str },
@@ -197,6 +201,12 @@ fn base_to_cli(command: BaseCommand<'_>) -> Option<CliCommand> {
         BaseCommand::GetModbusInterFrameDelayUs => CliCommand::GetModbusInterFrameDelayUs,
         BaseCommand::SetBleEnabled { value } => CliCommand::SetBleEnabled(value),
         BaseCommand::GetBleEnabled => CliCommand::GetBleEnabled,
+        BaseCommand::SetOperatingMode { mode }
+            if matches!(mode, "servo" | "rtu_relay") =>
+        {
+            CliCommand::SetOperatingMode(String::from(mode))
+        }
+        BaseCommand::GetOperatingMode => CliCommand::GetOperatingMode,
         BaseCommand::SetWifiEnabled { value } => CliCommand::SetWifiEnabled(value),
         BaseCommand::GetWifiEnabled => CliCommand::GetWifiEnabled,
         BaseCommand::SetHostname { hostname } => CliCommand::SetHostname(String::from(hostname)),
@@ -367,6 +377,16 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
         CliCommand::GetBleEnabled => {
             let config = app_context.storage.pin();
             log::info!("ble_enabled: {}", config.ble_enabled);
+        }
+        CliCommand::SetOperatingMode(mode) => {
+            let mut config = app_context.storage.pin();
+            config.operating_mode = mode.clone();
+            app_context.storage.set_pin(config);
+            log::info!("operating_mode set to {}, restart to apply", mode);
+        }
+        CliCommand::GetOperatingMode => {
+            let config = app_context.storage.pin();
+            log::info!("operating_mode: {}", config.operating_mode);
         }
         CliCommand::SetWifiEnabled(value) => {
             let mut config = app_context.storage.net();

@@ -82,99 +82,125 @@ const averageUpdateRate = computed(() => {
         <h3 class="text-lg font-bold text-gray-800">Motor Connection & Modbus Configuration</h3>
       </div>
 
+      <!-- Device operating mode -->
+      <div class="rounded-lg border border-gray-200 bg-white p-4 space-y-2">
+        <label class="block text-sm font-semibold text-gray-700">Device Operating Mode</label>
+        <select
+          class="w-full border border-gray-300 rounded px-3 py-2 text-sm"
+          :value="pinConfig.operating_mode ?? 'servo'"
+          :disabled="!connected"
+          @change="updatePinField('operating_mode', ($event.target as HTMLSelectElement).value as PinConfiguration['operating_mode'])"
+        >
+          <option value="servo">Servo Control (OSSM motion)</option>
+          <option value="rtu_relay">RTU Relay (Modbus TCP + WebSocket bridge)</option>
+        </select>
+        <p class="text-xs text-gray-500">
+          Restart required after changing mode. In RTU Relay mode the motor controller is disabled;
+          use Modbus TCP :502 or <code class="font-mono">/ws/modbus</code> for remote drive control.
+        </p>
+      </div>
+
       <!-- Motor Telemetry Card -->
       <div class="rounded-lg border border-gray-200 bg-gray-50 p-4">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <div class="flex items-center space-x-2">
-            <span
-              class="inline-block h-3 w-3 rounded-full"
-              :class="motorUpdateRate !== null && motorUpdateRate > 0 ? 'bg-green-500 animate-pulse' : 'bg-red-400'"
-            />
-            <span class="text-sm font-semibold text-gray-700">Motor Update Rate Telemetry</span>
-          </div>
-          <div>
-            <span v-if="motorUpdateRate !== null" class="font-mono text-xl font-bold text-blue-600">
-              {{ motorUpdateRate }}
-              <span class="text-xs font-normal text-gray-500">updates/sec (Hz)</span>
-            </span>
-            <span v-else class="text-xs font-medium text-gray-400">
-              Not available
-            </span>
-          </div>
-        </div>
         <div
-          v-if="state && typeof state.dt_avg_ms === 'number'"
-          class="mt-2 flex flex-wrap items-center justify-between border-t border-gray-200 pt-2 text-xs text-gray-600"
+          v-if="(pinConfig.operating_mode ?? 'servo') === 'rtu_relay'"
+          class="text-sm text-gray-600"
         >
-          <span>Loop dt (min/avg/max): <strong class="font-mono text-gray-800">{{ state.dt_min_ms?.toFixed(1) }} / {{ state.dt_avg_ms?.toFixed(1) }} / {{ state.dt_max_ms?.toFixed(1) }} ms</strong></span>
-          <span>mdev: <strong class="font-mono text-gray-800">{{ state.dt_mdev_ms?.toFixed(2) }} ms</strong></span>
+          Motor update-rate telemetry is not available in RTU relay mode.
         </div>
-        <div
-          v-else-if="motorUpdateRate !== null && state?.update_history"
-          class="mt-2 flex items-center justify-between border-t border-gray-200 pt-2 text-xs text-gray-500"
-        >
-          <span>10s Avg: <strong class="font-mono text-gray-700">{{ averageUpdateRate }} Hz</strong></span>
-        </div>
+        <template v-else>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center space-x-2">
+              <span
+                class="inline-block h-3 w-3 rounded-full"
+                :class="motorUpdateRate !== null && motorUpdateRate > 0 ? 'bg-green-500 animate-pulse' : 'bg-red-400'"
+              />
+              <span class="text-sm font-semibold text-gray-700">Motor Update Rate Telemetry</span>
+            </div>
+            <div>
+              <span v-if="motorUpdateRate !== null" class="font-mono text-xl font-bold text-blue-600">
+                {{ motorUpdateRate }}
+                <span class="text-xs font-normal text-gray-500">updates/sec (Hz)</span>
+              </span>
+              <span v-else class="text-xs font-medium text-gray-400">
+                Not available
+              </span>
+            </div>
+          </div>
+          <div
+            v-if="state && typeof state.dt_avg_ms === 'number'"
+            class="mt-2 flex flex-wrap items-center justify-between border-t border-gray-200 pt-2 text-xs text-gray-600"
+          >
+            <span>Loop dt (min/avg/max): <strong class="font-mono text-gray-800">{{ state.dt_min_ms?.toFixed(1) }} / {{ state.dt_avg_ms?.toFixed(1) }} / {{ state.dt_max_ms?.toFixed(1) }} ms</strong></span>
+            <span>mdev: <strong class="font-mono text-gray-800">{{ state.dt_mdev_ms?.toFixed(2) }} ms</strong></span>
+          </div>
+          <div
+            v-else-if="motorUpdateRate !== null && state?.update_history"
+            class="mt-2 flex items-center justify-between border-t border-gray-200 pt-2 text-xs text-gray-500"
+          >
+            <span>10s Avg: <strong class="font-mono text-gray-700">{{ averageUpdateRate }} Hz</strong></span>
+          </div>
 
-        <!-- Modbus Timing & Percentiles Table (1s Rolling Window) -->
-        <div
-          v-if="state && state.modbus_stats"
-          class="mt-3 border-t border-gray-200 pt-3"
-        >
-          <div class="flex flex-wrap items-center justify-between text-xs mb-2">
-            <span class="font-semibold text-gray-700">Modbus Telemetry (1s Window)</span>
-            <span
-              class="rounded-full px-2 py-0.5 font-bold"
-              :class="state.modbus_stats.success_rate >= 98 ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-800'"
-            >
-              Success: {{ state.modbus_stats.success_rate.toFixed(1) }}% ({{ state.modbus_stats.successful_requests }} ok / {{ state.modbus_stats.failed_requests }} fail)
-            </span>
+          <!-- Modbus Timing & Percentiles Table (1s Rolling Window) -->
+          <div
+            v-if="state && state.modbus_stats"
+            class="mt-3 border-t border-gray-200 pt-3"
+          >
+            <div class="flex flex-wrap items-center justify-between text-xs mb-2">
+              <span class="font-semibold text-gray-700">Modbus Telemetry (1s Window)</span>
+              <span
+                class="rounded-full px-2 py-0.5 font-bold"
+                :class="state.modbus_stats.success_rate >= 98 ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-800'"
+              >
+                Success: {{ state.modbus_stats.success_rate.toFixed(1) }}% ({{ state.modbus_stats.successful_requests }} ok / {{ state.modbus_stats.failed_requests }} fail)
+              </span>
+            </div>
+            <div class="overflow-x-auto">
+              <table class="w-full text-left font-mono text-[11px] text-gray-700 border-collapse">
+                <thead>
+                  <tr class="border-b border-gray-200 text-gray-500">
+                    <th class="py-1 pr-2">Metric (µs)</th>
+                    <th class="py-1 px-1">Min</th>
+                    <th class="py-1 px-1">P5</th>
+                    <th class="py-1 px-1">P50</th>
+                    <th class="py-1 px-1">P95</th>
+                    <th class="py-1 px-1">Max</th>
+                    <th class="py-1 pl-1">Mean±MDev</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100">
+                  <tr>
+                    <td class="py-1 pr-2 font-semibold text-gray-800">Round Trip</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.round_trip.min }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.round_trip.pct5 }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.round_trip.pct50 }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.round_trip.pct95 }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.round_trip.max }}</td>
+                    <td class="py-1 pl-1">{{ state.modbus_stats.round_trip.mean }}±{{ state.modbus_stats.round_trip.mdev }}</td>
+                  </tr>
+                  <tr>
+                    <td class="py-1 pr-2 font-semibold text-gray-800">Slave Latency</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.min }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.pct5 }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.pct50 }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.pct95 }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.max }}</td>
+                    <td class="py-1 pl-1">{{ state.modbus_stats.slave_latency.mean }}±{{ state.modbus_stats.slave_latency.mdev }}</td>
+                  </tr>
+                  <tr>
+                    <td class="py-1 pr-2 font-semibold text-gray-800">RX Duration</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.min }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.pct5 }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.pct50 }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.pct95 }}</td>
+                    <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.max }}</td>
+                    <td class="py-1 pl-1">{{ state.modbus_stats.rx_duration.mean }}±{{ state.modbus_stats.rx_duration.mdev }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
-          <div class="overflow-x-auto">
-            <table class="w-full text-left font-mono text-[11px] text-gray-700 border-collapse">
-              <thead>
-                <tr class="border-b border-gray-200 text-gray-500">
-                  <th class="py-1 pr-2">Metric (µs)</th>
-                  <th class="py-1 px-1">Min</th>
-                  <th class="py-1 px-1">P5</th>
-                  <th class="py-1 px-1">P50</th>
-                  <th class="py-1 px-1">P95</th>
-                  <th class="py-1 px-1">Max</th>
-                  <th class="py-1 pl-1">Mean±MDev</th>
-                </tr>
-              </thead>
-              <tbody class="divide-y divide-gray-100">
-                <tr>
-                  <td class="py-1 pr-2 font-semibold text-gray-800">Round Trip</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.round_trip.min }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.round_trip.pct5 }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.round_trip.pct50 }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.round_trip.pct95 }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.round_trip.max }}</td>
-                  <td class="py-1 pl-1">{{ state.modbus_stats.round_trip.mean }}±{{ state.modbus_stats.round_trip.mdev }}</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-2 font-semibold text-gray-800">Slave Latency</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.min }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.pct5 }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.pct50 }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.pct95 }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.max }}</td>
-                  <td class="py-1 pl-1">{{ state.modbus_stats.slave_latency.mean }}±{{ state.modbus_stats.slave_latency.mdev }}</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-2 font-semibold text-gray-800">RX Duration</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.min }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.pct5 }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.pct50 }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.pct95 }}</td>
-                  <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.max }}</td>
-                  <td class="py-1 pl-1">{{ state.modbus_stats.rx_duration.mean }}±{{ state.modbus_stats.rx_duration.mdev }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
+        </template>
       </div>
 
       <div class="grid grid-cols-1 gap-4 md:grid-cols-3">

@@ -411,13 +411,24 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 *   `modbus_rx_timeout_us` (number): Modbus RX inter-byte timeout ($t_{1.5}$) in microseconds (`0` = auto: **750µs** @ 115200 baud per Modbus RTU for >19200 bps).
 *   `modbus_scan_delay_us` (number): Modbus scan inter-probe delay in microseconds (`0` = use Modbus t3.5 timing only, up to `200000`).
 *   `modbus_inter_frame_delay_us` (number): Modbus inter-frame quiet interval ($t_{3.5}$) in microseconds (`0` = auto based on baud rate: 350µs @ 115200 baud, enabling <3ms total end-to-end request-response cycle time for >300 Hz position updates).
+*   `operating_mode` (string): `"servo"` (default OSSM motion controller) or `"rtu_relay"` (Modbus RTU bridge). **Restart required.**
 
 #### `POST /pin-config`
 
 *   **Method:** `POST`
-*   **Description:** Updates the GPIO pin configuration and Modbus timing settings. You must restart the microcontroller for pin assignment changes to take effect.
+*   **Description:** Updates the GPIO pin configuration and Modbus timing settings. You must restart the microcontroller for pin assignment / `operating_mode` changes to take effect.
 *   **Request Body:** A JSON object with the same structure as the `GET /pin-config` response.
 *   **Response Body:** The updated configuration as a JSON object.
+
+### RTU Relay Mode
+
+When `operating_mode` is `"rtu_relay"` (Settings UI, `POST /pin-config`, or CLI `set-operating-mode rtu_relay`, then restart), the firmware does not run the motor controller. Instead it bridges RS-485 Modbus RTU:
+
+* **Modbus TCP** on port **502** (standard MBAP)
+* **WebSocket** `ws://<device>/ws/modbus` — binary full RTU frames (with CRC)
+* Embedded UI shows a relay banner and hides motor controls
+* `release/motor-control.html` supports **Remote WebSocket** connection mode
+* Tests: `./scripts/test_modbus_relay.py --switch-mode`, `./scripts/test_modbus_tcp.py`
 
 #### `POST /restart`
 

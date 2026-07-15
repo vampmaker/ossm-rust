@@ -430,6 +430,59 @@ async def test_flasher():
     print("✓ All Web Flasher E2E tests PASSED")
 
 
+async def test_motor_control():
+    print(f"\n============================================================")
+    print(f"  OSSM Motor-Control Playwright E2E Verification Suite")
+    print(f"============================================================")
+
+    mc_path = Path(__file__).parent.parent / "release" / "motor-control.html"
+    if not mc_path.exists():
+        print(f"Skipping motor-control E2E test: {mc_path} not found")
+        return
+
+    mc_url = mc_path.as_uri()
+    print(f"  Target: {mc_url}")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        page = await context.new_page()
+
+        await page.goto(mc_url, wait_until="load")
+        title = await page.title()
+        body = await page.locator("body").inner_text()
+        assert (
+            "57AIM30" in title
+            or "57AIM30" in body
+            or "Motor" in title
+            or "Modbus" in body
+        ), f"Unexpected motor-control content: title={title!r}"
+        print("✓ Motor-control page successfully loaded")
+
+        await page.wait_for_selector("#motor-control-connection", timeout=5000)
+        print("✓ Connection bar verified visible")
+
+        conn_type = page.locator("#mc-connection-type")
+        await conn_type.wait_for(state="visible", timeout=5000)
+        await conn_type.select_option("websocket")
+        await page.wait_for_selector("#mc-ws-url", state="visible", timeout=5000)
+        assert await page.locator("#mc-baud").count() == 0, "Baud select should hide in WebSocket mode"
+        print("✓ Remote WebSocket mode shows URL field and hides baud")
+
+        await conn_type.select_option("serial")
+        await page.wait_for_selector("#mc-baud", state="visible", timeout=5000)
+        assert await page.locator("#mc-ws-url").count() == 0, "WS URL should hide in serial mode"
+        print("✓ Local Serial mode restores baud select")
+
+        for text in ("波形显示", "modbus控制参数", "电机运行参数", "modbus读取", "modbus发送", "发送数据"):
+            assert await page.locator(f"text={text}").count() > 0, f"Missing VB panel caption: {text}"
+        assert await page.locator("text=开始读取").count() > 0
+        print("✓ Core motor-control VB layout controls verified visible")
+
+        await browser.close()
+    print("✓ All Motor-Control E2E tests PASSED")
+
+
 async def _soft_reset_device() -> None:
     """Reset ESP via USB so BLE advertising restarts (clears stuck CONNECTIONS_MAX=1)."""
     import subprocess
@@ -860,8 +913,9 @@ async def main():
     await test_frontend(base_url)
     await test_web_bluetooth_frontend(runs=args.web_bluetooth_runs)
     await test_flasher()
+    await test_motor_control()
     print(f"\n============================================================")
-    print(f"✓ All HTTP + BLE + frontend + Web Bluetooth + flasher Playwright tests PASSED")
+    print(f"✓ All HTTP + BLE + frontend + Web Bluetooth + flasher + motor-control Playwright tests PASSED")
     print(f"============================================================")
 
 

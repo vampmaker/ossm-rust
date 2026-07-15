@@ -395,7 +395,11 @@ async fn handle_gatt_events<C: Controller>(
                     }
 
                     if handle == server.ossm.config.handle {
-                        if let Ok(config) = serde_json::from_slice::<MotorControllerConfig>(&data) {
+                        if crate::modbus_relay::is_active() {
+                            // Motion config writes are disabled in RTU relay mode.
+                        } else if let Ok(config) =
+                            serde_json::from_slice::<MotorControllerConfig>(&data)
+                        {
                             let applied = app_context
                                 .enqueue_motion(crate::motion::MotionCommand::SetConfig(config.clone()))
                                 .await;
@@ -409,7 +413,9 @@ async fn handle_gatt_events<C: Controller>(
                             }
                         }
                     } else if handle == server.ossm.paused.handle {
-                        if let Ok(control) = serde_json::from_slice::<PausedControl>(&data) {
+                        if crate::modbus_relay::is_active() {
+                            // Pause control disabled in RTU relay mode.
+                        } else if let Ok(control) = serde_json::from_slice::<PausedControl>(&data) {
                             let mut config = app_context.load_snapshot().config.clone();
                             if let Some(paused) = control.paused {
                                 config.paused = paused;

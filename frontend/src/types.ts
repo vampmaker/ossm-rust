@@ -94,6 +94,7 @@ export interface PinConfiguration {
   modbus_scan_delay_us: number
   modbus_inter_frame_delay_us: number
   ble_enabled: boolean
+  operating_mode?: 'servo' | 'rtu_relay'
 }
 
 export interface NetworkConfiguration {

@@ -9,7 +9,7 @@ use static_cell::StaticCell;
 use crate::context::AppContext;
 use crate::storage::NetworkConfiguration;
 
-const STACK_RESOURCES_COUNT: usize = 16;
+const STACK_RESOURCES_COUNT: usize = 20;
 
 static STACK: StaticCell<Stack<'static>> = StaticCell::new();
 static STACK_RESOURCES: StaticCell<StackResources<STACK_RESOURCES_COUNT>> = StaticCell::new();

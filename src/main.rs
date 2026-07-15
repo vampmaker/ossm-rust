@@ -24,6 +24,7 @@ mod console;
 mod context;
 mod error;
 mod http_api;
+mod modbus_relay;
 mod motion;
 mod motor;
 mod motor_57aim30;
@@ -74,6 +75,13 @@ async fn main(spawner: Spawner) -> ! {
 
     let pin_config = app_context.storage.pin();
     let ble_enabled = pin_config.ble_enabled;
+    let rtu_relay = pin_config.is_rtu_relay();
+
+    if rtu_relay {
+        log::info!("Boot mode: rtu_relay (Modbus bridge; motor controller disabled)");
+    } else {
+        log::info!("Boot mode: servo (motor controller)");
+    }
 
     #[cfg(feature = "esp32c6")]
     {
@@ -82,47 +90,76 @@ async fn main(spawner: Spawner) -> ! {
             let exec = MOTOR_EXEC.init(InterruptExecutor::new(sw_interrupt.software_interrupt1));
             exec.start(Priority::Priority3)
         };
-        motor_spawner.spawn(
-            motor_task(
-                app_context,
-                motion_consumer,
-                peripherals.UART1,
-                peripherals.UHCI0,
-                peripherals.DMA_CH0,
-                pin_config,
-            )
-            .unwrap(),
-        );
+        if rtu_relay {
+            motor_spawner
+                .spawn(
+                    relay_task(
+                        peripherals.UART1,
+                        peripherals.UHCI0,
+                        peripherals.DMA_CH0,
+                        pin_config,
+                    )
+                    .unwrap(),
+                );
+            // Keep the unused motion consumer alive for AppContext lifetime.
+            core::mem::forget(motion_consumer);
+        } else {
+            motor_spawner.spawn(
+                motor_task(
+                    app_context,
+                    motion_consumer,
+                    peripherals.UART1,
+                    peripherals.UHCI0,
+                    peripherals.DMA_CH0,
+                    pin_config,
+                )
+                .unwrap(),
+            );
+        }
     }
 
     #[cfg(feature = "esp32s3")]
     {
         use esp_hal::system::Stack;
 
-        static CORE1_STACK: StaticCell<Stack<{ 32 * 1024 }>> = StaticCell::new();
+        static CORE1_STACK: StaticCell<Stack<{ 24 * 1024 }>> = StaticCell::new();
         let stack = CORE1_STACK.init(Stack::new());
         let uart = peripherals.UART1;
         let uhci = peripherals.UHCI0;
         let dma_ch = peripherals.DMA_CH0;
-        esp_rtos::start_second_core(
-            peripherals.CPU_CTRL,
-            sw_interrupt.software_interrupt1,
-            stack,
-            move || {
-                motor_57aim30::run_motor_blocking(
-                    app_context,
-                    motion_consumer,
-                    uart,
-                    uhci,
-                    dma_ch,
-                    pin_config,
-                );
-            },
-        );
+        if rtu_relay {
+            core::mem::forget(motion_consumer);
+            esp_rtos::start_second_core(
+                peripherals.CPU_CTRL,
+                sw_interrupt.software_interrupt1,
+                stack,
+                move || {
+                    modbus_relay::run_relay_blocking(uart, uhci, dma_ch, pin_config);
+                },
+            );
+        } else {
+            esp_rtos::start_second_core(
+                peripherals.CPU_CTRL,
+                sw_interrupt.software_interrupt1,
+                stack,
+                move || {
+                    motor_57aim30::run_motor_blocking(
+                        app_context,
+                        motion_consumer,
+                        uart,
+                        uhci,
+                        dma_ch,
+                        pin_config,
+                    );
+                },
+            );
+        }
     }
 
     spawner.spawn(cli_task(app_context).unwrap());
-    spawner.spawn(nvs_saver_task(app_context).unwrap());
+    if !rtu_relay {
+        spawner.spawn(nvs_saver_task(app_context).unwrap());
+    }
 
     // Hold BT until after WiFi/HTTP are up so association and TCP listen are
     // established before BLE radio contention begins.
@@ -135,9 +172,12 @@ async fn main(spawner: Spawner) -> ! {
     let net_config = app_context.storage.net();
     if net_config.wifi_enabled {
         let stack = wifi::start_wifi(peripherals.WIFI, app_context, &spawner).await;
-        http_api::run_server(stack, app_context, &spawner).await;
+        http_api::run_server(stack, app_context, &spawner, rtu_relay).await;
     } else {
         log::info!("WiFi is disabled in NetworkConfiguration.");
+        if rtu_relay {
+            log::warn!("RTU relay network endpoints require WiFi to be enabled.");
+        }
     }
 
     if let Some(bt) = bt_for_later {
@@ -173,6 +213,19 @@ async fn motor_task(
         motor_57aim30::run_motor(app_context, motion_consumer, uart, uhci, dma_ch, pin_config).await
     {
         log::error!("Motor task failed: {}", e);
+    }
+}
+
+#[cfg(feature = "esp32c6")]
+#[embassy_executor::task]
+async fn relay_task(
+    uart: esp_hal::peripherals::UART1<'static>,
+    uhci: esp_hal::peripherals::UHCI0<'static>,
+    dma_ch: esp_hal::peripherals::DMA_CH0<'static>,
+    pin_config: PinConfiguration,
+) {
+    if let Err(e) = modbus_relay::run_relay(uart, uhci, dma_ch, pin_config).await {
+        log::error!("Modbus relay task failed: {}", e);
     }
 }
 

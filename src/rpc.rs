@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::context::AppContext;
 use crate::http_api::{SubscribeParams, WaypointsInput, WsMessage};
+use crate::modbus_relay;
 use crate::motion::{MotionCommand, MotorControllerConfig};
 use crate::storage::NetworkConfiguration;
 
@@ -94,6 +95,7 @@ async fn respond<T: Serialize + ?Sized>(id: &serde_json::Value, result: &T) -> R
 
 pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAction {
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+    let relay = modbus_relay::is_active() || app_context.storage.pin().is_rtu_relay();
 
     match request.cmd.as_str() {
         "ping" => respond(&id, "pong").await,
@@ -106,6 +108,9 @@ pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAc
             respond(&id, &*state).await
         }
         "set-config" | "set_config" => {
+            if relay {
+                return err_response(&id, -32001, "rtu_relay mode").await;
+            }
             if let Ok(config) = request.parse_params::<MotorControllerConfig>() {
                 if app_context
                     .enqueue_motion(MotionCommand::SetConfig(config.clone()))
@@ -118,12 +123,18 @@ pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAc
             err_response(&id, -32602, "Invalid params").await
         }
         "subscribe-state" | "subscribe_state" => {
+            if relay {
+                return err_response(&id, -32001, "rtu_relay mode").await;
+            }
             let params = request.parse_params::<SubscribeParams>().unwrap_or_default();
             let interval = params.interval_ms.unwrap_or(33).clamp(20, 60000);
             RpcAction::Subscribe { interval_ms: interval }
         }
         "unsubscribe-state" | "unsubscribe_state" => RpcAction::Unsubscribe,
         "append-waypoints" | "append_waypoints" => {
+            if relay {
+                return err_response(&id, -32001, "rtu_relay mode").await;
+            }
             if let Ok(input) = request.parse_params::<WaypointsInput>() {
                 let (waypoints, _) = input.into_parts();
                 if app_context
@@ -136,6 +147,9 @@ pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAc
             err_response(&id, -32602, "Invalid params").await
         }
         "set-waypoints" | "set_waypoints" => {
+            if relay {
+                return err_response(&id, -32001, "rtu_relay mode").await;
+            }
             if let Ok(input) = request.parse_params::<WaypointsInput>() {
                 let (waypoints, reset_timestamp) = input.into_parts();
                 if reset_timestamp {
@@ -156,6 +170,9 @@ pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAc
             err_response(&id, -32602, "Invalid params").await
         }
         "reset-timestamp" | "reset_timestamp" => {
+            if relay {
+                return err_response(&id, -32001, "rtu_relay mode").await;
+            }
             let _ = app_context
                 .enqueue_motion(MotionCommand::ResetTimestamp)
                 .await;

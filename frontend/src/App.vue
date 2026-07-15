@@ -31,6 +31,7 @@ const defaultPinConfig: PinConfiguration = {
   modbus_scan_delay_us: 0,
   modbus_inter_frame_delay_us: 0,
   ble_enabled: true,
+  operating_mode: 'servo',
 }
 
 const defaultNetConfig: NetworkConfiguration = {
@@ -289,6 +290,10 @@ const isMotorConnected = computed<boolean>(() => {
   return motorUpdateRate.value !== null && motorUpdateRate.value > 0
 })
 
+const isRelayMode = computed(
+  () => (pinConfig.value.operating_mode ?? 'servo') === 'rtu_relay',
+)
+
 async function saveAllSettings() {
   pinConfigSaving.value = true
   pinConfigSaved.value = false
@@ -451,9 +456,34 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
         </button>
       </div>
 
+      <!-- Alert Banner: RTU relay mode -->
+      <div
+        v-if="connected && isRelayMode"
+        id="alert-rtu-relay"
+        class="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-amber-800 shadow-sm"
+      >
+        <div class="flex items-center space-x-3">
+          <span class="flex h-3 w-3 rounded-full bg-amber-500 animate-ping"></span>
+          <div>
+            <p class="font-bold">RTU Relay Mode Active</p>
+            <p class="text-xs text-amber-700">
+              Motor control is disabled. Use Modbus TCP on port 502 or WebSocket
+              <code class="font-mono">/ws/modbus</code> for remote drive access.
+              Change mode in Settings and restart to restore servo control.
+            </p>
+          </div>
+        </div>
+        <button
+          @click="showSettings = true"
+          class="rounded bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-700 shadow-sm"
+        >
+          Open Settings
+        </button>
+      </div>
+
       <!-- Alert Banner: Motor disconnected or low update rate (<50 Hz) -->
       <div
-        v-if="connected && (!isMotorConnected || (motorUpdateRate !== null && motorUpdateRate < 50))"
+        v-if="connected && !isRelayMode && (!isMotorConnected || (motorUpdateRate !== null && motorUpdateRate < 50))"
         id="alert-motor-status"
         class="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-amber-800 shadow-sm"
       >
@@ -481,12 +511,13 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
 
       <div class="space-y-4">
         <MotorPositionDiagram
-          v-if="showDiagram"
+          v-if="showDiagram && !isRelayMode"
           :config="config"
           :state="motorState"
           :connected="motorReady"
         />
         <MainControl
+          v-if="!isRelayMode"
           v-model="config"
           :pause-mode="pauseMode"
           :connected="motorReady"
@@ -496,12 +527,12 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
           @set-pause-mode="pauseMode = $event"
         />
         <SplineEditor
-          v-if="config.wave_func === 'spline'"
+          v-if="!isRelayMode && config.wave_func === 'spline'"
           v-model="config" :connected="motorReady"
           @update:model-value="setConfig"
         />
         <FunscriptPlayer
-          v-if="config.wave_func === 'funscript'"
+          v-if="!isRelayMode && config.wave_func === 'funscript'"
         />
         <UnifiedSettings
           v-if="showSettings"

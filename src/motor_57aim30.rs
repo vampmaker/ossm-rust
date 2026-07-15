@@ -407,7 +407,7 @@ impl<'d> ModbusRTUMaster<'d> {
         Ok((len, timing))
     }
 
-    async fn modbus_request(&mut self, req: &[u8], resp: &mut [u8]) -> Result<usize> {
+    pub async fn modbus_request(&mut self, req: &[u8], resp: &mut [u8]) -> Result<usize> {
         match self.modbus_request_inner(req, resp).await {
             Ok((len, timing)) => {
                 self.record_sample(timing);
@@ -721,7 +721,7 @@ pub struct ModbusScanResult {
     pub device_id: u8,
 }
 
-fn init_uart_and_modbus(
+pub(crate) fn init_uart_and_modbus(
     uart_periph: esp_hal::peripherals::UART1<'static>,
     uhci_periph: esp_hal::peripherals::UHCI0<'static>,
     dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
@@ -977,6 +977,13 @@ pub async fn run_motor(
 }
 
 #[cfg(feature = "esp32s3")]
+fn core1_executor() -> &'static mut esp_rtos::embassy::Executor {
+    use static_cell::StaticCell;
+    static CORE1_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+    CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new())
+}
+
+#[cfg(feature = "esp32s3")]
 pub fn run_motor_blocking(
     app_context: AppContext,
     motion_consumer: crate::motion::CommandConsumer,
@@ -985,10 +992,7 @@ pub fn run_motor_blocking(
     dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
     pin_config: PinConfiguration,
 ) {
-    use static_cell::StaticCell;
-    static CORE1_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
-
-    let executor = CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new());
+    let executor = core1_executor();
     executor.run(|spawner| {
         spawner.spawn(
             core1_motor_task(
@@ -1001,6 +1005,20 @@ pub fn run_motor_blocking(
             )
             .unwrap(),
         );
+    });
+}
+
+#[cfg(feature = "esp32s3")]
+pub fn run_relay_on_core1(
+    uart_periph: esp_hal::peripherals::UART1<'static>,
+    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
+    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
+    pin_config: PinConfiguration,
+) {
+    let executor = core1_executor();
+    executor.run(|spawner| {
+        spawner
+            .spawn(core1_relay_task(uart_periph, uhci_periph, dma_channel, pin_config).unwrap());
     });
 }
 
@@ -1025,6 +1043,21 @@ async fn core1_motor_task(
     .await
     {
         log::error!("Motor task on Core 1 failed: {}", e);
+    }
+}
+
+#[cfg(feature = "esp32s3")]
+#[embassy_executor::task]
+async fn core1_relay_task(
+    uart_periph: esp_hal::peripherals::UART1<'static>,
+    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
+    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
+    pin_config: PinConfiguration,
+) {
+    if let Err(e) =
+        crate::modbus_relay::run_relay(uart_periph, uhci_periph, dma_channel, pin_config).await
+    {
+        log::error!("Modbus relay on Core 1 failed: {}", e);
     }
 }
 

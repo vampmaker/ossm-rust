@@ -194,6 +194,7 @@ class PinConfiguration(BaseModel):
     modbus_scan_delay_us: int = 0
     modbus_inter_frame_delay_us: int = 0
     ble_enabled: bool = True
+    operating_mode: str = "servo"
 
 
 class NetworkConfiguration(BaseModel):
@@ -656,6 +657,11 @@ class DeviceBackend:
                 val = "true" if pin_dict["ble_enabled"] else "false"
                 await self._serial_command(
                     f"set-ble-enabled {val}", wait_response=False
+                )
+            if "operating_mode" in pin_dict:
+                await self._serial_command(
+                    f"set-operating-mode {pin_dict['operating_mode']}",
+                    wait_response=False,
                 )
             return await self.get_pin_config()
         return {}
@@ -1120,6 +1126,11 @@ def pins(
     ble_enabled: Optional[bool] = typer.Option(
         None, "--ble/--no-ble", help="Enable or disable Bluetooth Low Energy"
     ),
+    operating_mode: Optional[str] = typer.Option(
+        None,
+        "--operating-mode",
+        help="Device operating mode: servo or rtu_relay (restart required)",
+    ),
     mode: Optional[str] = typer.Option(
         None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
     ),
@@ -1140,6 +1151,11 @@ def pins(
         changes["modbus_de_re"] = de_re
     if ble_enabled is not None:
         changes["ble_enabled"] = ble_enabled
+    if operating_mode is not None:
+        if operating_mode not in ("servo", "rtu_relay"):
+            console.print("[bold red]operating_mode must be 'servo' or 'rtu_relay'[/bold red]")
+            raise typer.Exit(1)
+        changes["operating_mode"] = operating_mode
 
     if changes:
         with console.status(f"[bold cyan]Applying pin configuration updates..."):

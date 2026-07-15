@@ -1,0 +1,248 @@
+<script setup lang="ts">
+import { ref, onUnmounted, computed, watch } from 'vue'
+import { SerialModbusClient } from './lib/serial-port'
+import { WebSocketModbusClient } from './lib/websocket-modbus'
+import type { ModbusTransport } from './lib/transport'
+import { buildReadHoldingRegisters } from './lib/modbus-rtu'
+import { parseRegistersToState, type DriveState } from './lib/registers'
+
+import WaveformChart from './components/WaveformChart.vue'
+import ParamListPanel from './components/ParamListPanel.vue'
+import TelemetryPanel from './components/TelemetryPanel.vue'
+import DriverSettingsPanel from './components/DriverSettingsPanel.vue'
+import ModbusReadPanel from './components/ModbusReadPanel.vue'
+import StatusConnectPanel from './components/StatusConnectPanel.vue'
+import ModbusSendPanel from './components/ModbusSendPanel.vue'
+import SendEchoStrip from './components/SendEchoStrip.vue'
+import CommLog from './components/CommLog.vue'
+
+const serialClient = new SerialModbusClient()
+const wsClient = new WebSocketModbusClient()
+
+const connectionType = ref<'serial' | 'websocket'>('serial')
+const client = ref<ModbusTransport>(serialClient)
+
+const isConnected = ref(false)
+const baudRate = ref(115200)
+const wsUrl = ref('ws://ossm.lan/ws/modbus')
+const deviceAddress = ref(1)
+const pollIntervalMs = ref(50)
+const readEnabled = ref(true)
+const addressScanEnabled = ref(false)
+const isPolling = ref(false)
+const scanTickCounter = ref(0)
+
+const driveState = ref<DriveState | null>(null)
+const errorMsg = ref('')
+
+let pollTimer: number | null = null
+
+const webSerialSupported = computed(() => 'serial' in navigator)
+
+watch(connectionType, (next) => {
+  if (isConnected.value) return
+  client.value = next === 'websocket' ? wsClient : serialClient
+})
+
+function clampDeviceAddress() {
+  const safe = Math.trunc(Number(deviceAddress.value))
+  if (!Number.isFinite(safe)) {
+    deviceAddress.value = 1
+    return
+  }
+  deviceAddress.value = Math.min(255, Math.max(1, safe))
+}
+
+function advanceScanAddressIfNeeded() {
+  if (!addressScanEnabled.value) return
+  scanTickCounter.value += 1
+  if (scanTickCounter.value >= 3) {
+    if (deviceAddress.value < 255) {
+      deviceAddress.value += 1
+    }
+    scanTickCounter.value = 0
+  }
+}
+
+async function toggleConnection() {
+  if (isConnected.value) {
+    stopPolling()
+    await client.value.disconnect()
+    isConnected.value = false
+    driveState.value = null
+  } else {
+    try {
+      errorMsg.value = ''
+      clampDeviceAddress()
+      scanTickCounter.value = 0
+      client.value = connectionType.value === 'websocket' ? wsClient : serialClient
+      if (connectionType.value === 'websocket') {
+        await client.value.connect({ url: wsUrl.value })
+      } else {
+        await client.value.connect({ baudRate: baudRate.value })
+      }
+      isConnected.value = true
+      startPolling()
+    } catch (e: any) {
+      errorMsg.value = `连接失败: ${e.message}`
+    }
+  }
+}
+
+function startPolling() {
+  if (isPolling.value || !isConnected.value) return
+  isPolling.value = true
+  pollLoop()
+}
+
+function stopPolling() {
+  isPolling.value = false
+  if (pollTimer) {
+    clearTimeout(pollTimer)
+    pollTimer = null
+  }
+}
+
+async function pollLoop() {
+  if (!isPolling.value || !isConnected.value) return
+
+  if (readEnabled.value) {
+    try {
+      clampDeviceAddress()
+      const frame = buildReadHoldingRegisters(deviceAddress.value, 0, 26)
+      const response = await client.value.sendRequest(frame, 300)
+
+      if (!response.isError && response.data.length === 52) {
+        const registers = new Uint16Array(26)
+        for (let i = 0; i < 26; i++) {
+          registers[i] = (response.data[i * 2]! << 8) | response.data[i * 2 + 1]!
+        }
+        const nextState = parseRegistersToState(registers)
+        driveState.value = nextState
+        errorMsg.value = ''
+
+        if (addressScanEnabled.value && nextState.warningCode === 0) {
+          addressScanEnabled.value = false
+          scanTickCounter.value = 0
+          errorMsg.value = `地址扫描找到设备: ${deviceAddress.value}`
+        }
+      } else if (response.isError) {
+        errorMsg.value = `Modbus 错误: 0x${response.errorCode?.toString(16)}`
+      }
+    } catch (e: any) {
+      errorMsg.value = `轮询失败: ${e.message}`
+    }
+
+    advanceScanAddressIfNeeded()
+  }
+
+  if (isPolling.value) {
+    pollTimer = window.setTimeout(pollLoop, pollIntervalMs.value)
+  }
+}
+
+onUnmounted(() => {
+  stopPolling()
+  if (isConnected.value) {
+    void client.value.disconnect()
+  }
+})
+</script>
+
+<template>
+  <div class="min-h-screen bg-[#ece9d8] text-gray-900 flex flex-col font-sans text-[12px]">
+    <header class="bg-[#000080] text-white px-2.5 py-1 flex items-center justify-between shadow-sm select-none border-b border-gray-400">
+      <div class="flex items-center gap-2">
+        <div class="w-3.5 h-3.5 bg-white/20 border border-white/40 flex items-center justify-center text-[9px] font-bold">YZ</div>
+        <h1 class="text-[13px] font-bold tracking-wide">YZ_AIM_v2_61</h1>
+        <span class="text-[11px] text-blue-200">57AIM30 PC Control</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-[11px] text-blue-200 hidden sm:inline mr-2">Local Serial / Remote Modbus WebSocket</span>
+        <div class="flex gap-0.5">
+          <div class="w-4 h-3.5 bg-[#d4d0c8] border border-white border-r-gray-600 border-b-gray-600 flex items-center justify-center text-black text-[9px] font-bold leading-none">_</div>
+          <div class="w-4 h-3.5 bg-[#d4d0c8] border border-white border-r-gray-600 border-b-gray-600 flex items-center justify-center text-black text-[9px] font-bold leading-none">□</div>
+          <div class="w-4 h-3.5 bg-[#d4d0c8] border border-white border-r-gray-600 border-b-gray-600 flex items-center justify-center text-black text-[9px] font-bold leading-none">×</div>
+        </div>
+      </div>
+    </header>
+
+    <main class="flex-1 p-2 grid vb-layout gap-2 min-h-0 overflow-auto">
+      <!-- Left side: chart, 4 bottom boxes, send data strip & log -->
+      <div class="flex flex-col gap-2 min-w-0">
+        <WaveformChart class="min-h-[320px] flex-1" :state="driveState" />
+        
+        <div class="grid vb-left-boxes gap-2">
+          <TelemetryPanel :state="driveState" />
+          <DriverSettingsPanel :state="driveState" />
+          <ModbusReadPanel
+            v-model:deviceAddress="deviceAddress"
+            v-model:pollIntervalMs="pollIntervalMs"
+            v-model:readEnabled="readEnabled"
+            v-model:addressScanEnabled="addressScanEnabled"
+            :isConnected="isConnected"
+          />
+          <StatusConnectPanel
+            v-model:connectionType="connectionType"
+            v-model:baudRate="baudRate"
+            v-model:wsUrl="wsUrl"
+            :state="driveState"
+            :isConnected="isConnected"
+            :errorMsg="errorMsg"
+            :webSerialSupported="webSerialSupported"
+            @toggle="toggleConnection"
+          />
+        </div>
+
+        <SendEchoStrip :client="client" />
+        <CommLog :client="client" />
+      </div>
+
+      <!-- Right side: parameter list and modbus send -->
+      <div class="flex flex-col gap-2 min-w-0">
+        <ParamListPanel
+          class="flex-1 min-h-[360px]"
+          :state="driveState"
+          :client="client"
+          :deviceAddress="deviceAddress"
+        />
+        <ModbusSendPanel :client="client" :deviceAddress="deviceAddress" />
+      </div>
+    </main>
+  </div>
+</template>
+
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background-color: #ece9d8;
+}
+#app {
+  height: 100%;
+}
+
+.vb-layout {
+  grid-template-columns: 1fr;
+}
+.vb-left-boxes {
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 1100px) {
+  .vb-layout {
+    grid-template-columns: minmax(0, 1fr) 320px;
+  }
+  .vb-left-boxes {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 640px) and (max-width: 1099px) {
+  .vb-left-boxes {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+</style>
+

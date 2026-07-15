@@ -394,13 +394,24 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
 *   `modbus_rx_timeout_us`（数字）：Modbus 字节间超时时间（微秒，$t_{1.5}$），`0` 表示自动（115200 波特率默认为 **`750µs`**，符合 >19200 bps 的 Modbus RTU 规范）。
 *   `modbus_scan_delay_us`（数字）：Modbus 自动扫描时的帧间检测延迟（微秒），`0` 表示仅采用 Modbus 规范标准的 t3.5 间隙时序（最高支持 `200000`）。
 *   `modbus_inter_frame_delay_us`（数字）：Modbus 正常通信时的帧间静默延迟（微秒，$t_{3.5}$），`0` 表示自动（115200 波特率默认为 `350µs`，确保完整的往返控制时延于 <3ms 以支撑 >300Hz 的电机控制刷新率）。
+*   `operating_mode`（字符串）：`"servo"`（默认 OSSM 运动控制）或 `"rtu_relay"`（Modbus RTU 桥接）。**需重启生效。**
 
 #### `POST /pin-config`
 
 *   **请求方法：** `POST`
-*   **接口描述：** 更新 Modbus GPIO 引脚映射及通信时序配置。注意，修改硬件引脚映射后需要软重启微控制器方可生效。
+*   **接口描述：** 更新 Modbus GPIO 引脚映射及通信时序配置。注意，修改硬件引脚映射或 `operating_mode` 后需要软重启微控制器方可生效。
 *   **请求消息体：** 结构与 `GET /pin-config` 返回的 JSON 对象相同。
 *   **响应消息体：** 成功更新后的配置 JSON 对象。
+
+### RTU 中继模式
+
+当 `operating_mode` 为 `"rtu_relay"`（设置面板、`POST /pin-config` 或串口 CLI `set-operating-mode rtu_relay`，然后重启）时，固件不运行电机控制环，而是作为 RS-485 Modbus RTU 桥：
+
+* **Modbus TCP** 端口 **502**
+* **WebSocket** `ws://<设备>/ws/modbus`（二进制完整 RTU 帧含 CRC）
+* 网页前端显示中继提示并隐藏电机控制面板
+* `release/motor-control.html` 支持 **Remote WebSocket** 连接
+* 测试：`./scripts/test_modbus_relay.py --switch-mode`、`./scripts/test_modbus_tcp.py`
 
 #### `POST /restart`
 

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use static_cell::StaticCell;
 
 use crate::context::AppContext;
+use crate::modbus_relay;
 use crate::motion::MotorControllerConfig;
 use crate::rpc::{self, RpcAction};
 use crate::storage::{NetworkConfiguration, PinConfiguration};
@@ -111,6 +112,9 @@ pub const WEB_TASK_POOL_SIZE: usize = 1;
 const TCP_POOL_SIZE: usize = 10;
 const Q_ACCEPTORS: usize = 4;
 const WS_MAX: usize = 3;
+const MODBUS_WS_MAX: usize = 2;
+const MODBUS_TCP_POOL: usize = 2;
+const MODBUS_TCP_BUFFER_SIZE: usize = 512;
 const MAX_BODY_LEN: usize = 1024;
 
 type HttpConn<'a> = Connection<'a, TcpSocket<'static>, DEFAULT_MAX_HEADERS_COUNT>;
@@ -136,16 +140,28 @@ impl SyncTcpSocket {
 static TCP_BUFFERS: StaticCell<TcpBuffers<TCP_POOL_SIZE, TCP_BUFFER_SIZE, TCP_BUFFER_SIZE>> =
     StaticCell::new();
 static TCP_FACTORY: StaticCell<Tcp<'static>> = StaticCell::new();
+static MODBUS_TCP_BUFFERS: StaticCell<
+    TcpBuffers<MODBUS_TCP_POOL, MODBUS_TCP_BUFFER_SIZE, MODBUS_TCP_BUFFER_SIZE>,
+> = StaticCell::new();
+static MODBUS_TCP_FACTORY: StaticCell<Tcp<'static>> = StaticCell::new();
 static SOCKET_QUEUE: Channel<CriticalSectionRawMutex, (SyncTcpSocket, usize), Q_ACCEPTORS> =
     Channel::new();
 static WS_SOCKET_CH: Channel<CriticalSectionRawMutex, (SyncTcpSocket, usize), WS_MAX> =
     Channel::new();
+static MODBUS_WS_CH: Channel<CriticalSectionRawMutex, (SyncTcpSocket, usize), MODBUS_WS_MAX> =
+    Channel::new();
 static REST_GATE: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 static WS_SLOTS: GreedySemaphore<CriticalSectionRawMutex> = GreedySemaphore::new(WS_MAX);
+static MODBUS_WS_SLOTS: GreedySemaphore<CriticalSectionRawMutex> =
+    GreedySemaphore::new(MODBUS_WS_MAX);
 static ACCEPT_SIGNALS: [Signal<CriticalSectionRawMutex, ()>; Q_ACCEPTORS] =
     [const { Signal::new() }; Q_ACCEPTORS];
 /// Signalled once the HTTP listener is bound and accept loops are about to run.
 static HTTP_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+fn is_relay_mode(ctx: AppContext) -> bool {
+    modbus_relay::is_active() || ctx.storage.pin().is_rtu_relay()
+}
 
 fn normalize_path(path: &str) -> &str {
     path.split('?').next().unwrap_or(path)
@@ -310,6 +326,9 @@ async fn post_config(
     ctx: AppContext,
     body: Vec<u8>,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    if is_relay_mode(ctx) {
+        return send_json(conn, 409, "Conflict", "rtu_relay mode").await;
+    }
     if body.len() > 1024 {
         return send_json(conn, 400, "Bad Request", "Request too large").await;
     }
@@ -343,6 +362,9 @@ async fn post_paused(
     ctx: AppContext,
     body: Vec<u8>,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    if is_relay_mode(ctx) {
+        return send_json(conn, 409, "Conflict", "rtu_relay mode").await;
+    }
     if body.len() > MAX_BODY_LEN {
         return send_json(conn, 400, "Bad Request", "Request too large").await;
     }
@@ -514,15 +536,67 @@ async fn process_connection(
         Err(_) => return,
     };
 
-    let is_ws = conn
-        .is_ws_upgrade_request()
-        .unwrap_or(false)
-        && conn
-            .headers()
-            .map(|h| normalize_path(h.path) == "/ws/command")
-            .unwrap_or(false);
+    let ws_path = conn
+        .headers()
+        .ok()
+        .map(|h| normalize_path(h.path));
+    let is_ws = conn.is_ws_upgrade_request().unwrap_or(false);
+    let is_command_ws = is_ws && ws_path == Some("/ws/command");
+    let is_modbus_ws = is_ws && ws_path == Some("/ws/modbus");
 
-    if is_ws {
+    if is_modbus_ws {
+        if !is_relay_mode(ctx) {
+            let _ = conn
+                .initiate_response(
+                    403,
+                    Some("Forbidden"),
+                    &[("Connection", "close"), ("Content-Type", "text/plain")],
+                )
+                .await;
+            finish_connection(&mut conn).await;
+            return;
+        }
+        if MODBUS_WS_SLOTS.try_acquire(1).is_none() {
+            let _ = conn
+                .initiate_response(
+                    503,
+                    Some("Service Unavailable"),
+                    &[("Connection", "close"), ("Content-Type", "text/plain")],
+                )
+                .await;
+            finish_connection(&mut conn).await;
+            return;
+        }
+
+        let mut key_buf = [0u8; edge_http::ws::MAX_BASE64_KEY_RESPONSE_LEN];
+        if conn
+            .initiate_ws_upgrade_response(&mut key_buf)
+            .await
+            .is_err()
+        {
+            MODBUS_WS_SLOTS.release(1);
+            finish_connection(&mut conn).await;
+            return;
+        }
+        if conn.complete().await.is_err() {
+            MODBUS_WS_SLOTS.release(1);
+            finish_connection(&mut conn).await;
+            return;
+        }
+        let _ = conn.unbind();
+        let socket = extract_unbound_socket(conn);
+        match MODBUS_WS_CH.try_send((SyncTcpSocket::new(socket), acceptor_id)) {
+            Ok(()) => {}
+            Err(embassy_sync::channel::TrySendError::Full((wrapped, _))) => {
+                MODBUS_WS_SLOTS.release(1);
+                let mut socket = wrapped.into_inner();
+                let _ = socket.close(Close::Both).await;
+            }
+        }
+        return;
+    }
+
+    if is_command_ws {
         if WS_SLOTS.try_acquire(1).is_none() {
             let _ = conn
                 .initiate_response(
@@ -729,6 +803,173 @@ async fn ws_session_task(ctx: AppContext) {
     }
 }
 
+async fn run_modbus_ws_session(mut socket: TcpSocket<'static>) {
+    let (mut rx, mut tx) = socket.split();
+    let mut buf = [0u8; HTTP_BUFFER_SIZE];
+    loop {
+        match ws_recv(&mut rx, &mut buf).await {
+            Ok((frame_type, len)) => match frame_type {
+                FrameType::Binary(_) | FrameType::Text(_) => {
+                    let req = &buf[..len];
+                    match modbus_relay::exchange_rtu(req).await {
+                        Ok(resp) => {
+                            if ws_send(&mut tx, FrameType::Binary(false), None, &resp)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Modbus WS exchange failed: {}", e);
+                            // Close on bus errors so the client can retry/reconnect.
+                            break;
+                        }
+                    }
+                }
+                FrameType::Ping => {
+                    if ws_send(&mut tx, FrameType::Pong, None, &buf[..len])
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                FrameType::Close => break,
+                _ => {}
+            },
+            Err(_) => break,
+        }
+    }
+    drop(socket);
+}
+
+#[embassy_executor::task(pool_size = 2)]
+async fn modbus_ws_session_task() {
+    loop {
+        let (wrapped, _acceptor_id) = MODBUS_WS_CH.receive().await;
+        run_modbus_ws_session(wrapped.into_inner()).await;
+        MODBUS_WS_SLOTS.release(1);
+    }
+}
+
+static MODBUS_TCP_SOCKET_CH: Channel<CriticalSectionRawMutex, SyncTcpSocket, MODBUS_TCP_POOL> =
+    Channel::new();
+
+async fn read_exact(socket: &mut TcpSocket<'static>, buf: &mut [u8]) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        match socket.read(&mut buf[off..]).await {
+            Ok(0) => return false,
+            Ok(n) => off += n,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+async fn handle_modbus_tcp_client(mut socket: TcpSocket<'static>) {
+    let mut hdr = [0u8; 7];
+    loop {
+        if !read_exact(&mut socket, &mut hdr).await {
+            break;
+        }
+        let tid = u16::from_be_bytes([hdr[0], hdr[1]]);
+        let proto = u16::from_be_bytes([hdr[2], hdr[3]]);
+        let length = u16::from_be_bytes([hdr[4], hdr[5]]) as usize;
+        let unit_id = hdr[6];
+        if proto != 0 || length < 2 || length > 253 {
+            break;
+        }
+        let pdu_len = length - 1;
+        let mut pdu = [0u8; 256];
+        if !read_exact(&mut socket, &mut pdu[..pdu_len]).await {
+            break;
+        }
+
+        match modbus_relay::exchange_modbus_tcp(unit_id, &pdu[..pdu_len]).await {
+            Ok(resp_pdu) => {
+                let resp_len = 1 + resp_pdu.len();
+                let mut out = [0u8; 260];
+                out[0..2].copy_from_slice(&tid.to_be_bytes());
+                out[2..4].copy_from_slice(&0u16.to_be_bytes());
+                out[4..6].copy_from_slice(&(resp_len as u16).to_be_bytes());
+                out[6] = unit_id;
+                out[7..7 + resp_pdu.len()].copy_from_slice(&resp_pdu);
+                if Write::write_all(&mut socket, &out[..7 + resp_pdu.len()])
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(e) => {
+                log::warn!("Modbus TCP exchange failed: {}", e);
+                let fc = if pdu_len > 0 { pdu[0] } else { 0x00 };
+                let exc = [fc | 0x80, 0x0A];
+                let mut out = [0u8; 9];
+                out[0..2].copy_from_slice(&tid.to_be_bytes());
+                out[2..4].copy_from_slice(&0u16.to_be_bytes());
+                out[4..6].copy_from_slice(&3u16.to_be_bytes());
+                out[6] = unit_id;
+                out[7..9].copy_from_slice(&exc);
+                let _ = Write::write_all(&mut socket, &out).await;
+                break;
+            }
+        }
+    }
+    let _ = socket.close(Close::Both).await;
+}
+
+#[embassy_executor::task(pool_size = 2)]
+async fn modbus_tcp_session_task() {
+    loop {
+        let wrapped = MODBUS_TCP_SOCKET_CH.receive().await;
+        handle_modbus_tcp_client(wrapped.into_inner()).await;
+    }
+}
+
+async fn modbus_tcp_server_main(stack: &'static Stack<'static>) {
+    let spawner = unsafe { embassy_executor::Spawner::for_current_executor().await };
+    for _ in 0..MODBUS_TCP_POOL {
+        let _ = spawner.spawn(modbus_tcp_session_task().unwrap());
+    }
+
+    let buffers = MODBUS_TCP_BUFFERS.init(TcpBuffers::new());
+    let tcp = MODBUS_TCP_FACTORY.init(Tcp::new(*stack, buffers));
+    let acceptor = loop {
+        match tcp.bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 502))).await {
+            Ok(a) => break a,
+            Err(e) => {
+                log::error!("Modbus TCP :502 bind failed: {:?}, retrying...", e);
+                Timer::after(Duration::from_secs(1)).await;
+            }
+        }
+    };
+    log::info!("Modbus TCP relay listening on :502");
+
+    use edge_nal::TcpAccept;
+    loop {
+        match acceptor.accept().await {
+            Ok((_, socket)) => {
+                let wrapped = SyncTcpSocket::new(socket);
+                if MODBUS_TCP_SOCKET_CH.try_send(wrapped).is_err() {
+                    // Pool busy — drop connection.
+                }
+            }
+            Err(e) => {
+                log::warn!("Modbus TCP accept error: {:?}", e);
+                Timer::after(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn modbus_tcp_server_task(stack: &'static Stack<'static>) {
+    modbus_tcp_server_main(stack).await;
+}
+
 async fn acceptor_loop(acceptor_id: usize, acceptor: edge_nal_embassy::TcpAccept<'static>) {
     use edge_nal::TcpAccept;
     loop {
@@ -806,9 +1047,16 @@ pub async fn run_server(
     stack: &'static Stack<'static>,
     app_context: AppContext,
     spawner: &Spawner,
+    rtu_relay: bool,
 ) {
     for _ in 0..WS_MAX {
         spawner.spawn(ws_session_task(app_context).unwrap());
+    }
+    if rtu_relay {
+        for _ in 0..MODBUS_WS_MAX {
+            spawner.spawn(modbus_ws_session_task().unwrap());
+        }
+        spawner.spawn(modbus_tcp_server_task(stack).unwrap());
     }
     spawner.spawn(http_server_task(stack, app_context).unwrap());
     // Wait until bind + accept priming completes so BLE is not started while the

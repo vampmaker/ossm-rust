@@ -17,6 +17,7 @@ const statusMessage = ref('Load a .funscript file to get started')
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 let streamTimer: number | null = null
+let streamStateListener: ((st: MotorState) => void) | null = null
 
 const totalDuration = computed(() => {
   if (actions.value.length === 0) return 0
@@ -177,12 +178,14 @@ async function startPlayback() {
       streaming: true
     })
 
-    await subscribeState((st: MotorState) => {
+    const onStreamState = (st: MotorState) => {
       if (st.stream) {
         bufferedCount.value = st.stream.buffered
         streamTime.value = st.stream.stream_time
       }
-    }, 200)
+    }
+    streamStateListener = onStreamState
+    await subscribeState(onStreamState, 200)
 
     resyncStream(true)
 
@@ -212,7 +215,10 @@ async function stopPlayback() {
     streamTimer = null
   }
   try {
-    await unsubscribeState()
+    if (streamStateListener) {
+      await unsubscribeState(streamStateListener)
+      streamStateListener = null
+    }
     await setConfig({
       bpm: 30,
       depth: 1.0,

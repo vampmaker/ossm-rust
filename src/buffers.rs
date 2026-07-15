@@ -1,24 +1,30 @@
-use core::cell::RefCell;
 use core::ops::{Deref, DerefMut};
 use embassy_futures::select::{select4, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::mutex::{Mutex as AsyncMutex, MutexGuard};
 
-static SCRATCHPAD: BlockingMutex<CriticalSectionRawMutex, RefCell<[u8; 4096]>> =
-    BlockingMutex::new(RefCell::new([0u8; 4096]));
+static SCRATCHPAD: AsyncMutex<CriticalSectionRawMutex, [u8; 4096]> =
+    AsyncMutex::new([0u8; 4096]);
 
 /// Execute a synchronous compute-only operation using the 4 KB scratchpad buffer.
 /// Non-yieldable: closure `f` cannot `.await`.
-pub fn with_scratchpad<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
-    SCRATCHPAD.lock(|cell| {
-        let mut buf = cell.borrow_mut();
-        f(&mut *buf)
-    })
+pub async fn with_scratchpad<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let mut guard = SCRATCHPAD.lock().await;
+    f(&mut *guard)
+}
+
+/// Try to execute a synchronous compute-only operation using the 4 KB scratchpad buffer.
+/// Returns `None` if the scratchpad is currently locked.
+pub fn try_with_scratchpad<R>(f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+    if let Ok(mut guard) = SCRATCHPAD.try_lock() {
+        Some(f(&mut *guard))
+    } else {
+        None
+    }
 }
 
 /// Serialize a value to JSON into the scratchpad buffer zero-heap and pass the `&str` to closure `f`.
-pub fn serialize_to_scratchpad<T: serde::Serialize, R>(
+pub async fn serialize_to_scratchpad<T: serde::Serialize, R>(
     value: &T,
     f: impl FnOnce(&str) -> R,
 ) -> Result<R, ()> {
@@ -27,6 +33,7 @@ pub fn serialize_to_scratchpad<T: serde::Serialize, R>(
         let str_slice = core::str::from_utf8(&buf[..len]).map_err(|_| ())?;
         Ok(f(str_slice))
     })
+    .await
 }
 
 pub struct NetBufferLease<'a, const SIZE: usize> {

@@ -4,11 +4,10 @@
 
 extern crate alloc;
 
-use esp_backtrace as _;
-esp_bootloader_esp_idf::esp_app_desc!();
-
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
+esp_bootloader_esp_idf::esp_app_desc!();
+
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::timer::timg::TimerGroup;
@@ -21,6 +20,7 @@ use static_cell::StaticCell;
 mod ble_api;
 mod buffers;
 mod command;
+mod console;
 mod context;
 mod error;
 mod http_api;
@@ -31,9 +31,11 @@ mod rpc;
 mod storage;
 mod wifi;
 
-use context::{AppContext, CsMutex};
-use motion::MotorController;
-use storage::{PinConfiguration, StorageManager};
+use context::AppContext;
+#[cfg(feature = "esp32c6")]
+use motion::CommandConsumer;
+#[cfg(feature = "esp32c6")]
+use storage::PinConfiguration;
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -46,32 +48,31 @@ async fn main(spawner: Spawner) -> ! {
     let sw_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    esp_println::logger::init_logger_from_env();
-    log::set_max_level(log::LevelFilter::Info);
+    console::init_logger();
     log::info!("OSSM Rust firmware starting (esp-hal)");
 
-    let storage_ref: &'static CsMutex<StorageManager> = {
-        static STORAGE: StaticCell<CsMutex<StorageManager>> = StaticCell::new();
-        STORAGE.init(embassy_sync::mutex::Mutex::new(StorageManager::new(
-            peripherals.FLASH,
-        )))
-    };
+    // Console owns USB Serial/JTAG + UART0 (DevKit USB-UART bridge pins).
+    #[cfg(feature = "esp32c6")]
+    let uart_pins = console::UartPins::new(peripherals.GPIO16, peripherals.GPIO17);
+    #[cfg(feature = "esp32s3")]
+    let uart_pins = console::UartPins::new(peripherals.GPIO43, peripherals.GPIO44);
 
-    let motor_controller_ref: &'static CsMutex<Option<MotorController>> = {
-        static MC: StaticCell<CsMutex<Option<MotorController>>> = StaticCell::new();
-        MC.init(embassy_sync::mutex::Mutex::new(None))
-    };
+    spawner.spawn(
+        console_task(
+            peripherals.USB_DEVICE,
+            peripherals.UART0,
+            uart_pins,
+        )
+        .unwrap(),
+    );
 
-    let app_context = AppContext {
-        storage: storage_ref,
-        motor_controller: motor_controller_ref,
-    };
+    let init = context::init_app_context(peripherals.FLASH);
+    let app_context = init.ctx;
+    let motion_consumer = init.motion_consumer;
 
-    let pin_config = {
-        let mut sm = app_context.storage.lock().await;
-        sm.get_pin_configuration().unwrap_or_default()
-    };
+    spawner.spawn(context::storage_task(init.storage_manager, init.storage_cmd).unwrap());
 
+    let pin_config = app_context.storage.pin();
     let ble_enabled = pin_config.ble_enabled;
 
     #[cfg(feature = "esp32c6")]
@@ -84,6 +85,7 @@ async fn main(spawner: Spawner) -> ! {
         motor_spawner.spawn(
             motor_task(
                 app_context,
+                motion_consumer,
                 peripherals.UART1,
                 peripherals.UHCI0,
                 peripherals.DMA_CH0,
@@ -107,22 +109,30 @@ async fn main(spawner: Spawner) -> ! {
             sw_interrupt.software_interrupt1,
             stack,
             move || {
-                motor_57aim30::run_motor_blocking(app_context, uart, uhci, dma_ch, pin_config);
+                motor_57aim30::run_motor_blocking(
+                    app_context,
+                    motion_consumer,
+                    uart,
+                    uhci,
+                    dma_ch,
+                    pin_config,
+                );
             },
         );
     }
 
-    spawner.spawn(cli_task(peripherals.USB_DEVICE, app_context).unwrap());
+    spawner.spawn(cli_task(app_context).unwrap());
     spawner.spawn(nvs_saver_task(app_context).unwrap());
 
-    if ble_enabled {
-        spawner.spawn(ble_task(peripherals.BT, app_context).unwrap());
-    }
-
-    let net_config = {
-        let mut sm = app_context.storage.lock().await;
-        sm.get_network_configuration().unwrap_or_default()
+    // Hold BT until after WiFi/HTTP are up so association and TCP listen are
+    // established before BLE radio contention begins.
+    let bt_for_later = if ble_enabled {
+        Some(peripherals.BT)
+    } else {
+        None
     };
+
+    let net_config = app_context.storage.net();
     if net_config.wifi_enabled {
         let stack = wifi::start_wifi(peripherals.WIFI, app_context, &spawner).await;
         http_api::run_server(stack, app_context, &spawner).await;
@@ -130,21 +140,38 @@ async fn main(spawner: Spawner) -> ! {
         log::info!("WiFi is disabled in NetworkConfiguration.");
     }
 
+    if let Some(bt) = bt_for_later {
+        log::info!("Starting BLE after WiFi/HTTP initialization");
+        spawner.spawn(ble_task(bt, app_context).unwrap());
+    }
+
     loop {
         Timer::after(Duration::from_secs(60)).await;
     }
 }
 
-#[allow(dead_code)]
+#[embassy_executor::task]
+async fn console_task(
+    usb: esp_hal::peripherals::USB_DEVICE<'static>,
+    uart0: esp_hal::peripherals::UART0<'static>,
+    pins: console::UartPins,
+) {
+    console::run(usb, uart0, pins).await;
+}
+
+#[cfg(feature = "esp32c6")]
 #[embassy_executor::task]
 async fn motor_task(
     app_context: AppContext,
+    motion_consumer: CommandConsumer,
     uart: esp_hal::peripherals::UART1<'static>,
     uhci: esp_hal::peripherals::UHCI0<'static>,
     dma_ch: esp_hal::peripherals::DMA_CH0<'static>,
     pin_config: PinConfiguration,
 ) {
-    if let Err(e) = motor_57aim30::run_motor(app_context, uart, uhci, dma_ch, pin_config).await {
+    if let Err(e) =
+        motor_57aim30::run_motor(app_context, motion_consumer, uart, uhci, dma_ch, pin_config).await
+    {
         log::error!("Motor task failed: {}", e);
     }
 }
@@ -155,42 +182,48 @@ async fn ble_task(bt: esp_hal::peripherals::BT<'static>, app_context: AppContext
 }
 
 #[embassy_executor::task]
-async fn cli_task(usb: esp_hal::peripherals::USB_DEVICE<'static>, app_context: AppContext) {
-    command::handle_cli(usb, app_context).await;
+async fn cli_task(app_context: AppContext) {
+    command::handle_cli(app_context).await;
 }
 
 #[embassy_executor::task]
 async fn nvs_saver_task(app_context: AppContext) {
-    let mut last_saved_version = None::<u32>;
+    let mut last_saved: Option<crate::motion::MotorControllerConfig> = None;
 
     loop {
-        Timer::after(Duration::from_millis(500)).await;
-        let to_save = {
-            let mc_opt = app_context.motor_controller.lock().await;
-            if let Some(mc) = mc_opt.as_ref() {
-                let ver = mc.get_config_version();
-                match last_saved_version {
-                    None => {
-                        last_saved_version = Some(ver);
-                        None
-                    }
-                    Some(last) if ver != last => {
-                        last_saved_version = Some(ver);
-                        Some(mc.get_config())
-                    }
-                    _ => None,
-                }
-            } else {
-                None
+        // Longer debounce: flash erase during an active BLE/WiFi session
+        // starves the RF controller and drops connections.
+        Timer::after(Duration::from_millis(2000)).await;
+        let config = app_context.load_snapshot().config.clone();
+        let should_save = match &last_saved {
+            None => {
+                last_saved = Some(config.clone());
+                false
             }
+            Some(prev) if persistent_motor_changed(prev, &config) => {
+                last_saved = Some(config.clone());
+                true
+            }
+            Some(_) => false,
         };
-
-        if let Some(config) = to_save {
+        if should_save {
             log::info!("Saving motor config to NVS");
-            let mut sm = app_context.storage.lock().await;
-            if let Err(e) = sm.set_motor_config(&config) {
-                log::error!("Failed to save motor config: {}", e);
-            }
+            app_context.storage.set_motor_config(config);
         }
     }
+}
+
+/// Pause toggles are ephemeral — flashing NVS for them mid-BLE is harmful.
+fn persistent_motor_changed(
+    a: &crate::motion::MotorControllerConfig,
+    b: &crate::motion::MotorControllerConfig,
+) -> bool {
+    a.bpm != b.bpm
+        || a.depth != b.depth
+        || a.depth_top != b.depth_top
+        || a.reversed != b.reversed
+        || a.wave_func != b.wave_func
+        || (a.sharpness - b.sharpness).abs() > f32::EPSILON
+        || a.spline_points != b.spline_points
+        || a.streaming != b.streaming
 }

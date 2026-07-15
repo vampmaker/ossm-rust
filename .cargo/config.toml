@@ -1,4 +1,7 @@
 [target.riscv32imac-unknown-none-elf]
+rustflags = [
+    "-C", "force-frame-pointers",    # required by esp-backtrace frame walks
+]
 runner = "espflash flash --monitor"
 
 [target.xtensa-esp32s3-none-elf]

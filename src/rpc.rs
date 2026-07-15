@@ -8,13 +8,13 @@ use crate::motion::{MotionCommand, MotorControllerConfig};
 use crate::storage::NetworkConfiguration;
 
 #[derive(Serialize)]
-pub struct RpcResponseJson {
-    pub jsonrpc: &'static str,
-    pub id: serde_json::Value,
+struct RpcResponse<'a, T: ?Sized> {
+    jsonrpc: &'static str,
+    id: &'a serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
+    result: Option<&'a T>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<RpcErrorJson>,
+    error: Option<RpcErrorJson>,
 }
 
 #[derive(Serialize)]
@@ -30,91 +30,92 @@ pub enum RpcAction {
     Restart,
 }
 
-fn ok_response(id: serde_json::Value, result: serde_json::Value) -> RpcAction {
-    let resp = RpcResponseJson {
-        jsonrpc: "2.0",
-        id,
-        result: Some(result),
-        error: None,
-    };
-    RpcAction::Respond(serde_json::to_string(&resp).unwrap_or_default())
-}
-
-fn err_response(id: serde_json::Value, code: i32, message: &'static str) -> RpcAction {
-    let resp = RpcResponseJson {
+async fn err_response(id: &serde_json::Value, code: i32, message: &'static str) -> RpcAction {
+    let resp: RpcResponse<'_, ()> = RpcResponse {
         jsonrpc: "2.0",
         id,
         result: None,
         error: Some(RpcErrorJson { code, message }),
     };
-    RpcAction::Respond(serde_json::to_string(&resp).unwrap_or_default())
+    let encoded = crate::buffers::try_with_scratchpad(|buf| {
+        if let Ok(len) = serde_json_core::to_slice(&resp, buf) {
+            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                return Some(String::from(s));
+            }
+        }
+        None
+    })
+    .unwrap_or(None);
+    RpcAction::Respond(encoded.unwrap_or_else(|| {
+        String::from("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}")
+    }))
+}
+
+async fn respond<T: Serialize + ?Sized>(id: &serde_json::Value, result: &T) -> RpcAction {
+    let resp = RpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: Some(result),
+        error: None,
+    };
+    
+    let encoded = crate::buffers::try_with_scratchpad(|buf| {
+        if let Ok(len) = serde_json_core::to_slice(&resp, buf) {
+            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                return Some(String::from(s));
+            }
+        }
+        None
+    });
+
+    match encoded {
+        Some(Some(s)) => RpcAction::Respond(s),
+        Some(None) => err_response(id, -32603, "Serialization failed").await,
+        None => {
+            // Scratchpad was locked, fallback to async wait
+            let encoded_async = crate::buffers::with_scratchpad(|buf| {
+                if let Ok(len) = serde_json_core::to_slice(&resp, buf) {
+                    if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                        return Some(String::from(s));
+                    }
+                }
+                None
+            })
+            .await;
+            
+            if let Some(s) = encoded_async {
+                RpcAction::Respond(s)
+            } else {
+                err_response(id, -32603, "Serialization failed").await
+            }
+        }
+    }
 }
 
 pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAction {
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
 
     match request.cmd.as_str() {
-        "ping" => ok_response(id, serde_json::Value::String(String::from("pong"))),
+        "ping" => respond(&id, "pong").await,
         "status" => {
-            let status = {
-                let mc_opt = app_context.motor_controller.lock().await;
-                mc_opt.as_ref().map(|mc| mc.get_stream_status())
-            };
-            match status {
-                Some(st) => {
-                    let resp = RpcResponseJson {
-                        jsonrpc: "2.0",
-                        id,
-                        result: serde_json::to_value(st).ok(),
-                        error: None,
-                    };
-                    RpcAction::Respond(serde_json::to_string(&resp).unwrap_or_default())
-                }
-                None => err_response(id, -32603, "Motor controller not initialized"),
-            }
+            let status = app_context.load_snapshot().stream;
+            respond(&id, &status).await
         }
         "get-state" | "get_state" => {
-            let state = {
-                let mut mc_opt = app_context.motor_controller.lock().await;
-                mc_opt.as_mut().map(|mc| mc.get_current_state())
-            };
-            match state {
-                Some(state) => {
-                    let resp = RpcResponseJson {
-                        jsonrpc: "2.0",
-                        id,
-                        result: serde_json::to_value(&state).ok(),
-                        error: None,
-                    };
-                    RpcAction::Respond(serde_json::to_string(&resp).unwrap_or_default())
-                }
-                None => err_response(id, -32603, "Motor controller not initialized"),
-            }
+            let state = app_context.load_snapshot();
+            respond(&id, &*state).await
         }
         "set-config" | "set_config" => {
             if let Ok(config) = request.parse_params::<MotorControllerConfig>() {
-                let applied = {
-                    let mut mc_opt = app_context.motor_controller.lock().await;
-                    if let Some(mc) = mc_opt.as_mut() {
-                        mc.set_config(config.clone()).is_ok()
-                    } else {
-                        false
-                    }
-                };
-                if applied {
-                    let resp = RpcResponseJson {
-                        jsonrpc: "2.0",
-                        id,
-                        result: serde_json::to_value(&config).ok(),
-                        error: None,
-                    };
-                    return RpcAction::Respond(
-                        serde_json::to_string(&resp).unwrap_or_default(),
-                    );
+                if app_context
+                    .enqueue_motion(MotionCommand::SetConfig(config.clone()))
+                    .await
+                {
+                    return respond(&id, &config).await;
                 }
-                return err_response(id, -32603, "Failed to apply config");
+                return err_response(&id, -32603, "Failed to apply config").await;
             }
-            err_response(id, -32602, "Invalid params")
+            err_response(&id, -32602, "Invalid params").await
         }
         "subscribe-state" | "subscribe_state" => {
             let params = request.parse_params::<SubscribeParams>().unwrap_or_default();
@@ -125,137 +126,137 @@ pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAc
         "append-waypoints" | "append_waypoints" => {
             if let Ok(input) = request.parse_params::<WaypointsInput>() {
                 let (waypoints, _) = input.into_parts();
-                if let Some(mc) = app_context.motor_controller.lock().await.as_ref() {
-                    let sender = mc.get_command_sender();
-                    if sender
-                        .lock()
-                        .await
-                        .enqueue(MotionCommand::AppendWaypoints(waypoints))
-                        .is_ok()
-                    {
-                        return ok_response(id, serde_json::Value::String(String::from("ok")));
-                    }
+                if app_context
+                    .enqueue_motion(MotionCommand::AppendWaypoints(waypoints))
+                    .await
+                {
+                    return respond(&id, "ok").await;
                 }
             }
-            err_response(id, -32602, "Invalid params")
+            err_response(&id, -32602, "Invalid params").await
         }
         "set-waypoints" | "set_waypoints" => {
             if let Ok(input) = request.parse_params::<WaypointsInput>() {
                 let (waypoints, reset_timestamp) = input.into_parts();
-                if let Some(mc) = app_context.motor_controller.lock().await.as_ref() {
-                    let sender = mc.get_command_sender();
-                    let mut queue = sender.lock().await;
-                    if reset_timestamp {
-                        let _ = queue.enqueue(MotionCommand::ResetTimestamp);
-                    }
-                    if queue
-                        .enqueue(MotionCommand::SetWaypoints {
-                            waypoints,
-                            reset_timestamp,
-                        })
-                        .is_ok()
-                    {
-                        return ok_response(id, serde_json::Value::String(String::from("ok")));
-                    }
+                if reset_timestamp {
+                    let _ = app_context
+                        .enqueue_motion(MotionCommand::ResetTimestamp)
+                        .await;
+                }
+                if app_context
+                    .enqueue_motion(MotionCommand::SetWaypoints {
+                        waypoints,
+                        reset_timestamp,
+                    })
+                    .await
+                {
+                    return respond(&id, "ok").await;
                 }
             }
-            err_response(id, -32602, "Invalid params")
+            err_response(&id, -32602, "Invalid params").await
         }
         "reset-timestamp" | "reset_timestamp" => {
-            if let Some(mc) = app_context.motor_controller.lock().await.as_ref() {
-                let _ = mc
-                    .get_command_sender()
-                    .lock()
-                    .await
-                    .enqueue(MotionCommand::ResetTimestamp);
-            }
-            ok_response(id, serde_json::Value::String(String::from("ok")))
+            let _ = app_context
+                .enqueue_motion(MotionCommand::ResetTimestamp)
+                .await;
+            respond(&id, "ok").await
         }
         "get-network-config" | "get_network_config" => {
-            let conf = app_context
-                .storage
-                .lock()
-                .await
-                .get_network_configuration()
-                .unwrap_or_default();
-            let resp = RpcResponseJson {
-                jsonrpc: "2.0",
-                id,
-                result: serde_json::to_value(&conf).ok(),
-                error: None,
-            };
-            RpcAction::Respond(serde_json::to_string(&resp).unwrap_or_default())
+            let conf = app_context.storage.net();
+            respond(&id, &conf).await
         }
         "set-network-config" | "set_network_config" => {
             if let Ok(conf) = request.parse_params::<NetworkConfiguration>() {
-                let _ = app_context
-                    .storage
-                    .lock()
-                    .await
-                    .set_network_configuration(&conf);
-                let resp = RpcResponseJson {
-                    jsonrpc: "2.0",
-                    id,
-                    result: serde_json::to_value(&conf).ok(),
-                    error: None,
-                };
-                return RpcAction::Respond(serde_json::to_string(&resp).unwrap_or_default());
+                app_context.storage.set_net(conf.clone());
+                return respond(&id, &conf).await;
             }
-            err_response(id, -32602, "Invalid params")
+            err_response(&id, -32602, "Invalid params").await
         }
         "restart" => RpcAction::Restart,
-        _ => err_response(id, -32601, "Method not found"),
+        _ => err_response(&id, -32601, "Method not found").await,
     }
 }
 
-pub async fn build_state_notification(
+#[derive(Serialize)]
+struct StateNotification<'a> {
+    jsonrpc: &'static str,
+    method: &'static str,
+    cmd: &'static str,
+    params: &'a crate::motion::StateResponse,
+    state: &'a crate::motion::StateResponse,
+}
+
+pub fn build_state_notification_into(
     app_context: AppContext,
-) -> Option<String> {
-    let state = {
-        let mut mc_opt = app_context.motor_controller.lock().await;
-        mc_opt.as_mut().map(|mc| mc.get_current_state())
+    out: &mut [u8],
+) -> Option<usize> {
+    let state = app_context.load_snapshot();
+
+    let notif = StateNotification {
+        jsonrpc: "2.0",
+        method: "state",
+        cmd: "state",
+        params: state.as_ref(),
+        state: state.as_ref(),
     };
-    state.and_then(|s| {
-        let notif = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "state",
-            "cmd": "state",
-            "params": s,
-            "state": s,
-        });
-        serde_json::to_string(&notif).ok()
-    })
+
+    serde_json_core::to_slice(&notif, out).ok()
+}
+
+#[derive(Serialize)]
+struct SubscribeAckPayload {
+    subscribed: bool,
+    interval_ms: u64,
 }
 
 pub fn subscribe_ack(id: serde_json::Value, interval_ms: u64) -> String {
-    let resp = RpcResponseJson {
+    let payload = SubscribeAckPayload {
+        subscribed: true,
+        interval_ms,
+    };
+    let resp = RpcResponse {
         jsonrpc: "2.0",
-        id,
-        result: Some(serde_json::json!({
-            "subscribed": true,
-            "interval_ms": interval_ms,
-        })),
+        id: &id,
+        result: Some(&payload),
         error: None,
     };
-    serde_json::to_string(&resp).unwrap_or_default()
+    crate::buffers::try_with_scratchpad(|buf| {
+        let len = serde_json_core::to_slice(&resp, buf).unwrap_or(0);
+        core::str::from_utf8(&buf[..len])
+            .map(String::from)
+            .unwrap_or_default()
+    })
+    .unwrap_or_else(|| alloc::format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"subscribed\":true,\"interval_ms\":{}}}}}", id, interval_ms))
 }
 
 pub fn unsubscribe_ack(id: serde_json::Value) -> String {
-    let resp = RpcResponseJson {
+    let resp = RpcResponse {
         jsonrpc: "2.0",
-        id,
-        result: Some(serde_json::Value::String(String::from("unsubscribed"))),
+        id: &id,
+        result: Some("unsubscribed"),
         error: None,
     };
-    serde_json::to_string(&resp).unwrap_or_default()
+    crate::buffers::try_with_scratchpad(|buf| {
+        let len = serde_json_core::to_slice(&resp, buf).unwrap_or(0);
+        core::str::from_utf8(&buf[..len])
+            .map(String::from)
+            .unwrap_or_default()
+    })
+    .unwrap_or_else(|| alloc::format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"unsubscribed\"}}", id))
 }
 
 pub fn restart_ack(id: serde_json::Value) -> String {
-    let resp = RpcResponseJson {
+    let resp = RpcResponse {
         jsonrpc: "2.0",
-        id,
-        result: Some(serde_json::Value::String(String::from("restarting"))),
+        id: &id,
+        result: Some("restarting"),
         error: None,
     };
-    serde_json::to_string(&resp).unwrap_or_default()
+    crate::buffers::try_with_scratchpad(|buf| {
+        let len = serde_json_core::to_slice(&resp, buf).unwrap_or(0);
+        core::str::from_utf8(&buf[..len])
+            .map(String::from)
+            .unwrap_or_default()
+    })
+    .unwrap_or_else(|| alloc::format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"restarting\"}}", id))
 }

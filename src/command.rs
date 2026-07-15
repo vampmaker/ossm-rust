@@ -5,13 +5,10 @@ use embedded_cli::cli::CliBuilder;
 use embedded_cli::Command;
 use embedded_io::ErrorType;
 use embedded_io::Write as EmbeddedWrite;
-use embedded_io_async::Read as AsyncRead;
 use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex as BlockingMutex};
 use embassy_sync::channel::Channel;
-use embassy_time::Timer;
-use esp_hal::usb_serial_jtag::UsbSerialJtag;
-use esp_println::println;
 
+use crate::console;
 use crate::context::AppContext;
 use crate::http_api::WaypointsInput;
 use crate::motion::{MotionCommand, MotorControllerConfig};
@@ -137,6 +134,15 @@ fn queue_command(cmd: CliCommand) {
     let _ = CLI_CHANNEL.try_send(cmd);
 }
 
+fn flush_cli_output() {
+    let pending = unsafe { CLI_OUTPUT.lock_mut(core::mem::take) };
+    if pending.is_empty() {
+        return;
+    }
+    // Pass through as-is (echo chars + CLI newlines); do not wrap each flush in `\r\n`.
+    console::write_bytes(&pending);
+}
+
 fn base_to_cli(command: BaseCommand<'_>) -> Option<CliCommand> {
     Some(match command {
         BaseCommand::SetWifiSsid { ssid } => CliCommand::SetWifiSsid(String::from(ssid)),
@@ -211,18 +217,8 @@ fn base_to_cli(command: BaseCommand<'_>) -> Option<CliCommand> {
     })
 }
 
-async fn flush_cli_output(usb: &mut UsbSerialJtag<'_, esp_hal::Async>) {
-    let pending = unsafe {
-        CLI_OUTPUT.lock_mut(core::mem::take)
-    };
-    if !pending.is_empty() {
-        let _ = embedded_io::Write::write(usb, &pending);
-    }
-}
-
-pub async fn handle_cli(usb_peripheral: esp_hal::peripherals::USB_DEVICE<'static>, app_context: AppContext) {
-    let mut usb = UsbSerialJtag::new(usb_peripheral).into_async();
-
+/// CLI consumer: bytes from `console` IN channel, replies via OUT / `log::*`.
+pub async fn handle_cli(app_context: AppContext) {
     let mut cli = CliBuilder::default()
         .writer(CliOutputWriter)
         .command_buffer([0u8; 2048])
@@ -239,26 +235,18 @@ pub async fn handle_cli(usb_peripheral: esp_hal::peripherals::USB_DEVICE<'static
         Ok(())
     });
 
-    let mut buf = [0u8; 1];
     loop {
         while let Ok(cmd) = CLI_CHANNEL.try_receive() {
             execute_command(cmd, app_context).await;
-            flush_cli_output(&mut usb).await;
+            flush_cli_output();
         }
 
-        match AsyncRead::read(&mut usb, &mut buf).await {
-            Ok(1) => {
-                let byte = if buf[0] == 0x7F { 0x08 } else { buf[0] };
-                let _ = cli.process_byte::<BaseCommand<'_>, _>(byte, &mut processor);
-                flush_cli_output(&mut usb).await;
-                while let Ok(cmd) = CLI_CHANNEL.try_receive() {
-                    execute_command(cmd, app_context).await;
-                    flush_cli_output(&mut usb).await;
-                }
-            }
-            Ok(_) | Err(_) => {
-                Timer::after_millis(10).await;
-            }
+        let byte = console::read_byte().await;
+        let _ = cli.process_byte::<BaseCommand<'_>, _>(byte, &mut processor);
+        flush_cli_output();
+        while let Ok(cmd) = CLI_CHANNEL.try_receive() {
+            execute_command(cmd, app_context).await;
+            flush_cli_output();
         }
     }
 }
@@ -266,56 +254,52 @@ pub async fn handle_cli(usb_peripheral: esp_hal::peripherals::USB_DEVICE<'static
 async fn execute_command(command: CliCommand, app_context: AppContext) {
     match command {
         CliCommand::SetWifiSsid(ssid) => {
-            let _ = app_context.storage.lock().await.set_ssid(&ssid);
+            app_context.storage.set_ssid(ssid.as_str());
             log::info!("SSID saved: {}, restart to apply", ssid);
         }
         CliCommand::SetWifiPassword(password) => {
-            let _ = app_context.storage.lock().await.set_password(&password);
+            app_context.storage.set_password(password.as_str());
             log::info!("Password saved, restart to apply");
         }
         CliCommand::SetPinModbusTx(pin) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            let mut config = app_context.storage.pin();
             config.modbus_tx = pin;
-            let _ = sm.set_pin_configuration(&config);
+            app_context.storage.set_pin(config);
             log::info!("Modbus TX pin set to {}, restart to apply", pin);
         }
         CliCommand::SetPinModbusRx(pin) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            let mut config = app_context.storage.pin();
             config.modbus_rx = pin;
-            let _ = sm.set_pin_configuration(&config);
+            app_context.storage.set_pin(config);
             log::info!("Modbus RX pin set to {}, restart to apply", pin);
         }
         CliCommand::SetPinModbusDeRe(pin) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            let mut config = app_context.storage.pin();
             config.modbus_de_re = pin;
-            let _ = sm.set_pin_configuration(&config);
+            app_context.storage.set_pin(config);
             log::info!("Modbus DE/RE pin set to {}, restart to apply", pin);
         }
         CliCommand::GetPinConfiguration => {
-            if let Ok(config) = app_context.storage.lock().await.get_pin_configuration() {
-                let _ = crate::buffers::serialize_to_scratchpad(&config, |json| println!("{}", json));
-            }
+            let config = app_context.storage.pin();
+            let _ = crate::buffers::serialize_to_scratchpad(&config, |json| {
+                console::write_line(json);
+            })
+            .await;
         }
         CliCommand::SetMotorConfig(json) => {
             if let Ok(config) = serde_json::from_str::<MotorControllerConfig>(&json) {
-                let mut mc_opt = app_context.motor_controller.lock().await;
-                if let Some(mc) = mc_opt.as_mut() {
-                    let _ = mc.set_config(config);
-                }
+                let _ = app_context
+                    .enqueue_motion(MotionCommand::SetConfig(config))
+                    .await;
                 log::info!("Motor config updated");
             }
         }
         CliCommand::GetMotorConfig => {
-            let config = {
-                let mc_opt = app_context.motor_controller.lock().await;
-                mc_opt.as_ref().map(|mc| mc.get_config())
-            };
-            if let Some(config) = config {
-                let _ = crate::buffers::serialize_to_scratchpad(&config, |json| println!("{}", json));
-            }
+            let config = app_context.load_snapshot().config.clone();
+            let _ = crate::buffers::serialize_to_scratchpad(&config, |json| {
+                console::write_line(json);
+            })
+            .await;
         }
         CliCommand::Pause => update_config(app_context, |c| c.paused = true).await,
         CliCommand::Start => update_config(app_context, |c| c.paused = false).await,
@@ -337,106 +321,71 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
             update_config(app_context, |c| c.spline_points = points_vec).await;
         }
         CliCommand::SetModbusTimeoutMs(value) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            let mut config = app_context.storage.pin();
             config.modbus_timeout_ms = value;
-            let _ = sm.set_pin_configuration(&config);
+            app_context.storage.set_pin(config);
         }
         CliCommand::GetModbusTimeoutMs => {
-            let config = app_context
-                .storage
-                .lock()
-                .await
-                .get_pin_configuration()
-                .unwrap_or_default();
-            println!("modbus_timeout_ms: {}", config.modbus_timeout_ms);
+            let config = app_context.storage.pin();
+            log::info!("modbus_timeout_ms: {}", config.modbus_timeout_ms);
         }
         CliCommand::SetModbusRxTimeoutUs(value) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            let mut config = app_context.storage.pin();
             config.modbus_rx_timeout_us = value;
-            let _ = sm.set_pin_configuration(&config);
+            app_context.storage.set_pin(config);
         }
         CliCommand::GetModbusRxTimeoutUs => {
-            let config = app_context
-                .storage
-                .lock()
-                .await
-                .get_pin_configuration()
-                .unwrap_or_default();
-            println!("modbus_rx_timeout_us: {}", config.modbus_rx_timeout_us);
+            let config = app_context.storage.pin();
+            log::info!("modbus_rx_timeout_us: {}", config.modbus_rx_timeout_us);
         }
         CliCommand::SetModbusScanDelayUs(value) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            let mut config = app_context.storage.pin();
             config.modbus_scan_delay_us = value;
-            let _ = sm.set_pin_configuration(&config);
+            app_context.storage.set_pin(config);
         }
         CliCommand::GetModbusScanDelayUs => {
-            let config = app_context
-                .storage
-                .lock()
-                .await
-                .get_pin_configuration()
-                .unwrap_or_default();
-            println!("modbus_scan_delay_us: {}", config.modbus_scan_delay_us);
+            let config = app_context.storage.pin();
+            log::info!("modbus_scan_delay_us: {}", config.modbus_scan_delay_us);
         }
         CliCommand::SetModbusInterFrameDelayUs(value) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            let mut config = app_context.storage.pin();
             config.modbus_inter_frame_delay_us = value;
-            let _ = sm.set_pin_configuration(&config);
+            app_context.storage.set_pin(config);
         }
         CliCommand::GetModbusInterFrameDelayUs => {
-            let config = app_context
-                .storage
-                .lock()
-                .await
-                .get_pin_configuration()
-                .unwrap_or_default();
-            println!("modbus_inter_frame_delay_us: {}", config.modbus_inter_frame_delay_us);
+            let config = app_context.storage.pin();
+            log::info!(
+                "modbus_inter_frame_delay_us: {}",
+                config.modbus_inter_frame_delay_us
+            );
         }
         CliCommand::SetBleEnabled(value) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_pin_configuration().unwrap_or_default();
+            let mut config = app_context.storage.pin();
             config.ble_enabled = value;
-            let _ = sm.set_pin_configuration(&config);
+            app_context.storage.set_pin(config);
         }
         CliCommand::GetBleEnabled => {
-            let config = app_context
-                .storage
-                .lock()
-                .await
-                .get_pin_configuration()
-                .unwrap_or_default();
-            println!("ble_enabled: {}", config.ble_enabled);
+            let config = app_context.storage.pin();
+            log::info!("ble_enabled: {}", config.ble_enabled);
         }
         CliCommand::SetWifiEnabled(value) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_network_configuration().unwrap_or_default();
+            let mut config = app_context.storage.net();
             config.wifi_enabled = value;
-            let _ = sm.set_network_configuration(&config);
+            app_context.storage.set_net(config);
         }
         CliCommand::GetWifiEnabled => {
-            let config = app_context
-                .storage
-                .lock()
-                .await
-                .get_network_configuration()
-                .unwrap_or_default();
-            println!("wifi_enabled: {}", config.wifi_enabled);
+            let config = app_context.storage.net();
+            log::info!("wifi_enabled: {}", config.wifi_enabled);
         }
         CliCommand::SetHostname(hostname) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_network_configuration().unwrap_or_default();
+            let mut config = app_context.storage.net();
             config.hostname = hostname;
-            let _ = sm.set_network_configuration(&config);
+            app_context.storage.set_net(config);
         }
         CliCommand::SetDhcpEnabled(value) => {
-            let mut sm = app_context.storage.lock().await;
-            let mut config = sm.get_network_configuration().unwrap_or_default();
+            let mut config = app_context.storage.net();
             config.dhcp_enabled = value;
-            let _ = sm.set_network_configuration(&config);
+            app_context.storage.set_net(config);
         }
         CliCommand::SetStaticIp(ip) => set_net_field(app_context, |c| c.static_ip = ip).await,
         CliCommand::SetStaticMask(mask) => set_net_field(app_context, |c| c.static_mask = mask).await,
@@ -445,28 +394,27 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
         }
         CliCommand::SetStaticDns(dns) => set_net_field(app_context, |c| c.static_dns = dns).await,
         CliCommand::GetNetworkConfig => {
-            if let Ok(config) = app_context.storage.lock().await.get_network_configuration() {
-                let _ = crate::buffers::serialize_to_scratchpad(&config, |json| println!("{}", json));
-            }
+            let config = app_context.storage.net();
+            let _ = crate::buffers::serialize_to_scratchpad(&config, |json| {
+                console::write_line(json);
+            })
+            .await;
         }
         CliCommand::GetState => {
-            let state = {
-                let mut mc_opt = app_context.motor_controller.lock().await;
-                mc_opt.as_mut().map(|mc| mc.get_current_state())
-            };
-            if let Some(state) = state {
-                let _ = crate::buffers::serialize_to_scratchpad(&state, |json| println!("{}", json));
-            }
+            let state = app_context.load_snapshot();
+            let _ = crate::buffers::serialize_to_scratchpad(state.as_ref(), |json| {
+                console::write_line(json);
+            })
+            .await;
         }
         CliCommand::GetStatus => {
-            let data = {
-                let mut mc_opt = app_context.motor_controller.lock().await;
-                mc_opt.as_mut().map(|mc| (mc.get_current_state(), mc.get_config()))
-            };
-            if let Some((state, config)) = data {
-                let st = serde_json::json!({ "state": state, "config": config });
-                let _ = crate::buffers::serialize_to_scratchpad(&st, |json| println!("{}", json));
-            }
+            let state = app_context.load_snapshot();
+            let config = state.config.clone();
+            let st = serde_json::json!({ "state": state.as_ref(), "config": config });
+            let _ = crate::buffers::serialize_to_scratchpad(&st, |json| {
+                console::write_line(json);
+            })
+            .await;
         }
         CliCommand::ResetTimestamp => enqueue(app_context, MotionCommand::ResetTimestamp).await,
         CliCommand::SetWaypoints(json) => {
@@ -492,22 +440,20 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
 }
 
 async fn update_config(app_context: AppContext, f: impl FnOnce(&mut MotorControllerConfig)) {
-    let mut mc_opt = app_context.motor_controller.lock().await;
-    if let Some(mc) = mc_opt.as_mut() {
-        let _ = mc.update_config(f);
-    }
+    let mut config = app_context.load_snapshot().config.clone();
+    f(&mut config);
+    let _ = app_context
+        .enqueue_motion(MotionCommand::SetConfig(config))
+        .await;
 }
 
 async fn set_net_field(app_context: AppContext, f: impl FnOnce(&mut crate::storage::NetworkConfiguration)) {
-    let mut sm = app_context.storage.lock().await;
-    let mut config = sm.get_network_configuration().unwrap_or_default();
+    let mut config = app_context.storage.net();
     f(&mut config);
-    let _ = sm.set_network_configuration(&config);
+    app_context.storage.set_net(config);
 }
 
 async fn enqueue(app_context: AppContext, cmd: MotionCommand) {
-    if let Some(mc) = app_context.motor_controller.lock().await.as_ref() {
-        let _ = mc.get_command_sender().lock().await.enqueue(cmd);
-    }
-    println!("ok");
+    let _ = app_context.enqueue_motion(cmd).await;
+    log::info!("ok");
 }

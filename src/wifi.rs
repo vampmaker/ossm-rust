@@ -9,7 +9,7 @@ use static_cell::StaticCell;
 use crate::context::AppContext;
 use crate::storage::NetworkConfiguration;
 
-const STACK_RESOURCES_COUNT: usize = 10;
+const STACK_RESOURCES_COUNT: usize = 16;
 
 static STACK: StaticCell<Stack<'static>> = StaticCell::new();
 static STACK_RESOURCES: StaticCell<StackResources<STACK_RESOURCES_COUNT>> = StaticCell::new();
@@ -20,14 +20,12 @@ pub async fn start_wifi(
     spawner: &Spawner,
 ) -> &'static Stack<'static> {
     let (net_conf, ssid, password, hostname) = {
-        let mut sm = app_context.storage.lock().await;
+        let net = app_context.storage.net();
         (
-            sm.get_network_configuration().unwrap_or_default(),
-            sm.get_ssid().unwrap_or_default(),
-            sm.get_password().unwrap_or_default(),
-            sm.get_network_configuration()
-                .map(|c| c.hostname)
-                .unwrap_or_else(|_| String::from("ossm")),
+            net.clone(),
+            net.ssid.clone(),
+            net.password.clone(),
+            net.hostname.clone(),
         )
     };
 
@@ -60,10 +58,10 @@ fn build_net_config(net_conf: &NetworkConfiguration) -> NetConfig {
     if net_conf.dhcp_enabled {
         NetConfig::dhcpv4(Default::default())
     } else {
-        let addr = parse_ipv4(&net_conf.static_ip, [192, 168, 1, 100]);
-        let gateway = parse_ipv4(&net_conf.static_gateway, [192, 168, 1, 1]);
-        let dns = parse_ipv4(&net_conf.static_dns, [8, 8, 8, 8]);
-        let prefix_len = parse_prefix_len(&net_conf.static_mask);
+        let addr = parse_ipv4(net_conf.static_ip.as_str(), [192, 168, 1, 100]);
+        let gateway = parse_ipv4(net_conf.static_gateway.as_str(), [192, 168, 1, 1]);
+        let dns = parse_ipv4(net_conf.static_dns.as_str(), [8, 8, 8, 8]);
+        let prefix_len = parse_prefix_len(net_conf.static_mask.as_str());
 
         NetConfig::ipv4_static({
             let mut static_config = StaticConfigV4 {

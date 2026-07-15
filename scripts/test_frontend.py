@@ -16,6 +16,7 @@
 # ///
 
 import asyncio
+import argparse
 import json
 import os
 import sys
@@ -40,6 +41,10 @@ REST_ENDPOINTS = (
     "/pin-config",
     "/network-config",
 )
+WEB_BLUETOOTH_STABILITY_RUNS = 10
+WEB_BLUETOOTH_CONNECT_TIMEOUT_MS = 35_000
+WEB_BLUETOOTH_PROMPT_TIMEOUT_S = 45.0
+WEB_BLUETOOTH_COOLDOWN_S = 2.5
 
 
 def load_device_url() -> str:
@@ -228,7 +233,22 @@ async def test_frontend(base_url: str):
         assert saved_val == "true", f"Expected localStorage key to be 'true', got '{saved_val}'"
         print("✓ Motor Position Diagram toggle and persistence verified")
 
-        print(f"\n[Step 4] Opening Unified Device Settings Panel and verifying independent toggles & conditional fields...")
+        print(f"\n[Step 4] Testing Waveform Spline Mode selection...")
+        spline_btn = page.locator('button:has-text("Spline")')
+        await spline_btn.wait_for(state="visible", timeout=5000)
+        
+        print(" -> Clicking Spline mode button...")
+        await spline_btn.click()
+        await asyncio.sleep(1.0)
+        
+        # Verify the firmware didn't crash (WebSocket should still be receiving messages)
+        pre_spline_count = len(ws_messages)
+        await asyncio.sleep(1.0)
+        post_spline_count = len(ws_messages)
+        assert post_spline_count > pre_spline_count, "Firmware stopped sending WebSocket messages after selecting Spline mode! Did it panic?"
+        print("✓ Firmware remained stable after switching to Spline mode")
+
+        print(f"\n[Step 5] Opening Unified Device Settings Panel and verifying independent toggles & conditional fields...")
         settings_toggle = page.locator('button[aria-label="Toggle settings"]')
         await settings_toggle.wait_for(state="visible", timeout=5000)
         await settings_toggle.click()
@@ -270,58 +290,6 @@ async def test_frontend(base_url: str):
         await page.wait_for_selector("text=Motor Position Diagram", timeout=5000)
         print("✓ Motor Position Diagram component verified visible")
 
-        print(f"\n[Step 7] Verifying Web Bluetooth real hardware end-to-end connection via CDP DeviceAccess...")
-        import http.server
-        import socketserver
-        import threading
-
-        class DistHandler(http.server.SimpleHTTPRequestHandler):
-            def __init__(self, *args, **kwargs):
-                dist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../frontend/dist"))
-                super().__init__(*args, directory=dist_dir, **kwargs)
-            def log_message(self, format, *args): pass
-
-        ble_port = 18090
-        server = socketserver.TCPServer(("127.0.0.1", ble_port), DistHandler)
-        t = threading.Thread(target=server.serve_forever, daemon=True)
-        t.start()
-        print(f" -> Serving frontend/dist on http://localhost:{ble_port}/ for secure Web Bluetooth E2E testing")
-
-        ble_page = await context.new_page()
-        cdp = await context.new_cdp_session(ble_page)
-        await cdp.send("DeviceAccess.enable")
-
-        async def on_prompt(event):
-            devices = event.get("devices", [])
-            for d in devices:
-                if "OSSM" in d.get("name", ""):
-                    print(f"👀 [CDP] Found OSSM hardware BLE device: {d['name']} ({d['id']})")
-                    await cdp.send("DeviceAccess.selectPrompt", {"id": event["id"], "deviceId": d["id"]})
-                    print(f"✅ [CDP] Selected hardware BLE device: {d['name']}")
-                    return
-        cdp.on("DeviceAccess.deviceRequestPrompted", on_prompt)
-
-        await ble_page.goto(f"http://localhost:{ble_port}/", wait_until="networkidle")
-        ble_mode_btn = ble_page.locator("button:has-text('BLE')").first
-        await ble_mode_btn.click()
-        await asyncio.sleep(0.5)
-        connect_btn = ble_page.locator("button:has-text('Connect BLE')")
-        await connect_btn.wait_for(state="visible", timeout=5000)
-
-        print(" -> Clicking 'Connect BLE' and initiating hardware scan...")
-        await connect_btn.click()
-        await ble_page.wait_for_selector("text=Connected", timeout=15000)
-        print("✓ Web Bluetooth connected end-to-end against real hardware successfully!")
-
-        ble_settings_toggle = ble_page.locator('button[aria-label="Toggle settings"]')
-        await ble_settings_toggle.click()
-        await ble_page.wait_for_selector("text=Unified Device Settings", timeout=5000)
-        ble_chk_ble = ble_page.locator("#ble-enabled")
-        assert await ble_chk_ble.is_disabled(), "Expected #ble-enabled to be un-uncheck-able when connected via BLE mode"
-        print("✓ Verified #ble-enabled checkbox is un-uncheck-able when connected through BLE")
-
-        server.shutdown()
-        server.server_close()
         await browser.close()
 
 
@@ -405,7 +373,8 @@ async def _run_ble_tests():
         print(f"\n✓ All BLE integration tests PASSED")
     finally:
         await backend.disconnect()
-        await asyncio.sleep(1.5)
+        # Extra cool-down so WiFi HTTP remains stable for subsequent Playwright tests.
+        await asyncio.sleep(2.5)
 
 
 async def test_ble_connection():
@@ -461,8 +430,301 @@ async def test_flasher():
     print("✓ All Web Flasher E2E tests PASSED")
 
 
-async def test_web_bluetooth_frontend():
-    """Verify built frontend artifact in frontend/dist with Web Bluetooth using Playwright + CDP DeviceAccess."""
+async def _soft_reset_device() -> None:
+    """Reset ESP via USB so BLE advertising restarts (clears stuck CONNECTIONS_MAX=1)."""
+    import subprocess
+
+    port = os.environ.get("DEVICE_PORT", "/dev/ttyACM0").strip().strip('"') or "/dev/ttyACM0"
+    print(f" -> Soft-resetting device on {port} so OSSM re-advertises...")
+    
+    # Send CLI reset command using python script subprocess
+    try:
+        ossm_py = os.path.join(os.path.dirname(__file__), "ossm.py")
+        subprocess.run(
+            [sys.executable, ossm_py, "restart", "--mode", "serial"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        print("    (CLI restart successful)")
+    except Exception as e:
+        print(f"    (CLI reset failed: {e}, falling back to espflash board-info)")
+        subprocess.run(
+            ["espflash", "board-info", "--port", port],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+    # Boot + BLE stack start can take several seconds (WiFi + trouble-host).
+    await asyncio.sleep(8.0)
+
+
+async def _ossm_is_advertising(timeout_s: float = 6.0) -> bool:
+    from bleak import BleakScanner
+
+    try:
+        devices = await BleakScanner.discover(timeout=timeout_s, return_adv=True)
+        for dev, adv in devices.values():
+            name = (dev.name or adv.local_name or "").strip()
+            if "OSSM" in name:
+                return True
+    except Exception as e:
+        print(f" -> [BLE Scanner Note] Error during scan: {e}; retrying...")
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _ensure_ossm_advertising(run_idx: int, total_runs: int) -> None:
+    """
+    Confirm OSSM is advertising via Bleak BEFORE Chromium owns the adapter.
+
+    Do not call this while Playwright Chromium is open — BlueZ typically allows
+    only one LE scanner and Bleak/Chrome will fight each other.
+    """
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        remaining = max(2.0, min(6.0, deadline - time.monotonic()))
+        if await _ossm_is_advertising(timeout_s=remaining):
+            return
+        await asyncio.sleep(0.5)
+
+    print(
+        f" -> [Run {run_idx}/{total_runs}] OSSM not advertising; "
+        "resetting peripheral before Web Bluetooth chooser"
+    )
+    await _soft_reset_device()
+
+    deadline = time.monotonic() + 45.0
+    while time.monotonic() < deadline:
+        remaining = max(2.0, min(6.0, deadline - time.monotonic()))
+        if await _ossm_is_advertising(timeout_s=remaining):
+            return
+        await asyncio.sleep(0.5)
+
+    raise AssertionError(
+        f"[Run {run_idx}/{total_runs}] OSSM still not advertising after soft-reset"
+    )
+
+
+async def _run_single_web_bluetooth_attempt(
+    browser,
+    frontend_url: str,
+    run_idx: int,
+    total_runs: int,
+) -> None:
+    context = await browser.new_context(viewport={"width": 1280, "height": 800})
+    page = await context.new_page()
+    cdp = await context.new_cdp_session(page)
+    await cdp.send("DeviceAccess.enable")
+
+    selected_device_name: str | None = None
+    selection_error: Exception | None = None
+    selection_done = asyncio.Event()
+    devices_seen: list[str] = []
+    prompt_event_count = 0
+    last_prompt_id: str | None = None
+
+    async def wait_for_exact_connection_status(expected: str, timeout_ms: int) -> None:
+        await page.wait_for_function(
+            """({ expected }) => {
+                const labels = Array.from(
+                    document.querySelectorAll('header span.text-sm.font-medium')
+                );
+                return labels.some(
+                    (el) => (el.textContent || '').trim() === expected
+                );
+            }""",
+            arg={"expected": expected},
+            timeout=timeout_ms,
+        )
+
+    async def on_device_prompt(event):
+        nonlocal selected_device_name, selection_error, prompt_event_count, last_prompt_id
+        try:
+            prompt_event_count += 1
+            last_prompt_id = event.get("id")
+            devices = event.get("devices", [])
+            for dev in devices:
+                dev_name = dev.get("name", "<unnamed>")
+                if dev_name not in devices_seen:
+                    devices_seen.append(dev_name)
+
+            # Chromium re-fires this event as the chooser list updates. Selecting
+            # more than once aborts the outstanding requestDevice()/GATT handshake.
+            if selected_device_name is not None or selection_done.is_set():
+                return
+
+            ossm_device = next(
+                (dev for dev in devices if "OSSM" in dev.get("name", "")),
+                None,
+            )
+            if ossm_device is None:
+                return
+
+            selected_device_name = ossm_device.get("name", "<unnamed>")
+            device_id = ossm_device.get("id", "")
+            if not device_id:
+                raise AssertionError(
+                    f"[Run {run_idx}/{total_runs}] OSSM BLE device had empty id in prompt"
+                )
+
+            await cdp.send(
+                "DeviceAccess.selectPrompt",
+                {"id": event["id"], "deviceId": device_id},
+            )
+        except Exception as exc:
+            selection_error = exc
+            selected_device_name = None
+        finally:
+            if selected_device_name is not None or selection_error is not None:
+                selection_done.set()
+
+    cdp.on(
+        "DeviceAccess.deviceRequestPrompted",
+        lambda event: asyncio.create_task(on_device_prompt(event)),
+    )
+
+    try:
+        await page.goto(frontend_url, wait_until="networkidle")
+        title = await page.title()
+        assert "OSSM" in title, f"[Run {run_idx}/{total_runs}] Unexpected page title: {title}"
+
+        ble_mode_btn = page.locator("button:has-text('BLE')")
+        await ble_mode_btn.first.wait_for(state="visible", timeout=5000)
+        await ble_mode_btn.first.click()
+        await asyncio.sleep(0.4)
+
+        connect_btn = page.locator("button:has-text('Connect BLE')")
+        await connect_btn.first.wait_for(state="visible", timeout=5000)
+        await connect_btn.first.click()
+
+        try:
+            await asyncio.wait_for(
+                selection_done.wait(),
+                timeout=WEB_BLUETOOTH_PROMPT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as exc:
+            if last_prompt_id is not None:
+                try:
+                    await cdp.send("DeviceAccess.cancelPrompt", {"id": last_prompt_id})
+                except Exception:
+                    pass
+            raise AssertionError(
+                f"[Run {run_idx}/{total_runs}] Timed out waiting for OSSM in BLE prompt "
+                f"(prompt events: {prompt_event_count}, devices seen: {devices_seen})"
+            ) from exc
+        if selection_error is not None:
+            raise selection_error
+        assert selected_device_name is not None, (
+            f"[Run {run_idx}/{total_runs}] BLE prompt was not handled "
+            f"(prompt events: {prompt_event_count}, devices seen: {devices_seen})"
+        )
+
+        try:
+            await wait_for_exact_connection_status(
+                expected="Connected",
+                timeout_ms=WEB_BLUETOOTH_CONNECT_TIMEOUT_MS,
+            )
+        except Exception as exc:
+            status = await page.evaluate(
+                """() => ({
+                  labels: Array.from(
+                    document.querySelectorAll('header span.text-sm.font-medium')
+                  ).map((el) => (el.textContent || '').trim()),
+                  errBanner: document.querySelector('div.mb-4.bg-red-500')
+                    ?.textContent?.trim() || null,
+                })"""
+            )
+            raise AssertionError(
+                f"[Run {run_idx}/{total_runs}] Timed out waiting for Connected after "
+                f"selecting {selected_device_name}: {status}"
+            ) from exc
+        await connect_btn.first.wait_for(state="hidden", timeout=5000)
+
+        reconnect_btn = page.locator("button:has-text('Connect BLE')")
+        if await reconnect_btn.count() > 0:
+            assert not await reconnect_btn.first.is_visible(), (
+                f"[Run {run_idx}/{total_runs}] Connect BLE button stayed visible after connection"
+            )
+
+        start_btn = page.locator("button:has-text('Start')")
+        stop_btn = page.locator("button:has-text('Stop')")
+        if await start_btn.count() > 0 and await start_btn.first.is_visible():
+            assert await start_btn.first.is_enabled(), (
+                f"[Run {run_idx}/{total_runs}] Start button disabled after BLE connect"
+            )
+            await start_btn.first.click()
+            await stop_btn.first.wait_for(state="visible", timeout=5000)
+            assert await stop_btn.first.is_enabled(), (
+                f"[Run {run_idx}/{total_runs}] Stop button disabled after Start"
+            )
+            await stop_btn.first.click()
+            await start_btn.first.wait_for(state="visible", timeout=5000)
+        elif await stop_btn.count() > 0 and await stop_btn.first.is_visible():
+            assert await stop_btn.first.is_enabled(), (
+                f"[Run {run_idx}/{total_runs}] Stop button disabled after BLE connect"
+            )
+            await stop_btn.first.click()
+            await start_btn.first.wait_for(state="visible", timeout=5000)
+            assert await start_btn.first.is_enabled(), (
+                f"[Run {run_idx}/{total_runs}] Start button disabled after Stop"
+            )
+            await start_btn.first.click()
+            await stop_btn.first.wait_for(state="visible", timeout=5000)
+        else:
+            raise AssertionError(
+                f"[Run {run_idx}/{total_runs}] Could not find Start/Stop control button"
+            )
+
+        settings_toggle = page.locator('button[aria-label="Toggle settings"]')
+        await settings_toggle.first.wait_for(state="visible", timeout=5000)
+        await settings_toggle.first.click()
+        await page.wait_for_selector("text=Unified Device Settings", timeout=5000)
+        ble_chk = page.locator("#ble-enabled")
+        await ble_chk.wait_for(state="visible", timeout=5000)
+        assert await ble_chk.is_disabled(), (
+            f"[Run {run_idx}/{total_runs}] #ble-enabled should be disabled while in BLE mode"
+        )
+
+        print(
+            f"✓ [Web Bluetooth run {run_idx}/{total_runs}] "
+            f"Connected to {selected_device_name} and control path passed"
+        )
+    finally:
+        try:
+            # Switch to WiFi mode — App.vue calls api.disconnectBle() so the
+            # peripheral can resume advertising (CONNECTIONS_MAX=1).
+            wifi_btn = page.locator("button:has-text('WiFi')")
+            if await wifi_btn.count() > 0 and await wifi_btn.first.is_visible():
+                await wifi_btn.first.click()
+                try:
+                    await wait_for_exact_connection_status(
+                        expected="Disconnected",
+                        timeout_ms=5_000,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(0.4)
+        except Exception:
+            pass
+        if last_prompt_id is not None and selected_device_name is None:
+            try:
+                await cdp.send("DeviceAccess.cancelPrompt", {"id": last_prompt_id})
+            except Exception:
+                pass
+        await context.close()
+        # Peripheral needs a cool-down before the next chooser scan / re-advertise.
+        await asyncio.sleep(WEB_BLUETOOTH_COOLDOWN_S)
+
+
+async def test_web_bluetooth_frontend(runs: int = WEB_BLUETOOTH_STABILITY_RUNS):
+    """Verify frontend Web Bluetooth connect/control stability across repeated runs."""
+    if runs < 1:
+        raise AssertionError(f"Invalid runs={runs}; expected >= 1")
+
     print(f"\n============================================================")
     print(f"  OSSM Web Bluetooth E2E Verification Suite (Playwright + CDP)")
     print(f"============================================================")
@@ -476,87 +738,127 @@ async def test_web_bluetooth_frontend():
         print("[WARN] frontend/dist/index.html not found, skipping Web Bluetooth test")
         return
 
-    port = 8099
     class QuietHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(dist_dir), **kwargs)
         def log_message(self, format, *args):
             pass
 
-    httpd = socketserver.TCPServer(("127.0.0.1", port), QuietHandler)
+    class ReusableTCPServer(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    httpd = ReusableTCPServer(("127.0.0.1", 0), QuietHandler)
+    port = httpd.server_address[1]
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--headless=new",
-                    "--enable-features=WebBluetooth",
-                    "--enable-experimental-web-platform-features",
-                ],
+            # Web Bluetooth chooser needs a display server. Prefer headed mode when
+            # DISPLAY is set (including under `xvfb-run -a`); otherwise fall back to
+            # new headless which can still enumerate devices once firmware advertises
+            # a valid static random address.
+            has_display = bool(os.environ.get("DISPLAY"))
+            launch_args = [
+                "--enable-features=WebBluetooth,WebBluetoothNewPermissionsBackend",
+                "--enable-experimental-web-platform-features",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ]
+            if not has_display:
+                launch_args.insert(0, "--headless=new")
+            frontend_url = f"http://127.0.0.1:{port}/"
+            failures: list[tuple[int, str]] = []
+            print(
+                f" -> Running Web Bluetooth connect/control stability test "
+                f"{runs} times at {frontend_url} "
+                f"(DISPLAY={os.environ.get('DISPLAY')!r}, headed={has_display})"
             )
-            context = await browser.new_context(viewport={"width": 1280, "height": 800})
-            page = await context.new_page()
 
-            cdp = await context.new_cdp_session(page)
-            await cdp.send("DeviceAccess.enable")
+            async def launch_browser():
+                return await p.chromium.launch(
+                    headless=not has_display,
+                    args=launch_args,
+                )
 
-            ble_devices_seen = []
-
-            def on_device_prompt(event):
-                print("👀 [CDP] Intercepted Web Bluetooth device scan prompt:")
-                devices = event.get("devices", [])
-                for dev in devices:
-                    ble_devices_seen.append(dev)
-                    name = dev.get("name", "")
-                    dev_id = dev.get("id", "")
-                    print(f"  - Device discovered: {name} ({dev_id})")
-                    if "OSSM" in name or dev_id:
-                        print(f" -> Auto-selecting BLE device via CDP: {name} ({dev_id})")
-                        asyncio.create_task(
-                            cdp.send(
-                                "DeviceAccess.selectPrompt",
-                                {"id": event["id"], "deviceId": dev_id},
-                            )
+            async def run_with_retry(run_idx: int) -> None:
+                last_exc: Exception | None = None
+                for attempt in range(1, 3):
+                    # Bleak must scan while Chromium is NOT holding the adapter.
+                    await _ensure_ossm_advertising(run_idx, runs)
+                    browser = await launch_browser()
+                    try:
+                        await _run_single_web_bluetooth_attempt(
+                            browser=browser,
+                            frontend_url=frontend_url,
+                            run_idx=run_idx,
+                            total_runs=runs,
                         )
-                        break
+                        return
+                    except Exception as exc:
+                        last_exc = exc
+                        print(
+                            f" ! [Web Bluetooth run {run_idx}/{runs}] "
+                            f"attempt {attempt}/2 failed: {type(exc).__name__}: {exc}"
+                        )
+                    finally:
+                        await browser.close()
+                    await _soft_reset_device()
+                assert last_exc is not None
+                raise last_exc
 
-            cdp.on("DeviceAccess.deviceRequestPrompted", on_device_prompt)
+            for run_idx in range(1, runs + 1):
+                print(f"\n[Web Bluetooth run {run_idx}/{runs}]")
+                try:
+                    await run_with_retry(run_idx)
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+                    failures.append((run_idx, err))
+                    print(f"✗ [Web Bluetooth run {run_idx}/{runs}] {err}")
+                await asyncio.sleep(0.4)
 
-            print(f" -> Navigating to http://127.0.0.1:{port} (serving frontend/dist)...")
-            await page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
-
-            title = await page.title()
-            assert "OSSM" in title, f"Unexpected page title: {title}"
-            print("✓ Built frontend artifact loaded successfully")
-
-            ble_mode_btn = page.locator("button:has-text('BLE')")
-            if await ble_mode_btn.count() > 0:
-                print(" -> Switching UI to BLE mode...")
-                await ble_mode_btn.click()
-                await asyncio.sleep(0.5)
-
-            connect_btn = page.locator("button:has-text('Connect BLE')")
-            if await connect_btn.count() > 0:
-                print(" -> Clicking Connect BLE button...")
-                await connect_btn.click()
-                await asyncio.sleep(3.0)
-                print(f"✓ Web Bluetooth connect button clicked (CDP scan events intercepted: {len(ble_devices_seen)})")
-
-            await browser.close()
-            print("✓ Web Bluetooth E2E verification completed successfully")
+            if failures:
+                details = "; ".join(f"run {idx}: {msg}" for idx, msg in failures)
+                raise AssertionError(
+                    f"Web Bluetooth stability regression: {len(failures)}/{runs} failed ({details})"
+                )
+            print(f"✓ Web Bluetooth E2E stability passed ({runs}/{runs})")
     finally:
         httpd.shutdown()
+        httpd.server_close()
+        server_thread.join(timeout=2.0)
 
 
 async def main():
+    parser = argparse.ArgumentParser(description="OSSM frontend + BLE integration test suite")
+    parser.add_argument(
+        "--only-web-bluetooth",
+        action="store_true",
+        help="Run only the frontend Web Bluetooth stability suite",
+    )
+    parser.add_argument(
+        "--web-bluetooth-runs",
+        type=int,
+        default=WEB_BLUETOOTH_STABILITY_RUNS,
+        help=f"Number of Web Bluetooth repeated runs (default: {WEB_BLUETOOTH_STABILITY_RUNS})",
+    )
+    args = parser.parse_args()
+
+    if args.only_web_bluetooth:
+        await test_web_bluetooth_frontend(runs=args.web_bluetooth_runs)
+        print(f"\n============================================================")
+        print(
+            f"✓ Web Bluetooth frontend stability test PASSED "
+            f"({args.web_bluetooth_runs}/{args.web_bluetooth_runs})"
+        )
+        print(f"============================================================")
+        return
+
     base_url = load_device_url()
     await test_concurrent_http(base_url)
     await test_ble_connection()
     await test_frontend(base_url)
-    await test_web_bluetooth_frontend()
+    await test_web_bluetooth_frontend(runs=args.web_bluetooth_runs)
     await test_flasher()
     print(f"\n============================================================")
     print(f"✓ All HTTP + BLE + frontend + Web Bluetooth + flasher Playwright tests PASSED")

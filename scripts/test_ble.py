@@ -75,9 +75,15 @@ async def run_tests():
         assert res_state.get("id") == 2, "BLE RPC get-state failed!"
 
         # 6. Run the motor via BLE!
-        print("\n--- 6. Running Motor via BLE ---")
-        print("Starting motor at 30 BPM, depth 0.5...")
-        await backend.set_config({"bpm": 30.0, "depth": 0.5, "paused": False})
+        print("\n--- 6. Running Motor via BLE (Spline Mode) ---")
+        print("Starting motor at 30 BPM, depth 0.5 in spline mode...")
+        await backend.set_config({
+            "bpm": 30.0,
+            "depth": 0.5,
+            "wave_func": "spline",
+            "spline_points": [0.0, 0.3, 0.7, 1.0, 0.2, 0.0],
+            "paused": False
+        })
 
         async def _monitor_live_state():
             client = await backend._get_ble_client()

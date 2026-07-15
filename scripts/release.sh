@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 
 RELEASE_DIR="$SCRIPT_DIR/release"
 mkdir -p "$RELEASE_DIR"
-rm -rf "$RELEASE_DIR/*"
+rm -rf "$RELEASE_DIR"/*
 
 echo "==> Building frontend..."
 (cd frontend && npm ci && npm run build)
@@ -14,6 +14,10 @@ echo "==> Building frontend..."
 echo "==> Building flasher..."
 (cd flasher && npm ci && npm run build)
 cp flasher/dist/index.html "$RELEASE_DIR/flasher.html"
+
+echo "==> Building motor-control..."
+(cd motor-control && npm ci && npm run build)
+cp motor-control/dist/index.html "$RELEASE_DIR/motor-control.html"
 
 echo "==> Building firmware for ESP32-C6 ..."
 cargo b-c6 --release

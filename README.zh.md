@@ -68,7 +68,7 @@
 | GPIO 20 | --> | MAX3485 收发方向控制 (DE / RE) | 控制 RS-485 总线的收发方向转换 |
 
 > [!NOTE]
-> **关于 GPIO 引脚分配的说明**：GPIO 18, 19 和 20 是 ESP32-C6 开发板上的默认引脚。如果您使用的是 ESP32-S3 开发板（其 GPIO 19 和 20 被系统预留给 USB 串行 JTAG 功能），或者您实际接线使用了其他引脚，完全不用担心！我们的固件具备自动硬件探测功能，开机时会在所有可用引脚中自动搜索您的接线，并将正确的引脚配置自动保存。您也可以随心通过网页控制界面或串口命令随时查看或调整引脚配置。
+> **关于 GPIO 引脚分配的说明**：固件 NVS 中默认的 Modbus 引脚为 GPIO 18 / 19 / 20（两款芯片默认值相同）。在 ESP32-S3 上，19 / 20 常被 USB Serial/JTAG 占用——请将 Modbus TX/RX/DE-RE 接到空闲 GPIO，并通过网页界面、串口命令（`set-pin-modbus-*`）或烧录器配置面板写入 NVS。固件**不会**自动探测 GPIO 接线；开机时仅在电机未以 `115200` 响应时扫描 Modbus 波特率 / 从站 ID。
 
 ### 第三步：为 ESP32 开发板供电
 
@@ -85,48 +85,76 @@
 普通用户完全无需自行搭建开发环境或编译代码——我们在“第三部分”为您准备好了现成的编译版本！如果您是开发者，想要从源代码进行定制与构建，本项目采用 Espressif 官方的 `esp` Rust 工具链（已在 `rust-toolchain.toml` 中精确配置）。通过 `.cargo/config.toml` 中预设的快捷命令即可一键编译：
 
 ```
-cargo b-c6    # 为 ESP32-C6 平台编译固件
-cargo b-s3    # 为 ESP32-S3 平台编译固件
+cargo b-c6 --release    # 为 ESP32-C6 平台编译固件
+cargo b-s3 --release    # 为 ESP32-S3 平台编译固件
 ```
 
-构建完成后，固件程序会自动识别并适配所选微控制器的硬件体系架构与引脚分配。
+构建目标由 Cargo 特性 / 别名（`esp32c6` / `esp32s3`）选择。两款芯片的默认 Modbus GPIO 编号相同；若板级接线不同，请在 NVS 中修改引脚配置。
 
 ## 第三部分：烧录固件
 
-您无需具备任何编程或软件开发经验！本仓库的 **Releases** 页面为各类受支持的芯片提供了预先编译打包好的现成固件。我们还为您配备了零依赖的独立网页烧录工具（`flasher.html`），直接在浏览器里就能一键烧录，无需下载安装任何复杂的专业软件！
+您无需从源码编译。预编译好的**合并**固件镜像（`ossm-esp32c6.bin` / `ossm-esp32s3.bin`）在仓库 **Releases** 中提供，并附带基于 [Web Serial API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API) 的独立网页烧录器（`flasher.html`）——无需安装命令行工具。
 
 > [!IMPORTANT]
-> **请一定要连接原生 JTAG (Native USB) 接口！**
-> 如果您的 ESP32 开发板配有**两个** Type-C 接口（常见标注为 "USB", "Native", "JTAG" 与 "UART", "COM", "CP2102"），**请务必将 USB 数据线插在 Native JTAG / USB 接口上**！原生 JTAG 接口速度更快，且能直接在网页浏览器里即插即用，不用苦恼于电脑驱动不识别的问题！
+> **请使用 Native USB / JTAG 接口！**
+> 若开发板有**两个** Type-C 口（常见标注 "USB" / "Native" / "JTAG" 与 "UART" / "COM" / "CP2102"），**请始终插入 Native JTAG / USB 口**。该口直连芯片，可在 Chrome / Edge 中即插即用，通常不必安装额外 USB–UART 驱动。
 
-### 可视化一键烧录步骤
+### 烧录器界面一览
 
-1.  访问本项目的 **Releases** 页面，下载最新发布的打包文件（`.zip`）并在电脑上解压缩。
-2.  使用 USB-C 数据线将您的 ESP32-C6 或 ESP32-S3 开发板连接至电脑（如果板子有双接口，请记得插在 **Native JTAG 接口**上！）。
-3.  使用支持 Web Serial API 的现代桌面浏览器（推荐 Google Chrome、Microsoft Edge 或 Opera），直接双击或将解压所得的 `flasher.html` 文件拖入浏览器标签页打开。
-4.  点击网页左侧的 **"Connect Device"（连接设备）** 按钮。此时浏览器顶部会弹出一个窗口，列出当前系统中的所有串口设备。
+`flasher.html` 为单页布局：
+
+| 区域 | 作用 |
+| --- | --- |
+| **状态栏**（顶部） | 连接状态，以及 **Connect**、**Monitor**、**Stop**、**Reset**、**Disconnect** |
+| **Flash Firmware**（左侧） | 拖入 / 选择 `.bin`、可选烧录地址（默认 `0x0`）、**Flash Firmware** |
+| **Device Configuration**（右侧） | WiFi、Modbus GPIO、Modbus 时序、BLE，然后 **Send Configuration** |
+| **Console**（左下） | 烧录器进度与 CLI ACK 日志 |
+| **Serial**（右下） | 设备 UART 实时输出（启动日志、WiFi IP、电机提示） |
+
+表单内容会保存在浏览器本地（`localStorage` 键 `ossm-flasher-device-config-v1`），下次打开可复用。**Reset to defaults** 可将表单恢复为默认引脚 / 时序。
+
+### 烧录步骤
+
+1.  从 **Releases** 下载并解压最新发布包（`.zip`）。
+2.  用 USB-C **数据线**将 ESP32-C6 或 ESP32-S3 接到电脑的 **Native USB / JTAG** 口。
+3.  用 **Google Chrome** 或 **Microsoft Edge** 打开 `flasher.html`（需 Web Serial；桌面浏览器；Safari / Firefox 及多数移动浏览器不支持）。可直接双击文件或拖入标签页，无需本地 Web 服务。
+4.  点击状态栏 **Connect**，在浏览器弹窗中选择 ESP32 串口。
     > [!TIP]
-    > **如何准确认出哪一个串口是我的 ESP32 设备？**
-    > 如果弹出列表里有好几个 COM 串口，您无法分清哪一个才是刚刚插上的开发板，请使用这个极其简便的**“插拔排查法”**：
-    > 1. 先看一眼当前列表里有的端口号，然后直接取消关闭这个弹出窗。
-    > 2. 将 ESP32 开发板的 USB 数据线从电脑上**拔下来**。
-    > 3. 再次点击 **"Connect Device"** 按钮，观察列表里**哪一个端口号消失了**——那个消失的端口号就是您设备专属的串口！
-    > 4. 关闭弹窗，将 ESP32 **重新插回电脑**，再次点击 **"Connect Device"** 按钮，选中那个**重新出现的端口**，点击 **连接 (Connect)** 即可。
-5.  在网页烧录区域中，点击选择或直接将芯片型号对应的固件二进制文件（例如 ESP32-C6 选择 `ossm-esp32c6.bin`；ESP32-S3 选择 `ossm-esp32s3.bin`）拖入框中。烧录器会自动为您填好默认闪存地址（`0x0`）。
-6.  点击 **"Flash Firmware"（烧录固件）** 按钮，开始自动烧录。
-7.  耐心等待进度条走满 100%；当底层终端日志输出提示烧录完成时，您的固件就顺利刷写完毕了！
+    > **如何确认是哪一个串口？**
+    > 若列表有多个端口，可用插拔法：记下列表 → 取消 → **拔掉** ESP32 → 再点 **Connect** 看哪一项消失 → 插回 → **Connect** 并选择重新出现的端口。
+5.  在 **Flash Firmware** 区域拖入（或浏览选择）对应芯片的合并镜像：
+    - ESP32-C6 → `ossm-esp32c6.bin`
+    - ESP32-S3 → `ossm-esp32s3.bin`
+    **Flash address** 保持 `0x0`（除非您明确需要其他偏移；发布包中的合并镜像从 `0x0` 写入）。
+6.  点击 **Flash Firmware**。关注进度条与 **Console** 面板（`Flash complete` / 设备复位）。
+7.  烧录结束后工具会硬复位芯片，状态变为 **Flash complete**。通常**无需**再点 Connect —— USB 端口仍保持占用，可直接配置。
+
+> [!NOTE]
+> **Connect** 会进入 ROM 引导下载模式（烧录所需）。烧录成功后工具会离开 bootloader，以便在同一页面配置并监视正在运行的固件。
 
 ## 第四部分：网络与设备配置
 
-固件烧录完毕后，您还需要为设备配置家庭 WiFi 网络名称与密码，以及核对 RS-485 Modbus 通信引脚。借助网页烧录器内置的图形化向导，您继续停留在当前网页中就能轻松搞定！
+烧录完成后请继续留在同一 `flasher.html` 页面。填写右侧 **Device Configuration**，然后点击 **Send Configuration**。
 
-1.  保持 ESP32 开发板与电脑的 USB 连通，并继续停留在当前的 `flasher.html` 页面中。
-2.  如果由于烧录完成后的芯片重置导致断开，请再次点击 **"Connect Device"** 重新连上开发板。
-3.  在页面中部的 **"Step 2: Post-Flash Device Configuration"（设备配置）** 面板中，在对应输入框内准确填入您家里的 WiFi 名称（SSID）及密码。同时，您也可以在上方核对修改 Modbus GPIO 引脚，或开关低功耗蓝牙 (BLE) 功能。
-4.  确认无误后，点击 **"Send Configuration"（发送配置）** 按钮。烧录器会自动将设置保存进芯片并触发 ESP32 重启。
-5.  设备重启后将会自动连入您的 WiFi 局域网。在网页底部的终端监视器 (Terminal Monitor) 中，您会看到连接成功的提示以及分配到的设备 IP 地址。**请一定要记下这个 IP 地址！** 随后在手机或电脑浏览器输入这个地址，就能打开设备的 Web 操作面板了。
+### 配置项
 
-**关于电机初始化的重要说明**：开发板每次开机启动时，固件都会自动尝试通过 RS-485 Modbus 协议与伺服电机通信。如果电机当前的通信速率（波特率）和固件不一致导致握手失败，固件会自动启动智能扫描，在所有可能的速度和 ID 里搜索电机的踪迹。一旦找到处于非标准波特率的电机，固件会自动将电机的通信波特率永久重设为标准的 `115200`，并在底层终端日志中提示您给电机重新上电。如果您看到了这条提示，只需将电机的 24V 主电源拔下停顿 3 秒后再重新插上，新的总线速率就会即刻生效！
+| 分组 | 填写内容 |
+| --- | --- |
+| **WiFi** | 开关 **Enable WiFi**；开启时填写 SSID 与密码。若仅用 BLE / USB，可关闭 WiFi。 |
+| **GPIO Pins** | Modbus **TX** / **RX** / **DE/RE**（默认 `18` / `19` / `20`）。接线不同时请改（尤其 ESP32-S3 上 19/20 可能被 USB 占用）。 |
+| **Motor / Modbus** | 可选时序：读超时 (ms)、字节间超时 (µs)、帧间静默 (µs)、扫描延迟 (µs)。填 `0` 使用固件自动默认值（115200 下：**10 ms** 帧超时、**750 µs** 字节间、**350 µs** 帧间）。界面中波特率 `115200` 与设备 ID `1` 为固定显示。 |
+| **BLE** | **Enable Bluetooth Low Energy (BLE)** — 默认开启，不需要时可关闭。 |
+
+### 发送配置
+
+1.  保持 USB 连接。状态应为 **Flash complete**、**Connected to …** 或 **Configuration complete**（这些状态才会启用 **Send Configuration**）。若曾点过 **Disconnect**，请先再点 **Connect**。
+2.  点击 **Send Configuration**。烧录器会复位设备、等待启动，再依次发送串口 CLI（`set-wifi-*`、`set-pin-modbus-*`、`set-modbus-*`、`set-ble-enabled`，最后 `reset`），并在 **Console** 中等待每条 ACK。
+3.  配置成功后会自动进入 **Serial** 监视。请留意 WiFi 连接成功日志以及类似 `http://<hostname>.local` 或分配到的 IP。**请记下该 IP**（若本机 mDNS 可用也可访问 `http://ossm.local`），随后用浏览器打开控制面板。
+4.  **Stop** 可暂停监视，**Monitor** 可再次附着，**Reset** 仅复位芯片而不发送配置，**Disconnect** 释放 Web Serial 端口。
+
+若配置失败（等待 ACK 超时），请查看 **Console** / **Serial**，确认使用的是 Native USB 口，必要时重新 **Connect** 后再试 **Send Configuration**。
+
+**关于电机初始化**：每次开机固件都会经 Modbus 联系伺服。若电机在 `115200` 无响应，会扫描其他波特率 / 从站 ID。若在其他速率找到电机，会将其改写为 `115200`，并在串口日志中提示您对电机 **24V** 电源断电约 3 秒后再上电。
 
 ## 第五部分：设备使用
 
@@ -142,11 +170,11 @@ cargo b-s3    # 为 ESP32-S3 平台编译固件
 
 核心界面与连接特性包含：
 - **实时电机行程图表（可切换并持久化）**：可视化展现全行程区间（`0% – 100%`）、物理极限位置（`pos_min` / `pos_max`）、当前运动区间（左右极限点标记），以及以 30 FPS 实时展示电机运动位置的动画组件。顶部活动图标可一键切换显示/隐藏，并在浏览器中自动记忆切换状态。
-- **高韧性实时数据遥测 (`WsDataManager`)**：前端采用单所有者 WebSocket 专职通信管理器 (`client.ts`)，以高达 **30 FPS (`33ms`)** 速率实时推送状态数据与底层控制循环统计指标 (`ups`、`dt_min_ms`、`dt_max_ms`、`dt_avg_ms`、`dt_mdev_ms`)。固件端采用**收发分离异步任务架构** (`edge_nal::TcpSplit`) 结合堆分配字符串与 **4 缓冲区共享缓冲池 (`NET_BUFFER_POOL`)**，即使在高并发 HTTP REST 请求与持续 WebSocket 遥测并存时也不会发生缓冲区阻塞或掉线。
+- **高韧性实时数据遥测 (`WsDataManager`)**：前端采用单所有者 WebSocket 专职通信管理器 (`client.ts`)，以高达 **30 FPS (`33ms`)** 速率经 WiFi WebSocket（`/ws/command`）实时推送状态数据与底层控制循环统计指标 (`ups`、`dt_min_ms`、`dt_max_ms`、`dt_avg_ms`、`dt_mdev_ms`)。BLE 实时遥测走独立路径（`ble.ts` / GATT `CHAR_STATE` 通知），不经过该 WebSocket 管理器。固件端采用**收发分离异步任务架构** (`edge_nal::TcpSplit`) 结合堆分配字符串与 **4 缓冲区共享缓冲池 (`NET_BUFFER_POOL`)**，即使在高并发 HTTP REST 请求与持续 WebSocket 遥测并存时也不会发生缓冲区阻塞或掉线。
 
 ### 串口命令与调试
 
-通过网页下方的 USB 串口交互终端（或任何其他串口监视调试软件），您可以直接发送纯文本指令来控制电机与检查系统状态。以下为固件当前支持的所有串口命令行指令清单：
+也可通过 USB 串口（`115200` 波特，`\r\n`）控制设备。在 `flasher.html` 中请使用 **Serial** 面板（或 **Monitor**）进行交互式 CLI；**Console** 仅显示烧录 / 配置工具自身的日志。同一套命令也适用于任意串口终端。以下为固件当前支持的命令清单：
 
 ```
 help                           - 显示此帮助消息
@@ -362,8 +390,8 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
 *   `modbus_tx`（数字）：分配给 Modbus DI/TX（发送）的 GPIO 引脚编号。
 *   `modbus_rx`（数字）：分配给 Modbus RO/RX（接收）的 GPIO 引脚编号。
 *   `modbus_de_re`（数字）：分配给 Modbus DE/RE（收发方向控制）的 GPIO 引脚编号。
-*   `modbus_timeout_ms`（数字）：Modbus 单次总线响应超时时间（毫秒），`0` 表示由系统根据当前波特率自动匹配默认值（例如 115200 波特率默认为 `15ms`，最高支持 `1000`）。
-*   `modbus_rx_timeout_us`（数字）：Modbus 字节间超时时间（微秒，$t_{1.5}$），`0` 表示自动（115200 波特率默认为 `1750µs`，以避免下位机中断抖动导致误拆包）。
+*   `modbus_timeout_ms`（数字）：Modbus 单次总线响应超时时间（毫秒），`0` 表示由系统根据当前波特率自动匹配默认值（例如 115200 波特率默认为 **`10ms`**，最高支持 `1000`）。
+*   `modbus_rx_timeout_us`（数字）：Modbus 字节间超时时间（微秒，$t_{1.5}$），`0` 表示自动（115200 波特率默认为 **`750µs`**，符合 >19200 bps 的 Modbus RTU 规范）。
 *   `modbus_scan_delay_us`（数字）：Modbus 自动扫描时的帧间检测延迟（微秒），`0` 表示仅采用 Modbus 规范标准的 t3.5 间隙时序（最高支持 `200000`）。
 *   `modbus_inter_frame_delay_us`（数字）：Modbus 正常通信时的帧间静默延迟（微秒，$t_{3.5}$），`0` 表示自动（115200 波特率默认为 `350µs`，确保完整的往返控制时延于 <3ms 以支撑 >300Hz 的电机控制刷新率）。
 
@@ -378,7 +406,7 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
 
 *   **请求方法：** `POST`
 *   **接口描述：** 触发软复位指令，立即重启 ESP32 微控制器。
-*   **响应消息体：** `"Restarting device"`
+*   **响应消息体：** `{"ok":true}`
 
 #### `GET /ws/command`
 
@@ -453,8 +481,9 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
   "jsonrpc": "2.0",
   "method": "set-config",
   "params": {
-    "motion": { ... },
-    "driver": { ... }
+    "bpm": 60,
+    "depth": 0.8,
+    "paused": false
   },
   "id": 6
 }
@@ -470,9 +499,10 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
   "id": 7
 }
 ```
-        *   订阅生效后，服务器会依照设定的时间间隔（`interval_ms`）自动向连接的客户端持续推送 JSON-RPC 格式的遥测数据帧：`{"jsonrpc": "2.0", "method": "state", "params": { ...StateResponse... }}`。
+        *   订阅生效后，服务器会依照设定的时间间隔（`interval_ms`）自动向连接的客户端持续推送 JSON-RPC 格式的遥测数据帧：`{"jsonrpc": "2.0", "method": "state", "params": { ...StateResponse... }}`。再次发送 `subscribe-state` 可直接调整推流间隔，无需先取消订阅。
         *   **异步收发分离架构**：WebSocket 会话将底层 TCP 连结分离为独立读取（`ws_recv`）与写入（`ws_send`）任务，通过 Embassy 通道及堆分配字符串通信，确保高频推流不阻塞控制指令读入。
-        *   **精简 GATT 读 vs 完整推流状态**：在低功耗蓝牙 (BLE) 模式下，直接读取 `CHAR_STATE` 特征返回精简状态 (<120 字节) 以适合单包 ATT 读包限额；完整遥测与历史数组数据可通过 `subscribe-state` 推流获取。
+        *   **BLE 遥测**：GATT 对 `CHAR_STATE` 的读/通知使用**精简** JSON（必要时分块）。完整 `StateResponse`（循环遥测、历史数组等）请通过 `CHAR_RPC` 上的 JSON-RPC `get-state` 获取。BLE 的 `subscribe-state` 在 `CHAR_STATE` 上推送精简格式，而非 WiFi WebSocket 的完整载荷。
+        *   **空闲自动断开**：为节省设备内存与 WebSocket 会话槽位（`WS_MAX` = 3 并发），嵌入式网页在无活动监听者时会于约 3 秒空闲后自动断开 WebSocket。
     *   **Unsubscribe State（取消状态订阅）**：停止服务端的周期性状态自动推送工作。
 ```json
 {
@@ -481,3 +511,4 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
   "id": 8
 }
 ```
+

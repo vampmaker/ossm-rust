@@ -90,6 +90,9 @@ pub struct SubscribeParams {
 pub struct PausedControl {
     pub paused: Option<bool>,
     pub position: Option<f32>,
+    /// Alias for [`Self::position`] — some clients send the motor-config field name.
+    #[serde(default)]
+    pub paused_position: Option<f32>,
     pub adjust: Option<f32>,
 }
 
@@ -141,6 +144,8 @@ static REST_GATE: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 static WS_SLOTS: GreedySemaphore<CriticalSectionRawMutex> = GreedySemaphore::new(WS_MAX);
 static ACCEPT_SIGNALS: [Signal<CriticalSectionRawMutex, ()>; Q_ACCEPTORS] =
     [const { Signal::new() }; Q_ACCEPTORS];
+/// Signalled once the HTTP listener is bound and accept loops are about to run.
+static HTTP_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 fn normalize_path(path: &str) -> &str {
     path.split('?').next().unwrap_or(path)
@@ -296,14 +301,8 @@ async fn get_config(
     conn: &mut HttpConn<'_>,
     ctx: AppContext,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let config = {
-        let mc_opt = ctx.motor_controller.lock().await;
-        mc_opt.as_ref().map(|mc| mc.get_config())
-    };
-    match config {
-        Some(c) => send_json_obj(conn, 200, "OK", &c).await,
-        None => send_json(conn, 503, "Service Unavailable", "Motor controller not initialized").await,
-    }
+    let config = ctx.load_snapshot().config.clone();
+    send_json_obj(conn, 200, "OK", &config).await
 }
 
 async fn post_config(
@@ -318,15 +317,13 @@ async fn post_config(
 
     match config_res {
         Ok(config) => {
-            let res = {
-                let mut mc_opt = ctx.motor_controller.lock().await;
-                mc_opt.as_mut().map(|mc| mc.set_config(config))
-            };
-            match res {
-                Some(Ok(new_config)) => send_json_obj(conn, 200, "OK", &new_config).await,
-                Some(Err(_)) | None => {
-                    send_json(conn, 503, "Service Unavailable", "Motor controller not initialized").await
-                }
+            if ctx
+                .enqueue_motion(crate::motion::MotionCommand::SetConfig(config.clone()))
+                .await
+            {
+                send_json_obj(conn, 200, "OK", &config).await
+            } else {
+                send_json(conn, 503, "Service Unavailable", "Command queue full").await
             }
         }
         Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
@@ -337,14 +334,8 @@ async fn get_state(
     conn: &mut HttpConn<'_>,
     ctx: AppContext,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let state = {
-        let mut mc_opt = ctx.motor_controller.lock().await;
-        mc_opt.as_mut().map(|mc| mc.get_current_state())
-    };
-    match state {
-        Some(s) => send_json_obj(conn, 200, "OK", &s).await,
-        None => send_json(conn, 503, "Service Unavailable", "Motor controller not initialized").await,
-    }
+    let state = ctx.load_snapshot();
+    send_json_obj(conn, 200, "OK", state.as_ref()).await
 }
 
 async fn post_paused(
@@ -357,32 +348,23 @@ async fn post_paused(
     }
     match serde_json::from_slice::<PausedControl>(&body) {
         Ok(control) => {
-            let updated = {
-                let mut mc_opt = ctx.motor_controller.lock().await;
-                if let Some(mc) = mc_opt.as_mut() {
-                    let mut config = mc.get_config();
-                    if let Some(paused) = control.paused {
-                        config.paused = paused;
-                    }
-                    if let Some(position) = control.position {
-                        config.paused_position = position.clamp(0.0, 1.0);
-                    }
-                    if let Some(adjust) = control.adjust {
-                        config.paused_position =
-                            (config.paused_position + adjust).clamp(0.0, 1.0);
-                    }
-                    let _ = mc.set_config(config.clone());
-                    Some(config)
-                } else {
-                    None
-                }
-            };
-            match updated {
-                Some(config) => send_json_obj(conn, 200, "OK", &config).await,
-                None => {
-                    send_json(conn, 503, "Service Unavailable", "Motor controller not initialized")
-                        .await
-                }
+            let mut config = ctx.load_snapshot().config.clone();
+            if let Some(paused) = control.paused {
+                config.paused = paused;
+            }
+            if let Some(position) = control.position.or(control.paused_position) {
+                config.paused_position = position.clamp(0.0, 1.0);
+            }
+            if let Some(adjust) = control.adjust {
+                config.paused_position = (config.paused_position + adjust).clamp(0.0, 1.0);
+            }
+            if ctx
+                .enqueue_motion(crate::motion::MotionCommand::SetConfig(config.clone()))
+                .await
+            {
+                send_json_obj(conn, 200, "OK", &config).await
+            } else {
+                send_json(conn, 503, "Service Unavailable", "Command queue full").await
             }
         }
         Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
@@ -393,12 +375,7 @@ async fn get_pin_config(
     conn: &mut HttpConn<'_>,
     ctx: AppContext,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let config = ctx
-        .storage
-        .lock()
-        .await
-        .get_pin_configuration()
-        .unwrap_or_default();
+    let config = ctx.storage.pin();
     send_json_obj(conn, 200, "OK", &config).await
 }
 
@@ -418,10 +395,8 @@ async fn post_pin_config(
             {
                 return send_json(conn, 400, "Bad Request", "Invalid pin config").await;
             }
-            match ctx.storage.lock().await.set_pin_configuration(&config) {
-                Ok(()) => send_json_obj(conn, 200, "OK", &config).await,
-                Err(_) => send_json(conn, 500, "Internal Server Error", "Save failed").await,
-            }
+            ctx.storage.set_pin(config.clone());
+            send_json_obj(conn, 200, "OK", &config).await
         }
         Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
     }
@@ -431,12 +406,7 @@ async fn get_network_config(
     conn: &mut HttpConn<'_>,
     ctx: AppContext,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let config = ctx
-        .storage
-        .lock()
-        .await
-        .get_network_configuration()
-        .unwrap_or_default();
+    let config = ctx.storage.net();
     send_json_obj(conn, 200, "OK", &config).await
 }
 
@@ -449,10 +419,10 @@ async fn post_network_config(
         return send_json(conn, 400, "Bad Request", "Request too large").await;
     }
     match serde_json::from_slice::<NetworkConfiguration>(&body) {
-        Ok(config) => match ctx.storage.lock().await.set_network_configuration(&config) {
-            Ok(()) => send_json_obj(conn, 200, "OK", &config).await,
-            Err(_) => send_json(conn, 500, "Internal Server Error", "Save failed").await,
-        },
+        Ok(config) => {
+            ctx.storage.set_net(config.clone());
+            send_json_obj(conn, 200, "OK", &config).await
+        }
         Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
     }
 }
@@ -484,6 +454,7 @@ async fn handle_rest(
         (Method::Post, "/config") => {
             let (_, body) = conn.split();
             let payload = read_body_limited(body, MAX_BODY_LEN).await?;
+            let _gate = REST_GATE.lock().await;
             post_config(conn, ctx, payload).await
         }
         (Method::Options, "/config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
@@ -492,6 +463,7 @@ async fn handle_rest(
         (Method::Post, "/paused") => {
             let (_, body) = conn.split();
             let payload = read_body_limited(body, MAX_BODY_LEN).await?;
+            let _gate = REST_GATE.lock().await;
             post_paused(conn, ctx, payload).await
         }
         (Method::Options, "/paused") => cors_preflight(conn, "POST, OPTIONS").await,
@@ -499,6 +471,7 @@ async fn handle_rest(
         (Method::Post, "/pin-config") => {
             let (_, body) = conn.split();
             let payload = read_body_limited(body, MAX_BODY_LEN).await?;
+            let _gate = REST_GATE.lock().await;
             post_pin_config(conn, ctx, payload).await
         }
         (Method::Options, "/pin-config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
@@ -506,6 +479,7 @@ async fn handle_rest(
         (Method::Post, "/network-config") => {
             let (_, body) = conn.split();
             let payload = read_body_limited(body, MAX_BODY_LEN).await?;
+            let _gate = REST_GATE.lock().await;
             post_network_config(conn, ctx, payload).await
         }
         (Method::Options, "/network-config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
@@ -592,11 +566,11 @@ async fn process_connection(
         return;
     }
 
-    {
-        let _guard = REST_GATE.lock().await;
-        if handle_rest(&mut conn, ctx).await.is_err() {
-            let _ = conn.complete_err("INTERNAL ERROR").await;
-        }
+    // REST handlers that mutate state take REST_GATE themselves. Holding the
+    // gate across the entire request (including slow gzip HTML / TCP writes)
+    // starved acceptors and made port 80 look dead under burst load.
+    if handle_rest(&mut conn, ctx).await.is_err() {
+        let _ = conn.complete_err("INTERNAL ERROR").await;
     }
     finish_connection(&mut conn).await;
 }
@@ -727,11 +701,9 @@ async fn run_ws_session(mut socket: TcpSocket<'static>, ctx: AppContext) {
                 },
                 SelectEither::Second(()) => {
                     next_push += Duration::from_millis(push_interval_ms);
-                    if let Some(json) = rpc::build_state_notification(ctx).await {
-                        if ws_send(&mut tx, FrameType::Text(false), None, json.as_bytes())
-                            .await
-                            .is_err()
-                        {
+                    let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
+                    if let Some(len) = rpc::build_state_notification_into(ctx, &mut *lease) {
+                        if ws_send(&mut tx, FrameType::Text(false), None, &lease[..len]).await.is_err() {
                             break;
                         }
                     }
@@ -740,7 +712,12 @@ async fn run_ws_session(mut socket: TcpSocket<'static>, ctx: AppContext) {
         }
     };
 
-    embassy_futures::join::join(rx_task, tx_task).await;
+    select(rx_task, tx_task).await;
+    // Do not call close(Both).await here: that re-enters TCP read/flush after the
+    // peer or a WiFi blip (common when BLE starts) may have already torn down the
+    // smoltcp slot — observed as Load access fault (mtval=0) in SocketSet::get_mut.
+    // Dropping the edge TcpSocket removes the handle without another await.
+    drop(socket);
 }
 
 #[embassy_executor::task(pool_size = 3)]
@@ -782,19 +759,16 @@ async fn dispatcher_loop(ctx: AppContext) {
 async fn http_server_main(stack: &'static Stack<'static>, ctx: AppContext) {
     let buffers = TCP_BUFFERS.init(TcpBuffers::new());
     let tcp = TCP_FACTORY.init(Tcp::new(*stack, buffers));
-    let acceptor: edge_nal_embassy::TcpAccept<'static> = match tcp
-        .bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)))
-        .await
-    {
-        Ok(acceptor) => {
-            #[allow(clippy::missing_transmute_annotations)]
-            unsafe {
-                core::mem::transmute(acceptor)
+    let acceptor: edge_nal_embassy::TcpAccept<'static> = loop {
+        match tcp.bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80))).await {
+            Ok(acceptor) => {
+                #[allow(clippy::missing_transmute_annotations)]
+                break unsafe { core::mem::transmute(acceptor) };
             }
-        }
-        Err(e) => {
-            log::error!("HTTP bind failed: {:?}", e);
-            return;
+            Err(e) => {
+                log::error!("HTTP bind failed: {:?}, retrying in 1s...", e);
+                Timer::after(Duration::from_secs(1)).await;
+            }
         }
     };
 
@@ -809,6 +783,7 @@ async fn http_server_main(stack: &'static Stack<'static>, ctx: AppContext) {
     for signal in ACCEPT_SIGNALS.iter() {
         signal.signal(());
     }
+    HTTP_READY.signal(());
 
     embassy_futures::join::join(
         embassy_futures::join::join4(
@@ -836,4 +811,7 @@ pub async fn run_server(
         spawner.spawn(ws_session_task(app_context).unwrap());
     }
     spawner.spawn(http_server_task(stack, app_context).unwrap());
+    // Wait until bind + accept priming completes so BLE is not started while the
+    // HTTP socket set is still mid-setup (and so the log message is accurate).
+    HTTP_READY.wait().await;
 }

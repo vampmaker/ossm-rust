@@ -86,12 +86,46 @@ async def run_tests(backend: DeviceBackend):
                 },
                 "id": 4
             }
-            print("\n\033[33m--- 4. Testing set-config ---\033[0m")
+            print("\n\033[33m--- 4. Testing set-config (sine) ---\033[0m")
             print("Send:", json.dumps(req))
             await ws.send(json.dumps(req))
             res = json.loads(await ws.recv())
             print("Recv:", json.dumps(res, indent=2))
             assert res.get("id") == 4, "Set-config failed!"
+
+            # 4b. Test set-config with spline mode
+            req_spline = {
+                "jsonrpc": "2.0",
+                "method": "set-config",
+                "params": {
+                    "bpm": 40.0,
+                    "depth": 0.8,
+                    "depth_top": False,
+                    "reversed": False,
+                    "wave_func": "spline",
+                    "sharpness": 0.3,
+                    "spline_points": [0.0, 0.25, 0.75, 1.0, 0.5, 0.0],
+                    "paused": False,
+                    "paused_position": 0.0,
+                    "streaming": False
+                },
+                "id": 401
+            }
+            print("\n\033[33m--- 4b. Testing set-config (spline mode) ---\033[0m")
+            print("Send:", json.dumps(req_spline))
+            await ws.send(json.dumps(req_spline))
+            res = json.loads(await ws.recv())
+            print("Recv:", json.dumps(res, indent=2))
+            assert res.get("id") == 401, "Set-config spline failed!"
+
+            # Verify state reflects spline mode
+            req_check = {"jsonrpc": "2.0", "method": "get-state", "id": 402}
+            await ws.send(json.dumps(req_check))
+            res = json.loads(await ws.recv())
+            cfg = res.get("result", {}).get("config", {})
+            assert cfg.get("wave_func") == "spline", f"Expected wave_func='spline', got {cfg.get('wave_func')}"
+            assert cfg.get("spline_points") == [0.0, 0.25, 0.75, 1.0, 0.5, 0.0], f"Spline points mismatch: {cfg.get('spline_points')}"
+            print("✓ Spline mode configured and verified successfully without panic!")
 
             # 5. Test subscribe-state
             req = {"jsonrpc": "2.0", "method": "subscribe-state", "params": {"interval_ms": 300}, "id": 5}

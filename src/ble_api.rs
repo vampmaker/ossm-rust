@@ -3,6 +3,8 @@
 
 use alloc::string::String;
 
+use serde::Serialize;
+
 use bt_hci::controller::ExternalController;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -31,8 +33,10 @@ struct OssmService {
     #[characteristic(uuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e", read, write, notify)]
     config: heapless::Vec<u8, 512>,
 
+    // Compact telemetry only (~150 B). Keep attribute <= ATT MTU so BlueZ
+    // Read Request succeeds without Read Blob; avoids controller Unlikely Error.
     #[characteristic(uuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e", read, notify)]
-    state: heapless::Vec<u8, 1024>,
+    state: heapless::Vec<u8, 256>,
 
     #[characteristic(uuid = "6e400004-b5a3-f393-e0a9-e50e24dcca9e", write)]
     paused: heapless::Vec<u8, 128>,
@@ -58,29 +62,60 @@ fn to_vec<const N: usize>(data: &[u8]) -> heapless::Vec<u8, N> {
     out
 }
 
+fn round_mult(v: f32, mult: f32) -> f32 {
+    (v * mult) as i32 as f32 / mult
+}
+
+#[derive(Serialize)]
+struct CompactConfig {
+    bpm: f32,
+    depth: f32,
+    paused: bool,
+    paused_position: f32,
+}
+
+#[derive(Serialize)]
+struct CompactState {
+    config: CompactConfig,
+    y: f32,
+    shaped_y: f32,
+    position: f32,
+    speed: f32,
+    ups: u32,
+    motor_connected: bool,
+}
+
 /// Build a compact JSON string of the state for GATT attribute reads.
 /// Excludes large arrays (update_history, position_history) and redundant
 /// config fields to fit within the 512-byte GATT attribute value limit.
 fn format_compact_state(state: &crate::motion::StateResponse, out: &mut [u8]) -> Result<usize, ()> {
-    let compact = serde_json::json!({
-        "config": {
-            "bpm": (state.config.bpm * 10.0) as i32 as f32 / 10.0,
-            "depth": (state.config.depth * 100.0) as i32 as f32 / 100.0,
-            "paused": state.config.paused,
+    // Keep a Web-Bluetooth-usable subset: include normalized y/shaped_y so the UI
+    // can pause in-place and render the diagram without a full get-state RPC.
+    let compact = CompactState {
+        config: CompactConfig {
+            bpm: round_mult(state.config.bpm, 10.0),
+            depth: round_mult(state.config.depth, 100.0),
+            paused: state.config.paused,
+            paused_position: round_mult(state.config.paused_position, 1000.0),
         },
-        "position": (state.position * 1000.0) as i32 as f32 / 1000.0,
-        "speed": (state.speed * 100.0) as i32 as f32 / 100.0,
-        "ups": state.ups,
-    });
+        y: round_mult(state.y, 1000.0),
+        shaped_y: round_mult(state.shaped_y, 1000.0),
+        position: round_mult(state.position, 1000.0),
+        speed: round_mult(state.speed, 100.0),
+        ups: state.ups,
+        motor_connected: state.motor_connected,
+    };
     serde_json_core::to_slice(&compact, out).map_err(|_| ())
 }
 
+/// Update CHAR_STATE without awaiting. GattEvent handlers must never `.await`
+/// before `accept()`/`send()` — yielding with an outstanding ATT request hangs
+/// the controller (BlueZ sees Unlikely Error) and starves WiFi on the same executor.
 fn set_compact_state(server: &OssmGattServer<'_>, state: &crate::motion::StateResponse) {
-    crate::buffers::with_scratchpad(|buf| {
-        if let Ok(len) = format_compact_state(state, buf) {
-            let _ = server.set(&server.ossm.state, &to_vec::<1024>(&buf[..len]));
-        }
-    });
+    let mut buf = [0u8; 256];
+    if let Ok(len) = format_compact_state(state, &mut buf) {
+        let _ = server.set(&server.ossm.state, &to_vec::<256>(&buf[..len]));
+    }
 }
 
 /// Send a chunked notification on CHAR_STATE.
@@ -92,13 +127,13 @@ async fn chunked_notify_state(
 ) -> Result<(), trouble_host::Error> {
     let total = data.len().div_ceil(BLE_CHUNK_DATA).max(1) as u8;
     if data.is_empty() {
-        let mut buf: heapless::Vec<u8, 1024> = heapless::Vec::new();
+        let mut buf: heapless::Vec<u8, 256> = heapless::Vec::new();
         let _ = buf.push(0);
         let _ = buf.push(1);
         return server.ossm.state.notify(conn, &buf).await;
     }
     for (i, chunk) in data.chunks(BLE_CHUNK_DATA).enumerate() {
-        let mut buf: heapless::Vec<u8, 1024> = heapless::Vec::new();
+        let mut buf: heapless::Vec<u8, 256> = heapless::Vec::new();
         let _ = buf.push(i as u8);
         let _ = buf.push(total);
         let _ = buf.extend_from_slice(chunk);
@@ -130,96 +165,96 @@ async fn chunked_notify_rpc(
     Ok(())
 }
 
-/// Send a chunked notification on CHAR_CONFIG.
-async fn chunked_notify_config(
-    conn: &GattConnection<'_, '_, DefaultPacketPool>,
-    server: &OssmGattServer<'_>,
-    data: &[u8],
-) -> Result<(), trouble_host::Error> {
-    let total = data.len().div_ceil(BLE_CHUNK_DATA).max(1) as u8;
-    if data.is_empty() {
-        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
-        let _ = buf.push(0);
-        let _ = buf.push(1);
-        return server.ossm.config.notify(conn, &buf).await;
-    }
-    for (i, chunk) in data.chunks(BLE_CHUNK_DATA).enumerate() {
-        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
-        let _ = buf.push(i as u8);
-        let _ = buf.push(total);
-        let _ = buf.extend_from_slice(chunk);
-        server.ossm.config.notify(conn, &buf).await?;
-    }
-    Ok(())
-}
-
 pub async fn run_ble_server(
-    bt_peripheral: esp_hal::peripherals::BT<'static>,
+    mut bt_peripheral: esp_hal::peripherals::BT<'static>,
     app_context: AppContext,
 ) {
-    log::info!("Initializing BLE...");
+    loop {
+        log::info!("Initializing BLE stack & controller...");
 
-    let connector = match BleConnector::new(bt_peripheral, Default::default()) {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("BleConnector::new failed: {:?}", e);
-            return;
-        }
-    };
-    let controller: ExternalController<_, 20> = ExternalController::new(connector);
-
-    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
-        HostResources::new();
-    let stack = trouble_host::new(controller, &mut resources)
-        .set_random_address(Address::random([0x41, 0x42, 0x43, 0x44, 0x45, 0x46]));
-    let Host {
-        mut peripheral,
-        mut runner,
-        ..
-    } = stack.build();
-
-    let server = match OssmGattServer::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-        name: "OSSM",
-        appearance: &appearance::UNKNOWN,
-    })) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("GATT server init failed: {:?}", e);
-            return;
-        }
-    };
-
-    {
-        let mut sm = app_context.storage.lock().await;
-        if let Ok(config) = sm.get_motor_config() {
-            let _ = crate::buffers::serialize_to_scratchpad(&config, |json| {
-                let _ = server.set(&server.ossm.config, &to_vec::<512>(json.as_bytes()));
-            });
-        }
-        if let Ok(pin_config) = sm.get_pin_configuration() {
-            let _ = crate::buffers::serialize_to_scratchpad(&pin_config, |json| {
-                let _ = server.set(&server.ossm.pin_config, &to_vec::<256>(json.as_bytes()));
-            });
-        }
-        if let Ok(net_config) = sm.get_network_configuration() {
-            let _ = crate::buffers::serialize_to_scratchpad(&net_config, |json| {
-                let _ = server.set(&server.ossm.net_config, &to_vec::<256>(json.as_bytes()));
-            });
-        }
-    }
-
-    let _ = embassy_futures::join::join(
-        async {
-            loop {
-                if let Err(e) = runner.run().await {
-                    log::warn!("BLE runner error: {:?}, restarting...", e);
-                    Timer::after(Duration::from_millis(500)).await;
-                }
+        // Default controller task stack is 4 KiB — under WiFi coexistence +
+        // connection setup the LLL path overflows it (Instruction access fault
+        // at mepc=0x80000100). Give the controller more room.
+        // HCI/ACL buffer knobs exist on NimBLE adapters (C6 etc.); BTDM (S3/C3)
+        // uses a different Config without those fields.
+        #[cfg(feature = "esp32c6")]
+        let ble_config = esp_radio::ble::Config::default()
+            .with_task_stack_size(10 * 1024)
+            .with_max_connections(1)
+            .with_hci_high_buffer_count(40)
+            .with_acl_buf_count(32);
+        #[cfg(feature = "esp32s3")]
+        let ble_config = esp_radio::ble::Config::default()
+            .with_task_stack_size(10 * 1024)
+            .with_max_connections(1);
+        let connector = match BleConnector::new(bt_peripheral, ble_config) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("BleConnector::new failed: {:?}, retrying in 2s...", e);
+                Timer::after(Duration::from_secs(2)).await;
+                bt_peripheral = unsafe { esp_hal::peripherals::BT::steal() };
+                continue;
             }
-        },
-        serve_gatt(&server, &mut peripheral, app_context, &stack),
-    )
-    .await;
+        };
+        let controller: ExternalController<_, 32> = ExternalController::new(connector);
+
+        let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
+            HostResources::new();
+        let stack = trouble_host::new(controller, &mut resources)
+            .set_random_address(Address::random([0x41, 0x42, 0x43, 0x44, 0x45, 0xC6]));
+        let Host {
+            mut peripheral,
+            mut runner,
+            ..
+        } = stack.build();
+
+        let server = match OssmGattServer::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+            name: "OSSM",
+            appearance: &appearance::UNKNOWN,
+        })) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("GATT server init failed: {:?}, retrying in 2s...", e);
+                Timer::after(Duration::from_secs(2)).await;
+                bt_peripheral = unsafe { esp_hal::peripherals::BT::steal() };
+                continue;
+            }
+        };
+
+        let config = app_context.storage.motor_config();
+        let pin_config = app_context.storage.pin();
+        let net_config = app_context.storage.net();
+        let _ = crate::buffers::serialize_to_scratchpad(&config, |json| {
+            let _ = server.set(&server.ossm.config, &to_vec::<512>(json.as_bytes()));
+        })
+        .await;
+        let _ = crate::buffers::serialize_to_scratchpad(&pin_config, |json| {
+            let _ = server.set(&server.ossm.pin_config, &to_vec::<256>(json.as_bytes()));
+        })
+        .await;
+        let _ = crate::buffers::serialize_to_scratchpad(&net_config, |json| {
+            let _ = server.set(&server.ossm.net_config, &to_vec::<256>(json.as_bytes()));
+        })
+        .await;
+
+        let _ = embassy_futures::select::select(
+            async {
+                if let Err(e) = runner.run().await {
+                    log::warn!("BLE runner error: {:?}, restarting BLE stack (no chip reset)...", e);
+                } else {
+                    log::warn!("BLE runner exited cleanly, restarting BLE stack...");
+                }
+            },
+            serve_gatt(&server, &mut peripheral, app_context, &stack),
+        )
+        .await;
+
+        // Recover in-process: WiFi/HTTP must keep running. Full chip reset was
+        // killing the TCP stack and causing "connection refused" after BLE tests.
+        log::warn!("BLE stack session ended; cooldown before re-init...");
+        Timer::after(Duration::from_millis(500)).await;
+        bt_peripheral = unsafe { esp_hal::peripherals::BT::steal() };
+    }
 }
 
 async fn serve_gatt<C: Controller>(
@@ -228,17 +263,25 @@ async fn serve_gatt<C: Controller>(
     app_context: AppContext,
     stack: &Stack<'_, C, DefaultPacketPool>,
 ) {
+    // Put BOTH CompleteLocalName and the 128-bit service UUID in the primary
+    // advertising PDU so Web Bluetooth name filters and services filters match
+    // without depending on an active-scan response (Flags+Name+UUID128 = 27B).
+    let service_uuid: [u8; 16] = [
+        0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40,
+        0x6e,
+    ];
     let mut adv_data = [0u8; 31];
     let adv_len = AdStructure::encode_slice(
         &[
             AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
             AdStructure::CompleteLocalName(b"OSSM"),
+            AdStructure::ServiceUuids128(&[service_uuid]),
         ],
         &mut adv_data,
     )
     .unwrap_or(0);
 
-    let service_uuid: [u8; 16] = [0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e];
+    // Scan response keeps the service UUID for scanners that prefer scan RSPs.
     let mut scan_data = [0u8; 31];
     let scan_len = AdStructure::encode_slice(
         &[AdStructure::ServiceUuids128(&[service_uuid])],
@@ -247,6 +290,7 @@ async fn serve_gatt<C: Controller>(
     .unwrap_or(0);
 
     let adv_params = AdvertisementParameters {
+        // Relaxed intervals reduce WiFi coexistence contention (AGENTS.md).
         interval_min: Duration::from_millis(250),
         interval_max: Duration::from_millis(500),
         ..Default::default()
@@ -267,7 +311,7 @@ async fn serve_gatt<C: Controller>(
             Ok(a) => a,
             Err(e) => {
                 log::error!("BLE advertise failed: {:?}", e);
-                Timer::after(Duration::from_secs(2)).await;
+                Timer::after(Duration::from_millis(500)).await;
                 continue;
             }
         };
@@ -276,6 +320,9 @@ async fn serve_gatt<C: Controller>(
             Ok(c) => c,
             Err(e) => {
                 log::error!("BLE accept failed: {:?}", e);
+                // Cool down so the host can refresh its BlueZ device cache /
+                // advertising state before we race another accept.
+                Timer::after(Duration::from_millis(350)).await;
                 continue;
             }
         };
@@ -284,6 +331,7 @@ async fn serve_gatt<C: Controller>(
             Ok(c) => c,
             Err(e) => {
                 log::error!("BLE GATT attach failed: {:?}", e);
+                Timer::after(Duration::from_millis(350)).await;
                 continue;
             }
         };
@@ -291,32 +339,21 @@ async fn serve_gatt<C: Controller>(
         log::info!("BLE connected");
 
         {
-            let (state, config) = {
-                let mut mc_opt = app_context.motor_controller.lock().await;
-                if let Some(mc) = mc_opt.as_mut() {
-                    (Some(mc.get_current_state()), Some(mc.get_config()))
-                } else {
-                    (None, None)
+            let state = app_context.load_snapshot();
+            set_compact_state(server, state.as_ref());
+            // Prefer scratchpad (heap-free); fall back to truncating stack encode.
+            let _ = crate::buffers::try_with_scratchpad(|buf| {
+                if let Ok(len) = serde_json_core::to_slice(&state.config, buf) {
+                    let _ = server.set(&server.ossm.config, &to_vec::<512>(&buf[..len]));
                 }
-            };
-            if let Some(state) = state {
-                set_compact_state(server, &state);
+            });
+            let pin_config = app_context.storage.pin();
+            let net_config = app_context.storage.net();
+            if let Ok(json) = serde_json_core::to_string::<_, 512>(&pin_config) {
+                let _ = server.set(&server.ossm.pin_config, &to_vec::<256>(json.as_bytes()));
             }
-            if let Some(config) = config {
-                if let Ok(json) = serde_json_core::to_string::<_, 1024>(&config) {
-                    let _ = server.set(&server.ossm.config, &to_vec::<512>(json.as_bytes()));
-                }
-            }
-            let mut sm = app_context.storage.lock().await;
-            if let Ok(pin_config) = sm.get_pin_configuration() {
-                if let Ok(json) = serde_json_core::to_string::<_, 512>(&pin_config) {
-                    let _ = server.set(&server.ossm.pin_config, &to_vec::<256>(json.as_bytes()));
-                }
-            }
-            if let Ok(net_config) = sm.get_network_configuration() {
-                if let Ok(json) = serde_json_core::to_string::<_, 512>(&net_config) {
-                    let _ = server.set(&server.ossm.net_config, &to_vec::<256>(json.as_bytes()));
-                }
+            if let Ok(json) = serde_json_core::to_string::<_, 512>(&net_config) {
+                let _ = server.set(&server.ossm.net_config, &to_vec::<256>(json.as_bytes()));
             }
         }
 
@@ -330,7 +367,7 @@ async fn serve_gatt<C: Controller>(
         .await;
 
         log::info!("BLE session ended, cooldown before next advertisement...");
-        Timer::after(Duration::from_millis(200)).await;
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
@@ -350,88 +387,76 @@ async fn handle_gatt_events<C: Controller>(
             }
             GattConnectionEvent::Gatt { event } => match event {
                 GattEvent::Write(write) => {
-                    let data = write.data();
+                    let data = write.data().to_vec();
                     let handle = write.handle();
 
+                    if let Ok(reply) = write.accept() {
+                        reply.send().await;
+                    }
+
                     if handle == server.ossm.config.handle {
-                        if let Ok(config) = serde_json::from_slice::<MotorControllerConfig>(data) {
-                            let applied = {
-                                let mut mc_opt = app_context.motor_controller.lock().await;
-                                if let Some(mc) = mc_opt.as_mut() {
-                                    mc.set_config(config.clone()).is_ok()
-                                } else {
-                                    false
-                                }
-                            };
+                        if let Ok(config) = serde_json::from_slice::<MotorControllerConfig>(&data) {
+                            let applied = app_context
+                                .enqueue_motion(crate::motion::MotionCommand::SetConfig(config.clone()))
+                                .await;
                             if applied {
-                                if let Ok(json) = serde_json_core::to_string::<_, 1024>(&config) {
-                                    let buf = to_vec::<512>(json.as_bytes());
-                                    let _ = server.set(&server.ossm.config, &buf);
-                                    let _ = chunked_notify_config(conn, server, json.as_bytes()).await;
-                                }
+                                let _ = crate::buffers::try_with_scratchpad(|buf| {
+                                    if let Ok(len) = serde_json_core::to_slice(&config, buf) {
+                                        let _ = server
+                                            .set(&server.ossm.config, &to_vec::<512>(&buf[..len]));
+                                    }
+                                });
                             }
                         }
                     } else if handle == server.ossm.paused.handle {
-                        if let Ok(control) = serde_json::from_slice::<PausedControl>(data) {
-                            let json_opt = {
-                                let mut mc_opt = app_context.motor_controller.lock().await;
-                                if let Some(mc) = mc_opt.as_mut() {
-                                    let mut config = mc.get_config();
-                                    if let Some(paused) = control.paused {
-                                        config.paused = paused;
+                        if let Ok(control) = serde_json::from_slice::<PausedControl>(&data) {
+                            let mut config = app_context.load_snapshot().config.clone();
+                            if let Some(paused) = control.paused {
+                                config.paused = paused;
+                            }
+                            // Accept both "position" (canonical) and "paused_position"
+                            // (config field name) for client compatibility.
+                            let park = control.position.or(control.paused_position);
+                            if let Some(position) = park {
+                                config.paused_position = position.clamp(0.0, 1.0);
+                            }
+                            if let Some(adjust) = control.adjust {
+                                config.paused_position =
+                                    (config.paused_position + adjust).clamp(0.0, 1.0);
+                            }
+                            if app_context
+                                .enqueue_motion(crate::motion::MotionCommand::SetConfig(config.clone()))
+                                .await
+                            {
+                                let _ = crate::buffers::try_with_scratchpad(|buf| {
+                                    if let Ok(len) = serde_json_core::to_slice(&config, buf) {
+                                        let _ = server
+                                            .set(&server.ossm.config, &to_vec::<512>(&buf[..len]));
                                     }
-                                    if let Some(position) = control.position {
-                                        config.paused_position = position.clamp(0.0, 1.0);
-                                    }
-                                    if let Some(adjust) = control.adjust {
-                                        config.paused_position =
-                                            (config.paused_position + adjust).clamp(0.0, 1.0);
-                                    }
-                                    let _ = mc.set_config(config.clone());
-                                    serde_json_core::to_string::<_, 1024>(&config).ok()
-                                } else {
-                                    None
-                                }
-                            };
-                            if let Some(json) = json_opt {
-                                let buf = to_vec::<512>(json.as_bytes());
-                                let _ = server.set(&server.ossm.config, &buf);
-                                let _ = chunked_notify_config(conn, server, json.as_bytes()).await;
+                                });
                             }
                         }
                     } else if handle == server.ossm.pin_config.handle {
-                        if let Ok(config) = serde_json::from_slice::<PinConfiguration>(data) {
+                        if let Ok(config) = serde_json::from_slice::<PinConfiguration>(&data) {
                             if config.modbus_timeout_ms <= 1000
                                 && config.modbus_scan_delay_us <= 200_000
                                 && config.modbus_inter_frame_delay_us <= 200_000
-                                && app_context
-                                    .storage
-                                    .lock()
-                                    .await
-                                    .set_pin_configuration(&config)
-                                    .is_ok()
                             {
+                                app_context.storage.set_pin(config.clone());
                                 if let Ok(json) = serde_json_core::to_string::<_, 512>(&config) {
                                     let _ = server.set(&server.ossm.pin_config, &to_vec::<256>(json.as_bytes()));
                                 }
                             }
                         }
                     } else if handle == server.ossm.net_config.handle {
-                        if let Ok(config) = serde_json::from_slice::<NetworkConfiguration>(data) {
-                            if app_context
-                                .storage
-                                .lock()
-                                .await
-                                .set_network_configuration(&config)
-                                .is_ok()
-                            {
-                                if let Ok(json) = serde_json_core::to_string::<_, 512>(&config) {
-                                    let _ = server.set(&server.ossm.net_config, &to_vec::<256>(json.as_bytes()));
-                                }
+                        if let Ok(config) = serde_json::from_slice::<NetworkConfiguration>(&data) {
+                            app_context.storage.set_net(config.clone());
+                            if let Ok(json) = serde_json_core::to_string::<_, 512>(&config) {
+                                let _ = server.set(&server.ossm.net_config, &to_vec::<256>(json.as_bytes()));
                             }
                         }
                     } else if handle == server.ossm.rpc.handle {
-                        if let Ok(request) = serde_json::from_slice::<WsMessage>(data) {
+                        if let Ok(request) = serde_json::from_slice::<WsMessage>(&data) {
                             let id = request.id.clone().unwrap_or(serde_json::Value::Null);
                             match rpc::dispatch_rpc(&request, app_context).await {
                                 RpcAction::Respond(json) => {
@@ -458,44 +483,12 @@ async fn handle_gatt_events<C: Controller>(
                             }
                         }
                     }
-
-                    if let Ok(reply) = write.accept() {
-                        reply.send().await;
-                    }
                 }
                 GattEvent::Read(read) => {
-                    let handle = read.handle();
-                    if handle == server.ossm.state.handle {
-                        let state = {
-                            let mut mc_opt = app_context.motor_controller.lock().await;
-                            mc_opt.as_mut().map(|mc| mc.get_current_state())
-                        };
-                        if let Some(state) = state {
-                            set_compact_state(server, &state);
-                        }
-                    } else if handle == server.ossm.config.handle {
-                        let config = {
-                            let mc_opt = app_context.motor_controller.lock().await;
-                            mc_opt.as_ref().map(|mc| mc.get_config())
-                        };
-                        if let Some(config) = config {
-                            if let Ok(json) = serde_json_core::to_string::<_, 1024>(&config) {
-                                let _ = server.set(&server.ossm.config, &to_vec::<512>(json.as_bytes()));
-                            }
-                        }
-                    } else if handle == server.ossm.pin_config.handle {
-                        if let Ok(pin_cfg) = app_context.storage.lock().await.get_pin_configuration() {
-                            if let Ok(json) = serde_json_core::to_string::<_, 512>(&pin_cfg) {
-                                let _ = server.set(&server.ossm.pin_config, &to_vec::<256>(json.as_bytes()));
-                            }
-                        }
-                    } else if handle == server.ossm.net_config.handle {
-                        if let Ok(net_cfg) = app_context.storage.lock().await.get_network_configuration() {
-                            if let Ok(json) = serde_json_core::to_string::<_, 512>(&net_cfg) {
-                                let _ = server.set(&server.ossm.net_config, &to_vec::<256>(json.as_bytes()));
-                            }
-                        }
-                    }
+                    // Reply with cached attribute values only. Mutating the
+                    // attribute table mid-Read (especially during BlueZ service
+                    // discovery) races the controller and has been observed to
+                    // kill WiFi. Values are refreshed on connect/write/notify.
                     if let Ok(reply) = read.accept() {
                         reply.send().await;
                     }
@@ -540,30 +533,25 @@ async fn push_telemetry(
             continue;
         }
 
-        let state = {
-            let mut mc = app_context.motor_controller.lock().await;
-            mc.as_mut().map(|mc| mc.get_current_state())
-        };
+        let state = app_context.load_snapshot();
 
-        if let Some(state) = state {
-            let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
-            if let Ok(len) = format_compact_state(&state, &mut *lease) {
-                match chunked_notify_state(conn, server, &lease[..len]).await {
-                    Ok(_) => {
-                        consecutive_errors = 0;
+        let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
+        if let Ok(len) = format_compact_state(state.as_ref(), &mut *lease) {
+            match chunked_notify_state(conn, server, &lease[..len]).await {
+                Ok(_) => {
+                    consecutive_errors = 0;
+                }
+                Err(trouble_host::Error::Disconnected)
+                | Err(trouble_host::Error::ChannelClosed) => {
+                    log::info!("BLE client disconnected during telemetry push");
+                    break;
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors % 10 == 1 {
+                        log::warn!("BLE state notify failed ({}/10): {:?}", consecutive_errors, e);
                     }
-                    Err(trouble_host::Error::Disconnected)
-                    | Err(trouble_host::Error::ChannelClosed) => {
-                        log::info!("BLE client disconnected during telemetry push");
-                        break;
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors % 10 == 1 {
-                            log::warn!("BLE state notify failed ({}/10): {:?}", consecutive_errors, e);
-                        }
-                        Timer::after(Duration::from_millis(15)).await;
-                    }
+                    Timer::after(Duration::from_millis(15)).await;
                 }
             }
         }

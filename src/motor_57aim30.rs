@@ -1,3 +1,4 @@
+
 use core::f32::consts::PI;
 
 use embassy_time::{with_timeout, Duration, Instant, Timer};
@@ -11,9 +12,7 @@ use rmodbus::{client::ModbusRequest, guess_response_frame_len, ModbusProto};
 
 use crate::context::AppContext;
 use crate::error::{FirmwareError, Result};
-use crate::motion::{
-    LoopStats, ModbusStats, MotorController, MotorControllerConfig, TimingWindowStats,
-};
+use crate::motion::{LoopStats, ModbusStats, MotorController, TimingWindowStats};
 use crate::motor::Motor;
 use crate::storage::PinConfiguration;
 
@@ -42,6 +41,7 @@ pub struct ModbusRTUMaster<'d> {
     inter_frame_delay: Duration,
     inter_frame_delay_override_us: u32,
     baudrate: u32,
+    timeout_symbols: u8,
 
     last_stats_window: Instant,
     current_successes: u32,
@@ -101,6 +101,7 @@ impl<'d> ModbusRTUMaster<'d> {
         rx_timeout_override_us: u32,
         inter_frame_delay_override_us: u32,
         baudrate: u32,
+        timeout_symbols: u8,
     ) -> Self {
         let timeout = Self::compute_timeout(baudrate, timeout_override_ms).unwrap();
         let rx_inter_byte_timeout =
@@ -122,6 +123,7 @@ impl<'d> ModbusRTUMaster<'d> {
             inter_frame_delay,
             inter_frame_delay_override_us,
             baudrate,
+            timeout_symbols,
             last_stats_window: Instant::now(),
             current_successes: 0,
             current_failures: 0,
@@ -153,31 +155,25 @@ impl<'d> ModbusRTUMaster<'d> {
     /// Default software inter-byte timeout for the `with_timeout()` guard in `uart_read_exactly`.
     ///
     /// This is the SOFTWARE deadline for each individual `read_async` call after the first byte
-    /// has been seen. It must be long enough to span the maximum gap between hardware UART FIFO
-    /// deliveries (triggered by FIFO threshold or FIFO idle timeout interrupts).
+    /// has been seen.
     ///
-    /// ### Root cause of the original 1750µs requirement (diagnosed via byte-timing instrumentation)
+    /// ### GDMA UHCI RX & Hardware Idle Timeout (`timeout_symbols`)
     ///
-    /// The Modbus response is read in TWO phases:
-    ///   1. `uart_read_exactly(&resp[..3])` — reads header to determine frame length
-    ///   2. `uart_read_exactly(&resp[3..len])` — reads the rest
+    /// With GDMA UHCI RX enabled (`UhciRx::read(dma_rx)`), the hardware DMA controller captures
+    /// incoming bytes continuously into a 256-byte DMA buffer. Because Modbus RTU response frames
+    /// (7–9 bytes) do not fill the DMA buffer, the DMA transfer completes when the UART hardware
+    /// triggers an `RX_TOUT` (RX FIFO idle timeout) interrupt after observing line silence of
+    /// `timeout_symbols` symbol times after the last received byte.
     ///
-    /// Between phases, there is a gap where `read_async` is un-armed (the re-arm gap). If the
-    /// HARDWARE FIFO idle timeout (`timeout_symbols`) fires during this window, its IRQ is
-    /// delivered to nobody. When `read_async` finally arms, it must wait for the NEXT hardware
-    /// timeout fire — adding `timeout_symbols × char_time` to `read_wait_us`. With the old
-    /// `timeout_symbols = 4` (348µs), this re-fire wait was close to the 350µs software timeout,
-    /// causing intermittent `rx_inter_byte_timeout` expiries.
-    ///
-    /// ### Correct fix
-    ///
-    /// Set `timeout_symbols` to ~9 symbols (~783µs) — see `init_uart_and_modbus`. This is:
-    ///   - Large enough that it does NOT fire during the normal re-arm gap (~0µs without logging)
-    ///   - Much less than the 750µs slave latency, so it never adds latency to the end-to-end cycle
-    ///   - Allows the SOFTWARE timeout here to match the Modbus spec t1.5 = 750µs (for >19200 baud)
+    /// At 115200 baud (1 symbol ≈ 86.8 µs), setting `timeout_symbols = 3` (260 µs) provides fast
+    /// end-of-frame detection without splitting variable-length frames. Furthermore, because the
+    /// hardware already waits `timeout_symbols` of silence on the wire before `UhciRx::read`
+    /// returns, we subtract that duration (`hardware_silence_us`) from the inter-frame delay
+    /// ($t_{3.5}$) so the bus is not kept silent twice. This restores full Modbus polling
+    /// performance (>350 UPS) while retaining zero dropped bytes under GDMA.
     fn get_default_rx_inter_byte_timeout(baudrate: u32) -> Result<Duration> {
         // Modbus RTU spec (>19200 bps): fixed t1.5 = 750µs.
-        // With correct hardware timeout_symbols=9 (783µs FIFO idle threshold),
+        // With correct hardware timeout_symbols=3 (260µs FIFO idle threshold),
         // the software timeout of 750µs is sufficient — no re-arm race occurs.
         match baudrate {
             9600 => Ok(Duration::from_micros(4000)),
@@ -241,9 +237,9 @@ impl<'d> ModbusRTUMaster<'d> {
                 0.0
             };
 
-            let round_trip = compute_timing_stats(&mut self.current_round_trip_us);
-            let slave_latency = compute_timing_stats(&mut self.current_slave_latency_us);
-            let rx_duration = compute_timing_stats(&mut self.current_rx_duration_us);
+            let round_trip = compute_timing_stats(self.current_round_trip_us.as_mut_slice());
+            let slave_latency = compute_timing_stats(self.current_slave_latency_us.as_mut_slice());
+            let rx_duration = compute_timing_stats(self.current_rx_duration_us.as_mut_slice());
 
             self.latest_stats = ModbusStats {
                 successful_requests: self.current_successes,
@@ -286,10 +282,12 @@ impl<'d> ModbusRTUMaster<'d> {
             FirmwareError::Uart("dma tx start")
         })?;
         tx_transfer.wait_for_done().await;
-        let (tx_res, uhci_tx, dma_tx) = tx_transfer.wait();
+        let (tx_res, mut uhci_tx, dma_tx) = tx_transfer.wait();
+        let flush_res = uhci_tx.uart_tx.flush_async().await;
         self.uhci_tx = Some(uhci_tx);
         self.dma_tx = Some(dma_tx);
         tx_res.map_err(|_| FirmwareError::Uart("dma tx err"))?;
+        flush_res.map_err(|_| FirmwareError::Uart("dma tx flush"))?;
         Ok(())
     }
 
@@ -303,13 +301,12 @@ impl<'d> ModbusRTUMaster<'d> {
 
         if let Some(ref mut pin) = self.de_re {
             pin.set_high();
-            Delay::new().delay_micros(10);
+            Delay::new().delay_micros(2);
         }
 
         self.dma_write_all(req).await?;
 
         if let Some(ref mut pin) = self.de_re {
-            Delay::new().delay_micros(150);
             pin.set_low();
         }
         let t2 = Instant::now();
@@ -318,6 +315,8 @@ impl<'d> ModbusRTUMaster<'d> {
         let mut dma_rx = self.dma_rx.take().ok_or(FirmwareError::Uart("dma rx taken"))?;
         let cap = dma_rx.capacity();
         dma_rx.set_length(cap);
+        let expected_len = expected_modbus_response_len(req);
+        configure_uhci0_pkt_thres(expected_len);
 
         let mut rx_transfer = uhci_rx.read(dma_rx).map_err(|(_, rx, buf)| {
             self.uhci_rx = Some(rx);
@@ -327,6 +326,7 @@ impl<'d> ModbusRTUMaster<'d> {
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let wait_res = with_timeout(remaining, rx_transfer.wait_for_done()).await;
+        let _t3 = Instant::now();
         if wait_res.is_err() {
             let (uhci_rx, dma_rx) = rx_transfer.cancel();
             self.uhci_rx = Some(uhci_rx);
@@ -355,10 +355,39 @@ impl<'d> ModbusRTUMaster<'d> {
         }
 
         let t5 = Instant::now();
-        Timer::after(self.inter_frame_delay).await;
+        #[cfg(feature = "byte-timing-diag")]
+        if self.current_successes % 200 == 1 {
+            log::info!(
+                "TIME_BREAKDOWN: tx={}us rx_wait={}us rx_post={}us",
+                t2.duration_since(t0).as_micros(),
+                _t3.duration_since(t2).as_micros(),
+                t5.duration_since(_t3).as_micros()
+            );
+        }
 
-        let round_trip_us = t5.duration_since(t0).as_micros().min(u16::MAX as u64) as u16;
-        let slave_latency_us = t5.duration_since(t2).as_micros().min(u16::MAX as u64) as u16;
+        // When UHCI DMA read completes, the UART hardware has already observed line silence of
+        // `timeout_symbols` symbol times after the last response byte arrived on the wire.
+        let hardware_silence_us =
+            ((self.timeout_symbols as u64 * 10_000_000) / self.baudrate as u64) as u32;
+
+        let remaining_ifd_us = self
+            .inter_frame_delay
+            .as_micros()
+            .saturating_sub(hardware_silence_us as u64);
+        if remaining_ifd_us > 0 {
+            Delay::new().delay_micros(remaining_ifd_us as u32);
+        }
+
+        let round_trip_us = t5
+            .duration_since(t0)
+            .as_micros()
+            .saturating_sub(hardware_silence_us as u64)
+            .min(u16::MAX as u64) as u16;
+        let slave_latency_us = t5
+            .duration_since(t2)
+            .as_micros()
+            .saturating_sub(hardware_silence_us as u64)
+            .min(u16::MAX as u64) as u16;
         let rx_duration_us = 0;
 
         #[cfg(feature = "byte-timing-diag")]
@@ -455,7 +484,10 @@ impl<'d> ModbusRTUMaster<'d> {
     }
 
     pub fn set_baudrate(&mut self, baudrate: u32) -> Result<()> {
-        let config = Config::default().with_baudrate(baudrate);
+        let rx_config = esp_hal::uart::RxConfig::default().with_timeout(self.timeout_symbols);
+        let config = Config::default()
+            .with_baudrate(baudrate)
+            .with_rx(rx_config);
         if let Some(ref mut tx) = self.uhci_tx {
             tx.uart_tx
                 .apply_config(&config)
@@ -465,6 +497,17 @@ impl<'d> ModbusRTUMaster<'d> {
             rx.uart_rx
                 .apply_config(&config)
                 .map_err(|_| FirmwareError::Uart("baud rx"))?;
+        }
+        configure_uart1_rx_idle_threshold(self.timeout_symbols);
+        #[cfg(feature = "esp32c6")]
+        unsafe {
+            let u1 = &*esp_hal::peripherals::UART1::ptr();
+            log::info!(
+                "SET_BAUD_REGS: rx_idle_thrhd={} rx_tout_thrhd={} rx_tout_en={}",
+                u1.idle_conf().read().rx_idle_thrhd().bits(),
+                u1.tout_conf().read().rx_tout_thrhd().bits(),
+                u1.tout_conf().read().rx_tout_en().bit(),
+            );
         }
         self.baudrate = baudrate;
         let timeout = Self::compute_timeout(baudrate, self.timeout_override_ms)?;
@@ -689,12 +732,11 @@ fn init_uart_and_modbus(
     let de_pin = unsafe { AnyPin::steal(pin_config.modbus_de_re as u8) };
 
     let de_re = Output::new(de_pin, Level::Low, OutputConfig::default());
-    let rx_timeout_us = if pin_config.modbus_rx_timeout_us == 0 {
-        1750
+    let timeout_symbols = if pin_config.modbus_rx_timeout_us == 0 {
+        2u8
     } else {
-        pin_config.modbus_rx_timeout_us
+        (pin_config.modbus_rx_timeout_us / 87).clamp(2, 127) as u8
     };
-    let timeout_symbols = (rx_timeout_us / 87).clamp(9, 127) as u8;
     let rx_config = esp_hal::uart::RxConfig::default().with_timeout(timeout_symbols);
     let uart_config = Config::default()
         .with_baudrate(TARGET_BAUD_RATE)
@@ -718,6 +760,8 @@ fn init_uart_and_modbus(
 
     let (uhci_rx, uhci_tx) = uhci.into_async().split();
 
+    configure_uart1_rx_idle_threshold(timeout_symbols);
+
     Ok(ModbusRTUMaster::new(
         uhci_rx,
         uhci_tx,
@@ -729,36 +773,58 @@ fn init_uart_and_modbus(
         pin_config.modbus_rx_timeout_us,
         pin_config.modbus_inter_frame_delay_us,
         TARGET_BAUD_RATE,
+        timeout_symbols,
     ))
+}
+
+fn configure_uart1_rx_idle_threshold(symbols: u8) {
+    let bits = (symbols as u16).clamp(2, 1023);
+    unsafe {
+        let regs = &*esp_hal::peripherals::UART1::ptr();
+        regs.idle_conf()
+            .modify(|_, w| w.rx_idle_thrhd().bits(bits));
+        #[cfg(feature = "esp32c6")]
+        regs.tout_conf()
+            .modify(|_, w| w.rx_tout_thrhd().bits(bits));
+    }
+}
+
+fn configure_uhci0_pkt_thres(len: u16) {
+    unsafe {
+        let u0 = &*esp_hal::peripherals::UHCI0::ptr();
+        u0.pkt_thres().modify(|_, w| w.pkt_thrs().bits(len));
+    }
+}
+
+fn expected_modbus_response_len(req: &[u8]) -> u16 {
+    if req.len() >= 6 {
+        match req[1] {
+            0x03 | 0x04 => {
+                let qty = ((req[4] as u16) << 8) | (req[5] as u16);
+                5 + qty * 2
+            }
+            0x06 | 0x10 => 8,
+            _ => 128,
+        }
+    } else {
+        128
+    }
 }
 
 pub async fn run_motor(
     app_context: AppContext,
+    motion_consumer: crate::motion::CommandConsumer,
     uart_periph: esp_hal::peripherals::UART1<'static>,
     uhci_periph: esp_hal::peripherals::UHCI0<'static>,
     dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
     pin_config: PinConfiguration,
 ) -> Result<()> {
-    let motor_config = {
-        let mut sm = app_context.storage.lock().await;
-        match sm.get_motor_config() {
-            Ok(config) => {
-                log::info!("Loaded motor config from NVS");
-                config
-            }
-            Err(_) => {
-                log::info!("No motor config in NVS, using default");
-                let default_config = MotorControllerConfig::default();
-                let _ = sm.set_motor_config(&default_config);
-                default_config
-            }
-        }
-    };
+    let motor_config = app_context.storage.motor_config();
+    log::info!("Using motor config from storage cache");
 
-    {
-        let mut mc_lock = app_context.motor_controller.lock().await;
-        *mc_lock = Some(MotorController::new(motor_config.clone()));
-    }
+    let mut mc = MotorController::new(motor_config, motion_consumer);
+    mc.flush_snapshot();
+    app_context.update_snapshot(mc.snapshot());
 
     log::info!("Waiting 3s for WiFi/BLE initialization to settle before scanning motor...");
     Timer::after_millis(3000).await;
@@ -767,6 +833,17 @@ pub async fn run_motor(
         init_uart_and_modbus(uart_periph, uhci_periph, dma_channel, &pin_config)?,
         pin_config.modbus_scan_delay_us,
     );
+
+    #[cfg(feature = "esp32c6")]
+    unsafe {
+        let u1 = &*esp_hal::peripherals::UART1::ptr();
+        log::info!(
+            "DIAG_REGS: rx_idle_thrhd={} rx_tout_thrhd={} rx_tout_en={}",
+            u1.idle_conf().read().rx_idle_thrhd().bits(),
+            u1.tout_conf().read().rx_tout_thrhd().bits(),
+            u1.tout_conf().read().rx_tout_en().bit(),
+        );
+    }
 
     let mut modbus_ok = false;
     for init_attempt in 1..=2 {
@@ -830,11 +907,9 @@ pub async fn run_motor(
         );
         loop {
             Timer::after_millis(100).await;
-            let mut mc_lock = app_context.motor_controller.lock().await;
-            if let Some(mc) = mc_lock.as_mut() {
-                mc.set_motor_connected(false);
-                let _ = mc.get_current_state();
-            }
+            mc.set_motor_connected(false);
+            let _ = mc.compute_cycle();
+            app_context.update_snapshot(mc.snapshot());
         }
     }
 
@@ -842,10 +917,12 @@ pub async fn run_motor(
     motor.homing().await?;
 
     let current_position = motor.read_position().await.unwrap_or(0.0);
-    if let Some(mc) = app_context.motor_controller.lock().await.as_mut() {
-        mc.set_motor_connected(true);
-        let _ = mc.sync_to_position(motor.pos_min(), motor.pos_max(), current_position);
-    }
+    mc.set_motor_connected(true);
+    let _ = mc.sync_to_position(motor.pos_min(), motor.pos_max(), current_position);
+    mc.flush_snapshot();
+    mc.reset_cycle_clock();
+    app_context.update_snapshot(mc.snapshot());
+
     let _ = motor.set_max_power(0.6).await;
     let _ = motor.set_acceleration(4000.0).await;
     let _ = motor.set_position_ring_ratio(3000.0).await;
@@ -858,20 +935,19 @@ pub async fn run_motor(
         let log_stats = Instant::now().duration_since(last_stats_log) >= Duration::from_secs(5);
 
         let modbus_stats = motor.get_stats();
-        let target = {
-            let mut mc_lock = app_context.motor_controller.lock().await;
-            if let Some(mc) = mc_lock.as_mut() {
-                mc.modbus_stats = modbus_stats.clone();
-                mc.motor_connected = modbus_stats.successful_requests > 0;
-                let result = mc.compute_cycle();
-                if log_stats {
-                    pending_stats = Some(mc.last_loop_stats);
-                }
-                Some(result)
-            } else {
-                None
-            }
+        mc.modbus_stats = modbus_stats;
+        mc.motor_connected = modbus_stats.successful_requests > 0;
+        let (position, speed) = mc.compute_cycle();
+        let stats_opt = if log_stats {
+            Some(mc.last_loop_stats)
+        } else {
+            None
         };
+        app_context.update_snapshot(mc.snapshot());
+
+        if let Some(st) = stats_opt {
+            pending_stats = Some(st);
+        }
 
         if let Some(st) = pending_stats.take() {
             last_stats_log = Instant::now();
@@ -887,32 +963,23 @@ pub async fn run_motor(
             }
         }
 
-        match target {
-            Some((position, speed)) => {
-                if let Err(e) = motor.write_position(position, speed).await {
-                    log::warn!("Motor write error: {}, retrying...", e);
-                    Timer::after_millis(10).await;
-                    continue;
-                }
-                if let Err(e) = motor.cycle().await {
-                    log::warn!("Motor cycle error: {}, retrying...", e);
-                    Timer::after_millis(10).await;
-                    continue;
-                }
-            }
-            None => {
-                log::error!("Motor controller lost, stopping motor loop");
-                break;
-            }
+        if let Err(e) = motor.write_position(position, speed).await {
+            log::warn!("Motor write error: {}, retrying...", e);
+            Timer::after_millis(10).await;
+            continue;
+        }
+        if let Err(e) = motor.cycle().await {
+            log::warn!("Motor cycle error: {}, retrying...", e);
+            Timer::after_millis(10).await;
+            continue;
         }
     }
-
-    Ok(())
 }
 
 #[cfg(feature = "esp32s3")]
 pub fn run_motor_blocking(
     app_context: AppContext,
+    motion_consumer: crate::motion::CommandConsumer,
     uart_periph: esp_hal::peripherals::UART1<'static>,
     uhci_periph: esp_hal::peripherals::UHCI0<'static>,
     dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
@@ -923,17 +990,17 @@ pub fn run_motor_blocking(
 
     let executor = CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(|spawner| {
-        spawner
-            .spawn(
-                core1_motor_task(
-                    app_context,
-                    uart_periph,
-                    uhci_periph,
-                    dma_channel,
-                    pin_config,
-                )
-                .unwrap(),
-            );
+        spawner.spawn(
+            core1_motor_task(
+                app_context,
+                motion_consumer,
+                uart_periph,
+                uhci_periph,
+                dma_channel,
+                pin_config,
+            )
+            .unwrap(),
+        );
     });
 }
 
@@ -941,6 +1008,7 @@ pub fn run_motor_blocking(
 #[embassy_executor::task]
 async fn core1_motor_task(
     app_context: AppContext,
+    motion_consumer: crate::motion::CommandConsumer,
     uart_periph: esp_hal::peripherals::UART1<'static>,
     uhci_periph: esp_hal::peripherals::UHCI0<'static>,
     dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
@@ -948,6 +1016,7 @@ async fn core1_motor_task(
 ) {
     if let Err(e) = run_motor(
         app_context,
+        motion_consumer,
         uart_periph,
         uhci_periph,
         dma_channel,
@@ -958,3 +1027,4 @@ async fn core1_motor_task(
         log::error!("Motor task on Core 1 failed: {}", e);
     }
 }
+

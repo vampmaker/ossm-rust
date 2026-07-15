@@ -1033,7 +1033,7 @@ const statusColor = computed(() => {
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">RX inter-byte (µs) <span class="text-gray-400">0 = Auto (1750µs @ 115200)</span></label>
+                <label class="text-xs text-gray-500">RX inter-byte (µs) <span class="text-gray-400">0 = Auto (750µs @ 115200)</span></label>
                 <input
                   v-model.number="modbusRxTimeoutUs"
                   type="number"

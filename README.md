@@ -68,7 +68,7 @@ Next, connect your ESP32 development board to the MAX3485 module and the motor's
 | GPIO 20 | --> | MAX3485 Module (DE / RE) | Controls data transmission direction |
 
 > [!NOTE]
-> **About GPIO pins**: GPIO 18, 19, and 20 are the default pins on ESP32-C6. On ESP32-S3 boards (where pins 19 and 20 are reserved for USB JTAG), or if you connect to different pins, don't worry! The firmware has an automatic pin detection feature that finds your connections and saves them automatically. You can also view or change pins anytime using the web interface or serial commands.
+> **About GPIO pins**: GPIO 18, 19, and 20 are the default Modbus pins in firmware NVS (same defaults on both chips). On ESP32-S3 boards, pins 19 and 20 are often reserved for USB Serial/JTAG — wire Modbus TX/RX/DE-RE to free GPIOs and set them via the web UI, serial CLI (`set-pin-modbus-*`), or the flasher config panel. There is **no automatic GPIO pin detection**; only Modbus baud rate / slave ID scanning runs at boot when the motor does not respond at `115200`.
 
 ### Step 3: Powering the ESP32 Board
 
@@ -87,59 +87,84 @@ You don't need to build the code yourself—pre-compiled firmware is provided in
 The firmware is built on **`esp-hal`** (bare-metal) with **Embassy** async and **`esp-rtos`** for task scheduling, targeting `no_std`. Both targets are supported via cargo aliases defined in `.cargo/config.toml`:
 
 ```bash
-# ESP32-C6 (RISC-V) — builds with the standard Rust nightly toolchain
-cargo b-c6 --release
-
-# ESP32-S3 (Xtensa) — requires the Espressif `esp` toolchain
-source ~/export-esp.sh
-RUSTUP_TOOLCHAIN=esp cargo b-s3 --release
+# Both targets use the Espressif `esp` channel pinned in rust-toolchain.toml
+cargo b-c6 --release   # ESP32-C6 (RISC-V)
+cargo b-s3 --release   # ESP32-S3 (Xtensa)
 ```
 
-Install the `esp` toolchain with [espup](https://github.com/esp-rs/espup): `espup install --targets esp32s3`.
+Install the toolchain with [espup](https://github.com/esp-rs/espup): `espup install --targets esp32c6,esp32s3` (then `source ~/export-esp.sh` if your shell does not pick up `esp` automatically).
 
 To build everything (frontend, flasher, both firmware targets) and produce merged flash images:
 ```bash
 ./scripts/release.sh
 ```
 
-The firmware automatically adapts its pin layout based on the selected MCU.
+Chip selection is via Cargo features / aliases (`esp32c6` / `esp32s3`). Default Modbus GPIO numbers are the same for both; change them in NVS if your board wiring differs.
 
 ## Part 3: Flashing the Firmware
 
-You don't need to be a software programmer or build code from source! Pre-compiled binary files are ready for you in the **Releases** section of this repository. We also provide a built-in standalone web flasher (`flasher.html`) that runs directly inside your web browser without installing any software!
+You don't need to build from source. Pre-compiled **merged** flash images (`ossm-esp32c6.bin` / `ossm-esp32s3.bin`) are in the repository **Releases**, along with a standalone browser flasher (`flasher.html`) that uses the [Web Serial API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API) — no command-line tools required.
 
 > [!IMPORTANT]
-> **Use the Native JTAG Port!**
-> If your ESP32 development board has **two** USB-C ports (often labeled "USB", "Native", or "JTAG" vs "UART", "COM", or "CP2102"), **always plug your USB cable into the Native JTAG / USB port**, instead of the USB-to-UART converter port. The native JTAG port communicates faster and works directly with your browser without requiring extra driver installations!
+> **Use the Native USB / JTAG Port!**
+> If your ESP32 board has **two** USB-C ports (often labeled "USB", "Native", or "JTAG" vs "UART", "COM", or "CP2102"), **always plug into the Native JTAG / USB port**. That port talks to the chip directly and works with Chrome / Edge without extra USB–UART drivers.
 
-### Step-by-Step Flashing Guide
+### What the flasher looks like
 
-1.  Download and extract the latest release package (`.zip`) from the **Releases** page of this GitHub repository.
-2.  Connect your ESP32-C6 or ESP32-S3 board to your computer using a USB-C data cable (remembering to use the **Native JTAG port** if your board has two ports!).
-3.  Open `flasher.html` directly in a browser that supports Web Serial (Google Chrome, Microsoft Edge, or Opera) by double-clicking the file or dragging it into your browser tab.
-4.  Click the **"Connect Device"** button. A browser popup will appear asking you to select the serial port for your ESP32.
+`flasher.html` is a single page with:
+
+| Area | Purpose |
+| --- | --- |
+| **Status bar** (top) | Connection state plus **Connect**, **Monitor**, **Stop**, **Reset**, and **Disconnect** |
+| **Flash Firmware** (left) | Drop / pick a `.bin`, optional flash address (default `0x0`), **Flash Firmware** |
+| **Device Configuration** (right) | WiFi, Modbus GPIO pins, Modbus timing, BLE — then **Send Configuration** |
+| **Console** (bottom left) | Flasher progress and ACK messages |
+| **Serial** (bottom right) | Live device UART output (boot logs, WiFi IP, motor messages) |
+
+Settings you enter are remembered in the browser (`localStorage` key `ossm-flasher-device-config-v1`) so the next visit can reuse them. **Reset to defaults** clears the form back to factory pin / timing defaults.
+
+### Step-by-step: flash
+
+1.  Download and extract the latest release package (`.zip`) from **Releases**.
+2.  Connect the ESP32-C6 or ESP32-S3 with a USB-C **data** cable on the **Native USB / JTAG** port.
+3.  Open `flasher.html` in **Google Chrome** or **Microsoft Edge** (Web Serial; desktop browsers only — not Safari / Firefox / most mobile browsers). Double-click the file or drag it into a tab. A file URL is fine; no local web server is required.
+4.  Click **Connect** in the status bar. Choose your ESP32 serial port in the browser picker.
     > [!TIP]
-    > **How do I know which serial port belongs to my device?**
-    > If you see multiple COM ports or serial devices in the list and aren't sure which one is your ESP32, use this simple **plug-and-unplug test**:
-    > 1. Look at the current list of ports in the popup, then close or cancel the popup.
-    > 2. **Unplug** the USB cable of your ESP32 board from your computer.
-    > 3. Click **"Connect Device"** again and see which port **disappeared**. That is your device!
-    > 4. Close the popup, **plug your ESP32 back in**, click **"Connect Device"** again, select the port that just **reappeared**, and click **Connect**.
-5.  In the flasher interface, select or drag-and-drop the firmware binary file matching your chip model (e.g., `ossm-esp32c6.bin` for ESP32-C6 or `ossm-esp32s3.bin` for ESP32-S3). The flasher automatically configures the correct flash address offset (`0x0`).
-6.  Click the **"Flash Firmware"** button to start flashing.
-7.  Wait for the progress bar to reach 100% and the log to indicate that flashing is complete.
+    > **Which port is my board?**
+    > If several ports appear, use a quick plug test: note the list → cancel → **unplug** the ESP32 → **Connect** again and see which port vanished → plug back in → **Connect** and select the port that reappears.
+5.  Under **Flash Firmware**, drag-and-drop (or browse for) the matching merged image:
+    - ESP32-C6 → `ossm-esp32c6.bin`
+    - ESP32-S3 → `ossm-esp32s3.bin`
+    Leave **Flash address** at `0x0` unless you know you need another offset (merged release images are written from `0x0`).
+6.  Click **Flash Firmware**. Watch the progress bar and the **Console** panel (`Flash complete` / device reset).
+7.  When flashing finishes, the flasher hard-resets the chip and the status becomes **Flash complete**. You usually **do not** need to Connect again before configuration — the USB port stays open.
+
+> [!NOTE]
+> **Connect** enters the ROM bootloader (needed for flashing). After a successful flash, the tool leaves bootloader mode so you can configure and monitor the running firmware on the same page.
 
 ## Part 4: Network & Device Configuration
 
-After flashing, you need to configure the device to connect to your home WiFi network and set up your RS-485 Modbus pins. You can do this directly within the same web flasher using its convenient graphical interface!
+Stay on the same `flasher.html` page after flashing. Fill in **Device Configuration** (right column), then click **Send Configuration**.
 
-1.  Keep the ESP32 connected to your computer and stay on the `flasher.html` page.
-2.  If disconnected after flashing, click **"Connect Device"** again and select your serial port.
-3.  In the **"Step 2: Post-Flash Device Configuration"** panel, enter your home WiFi network name (SSID) and password into the input fields. You can also review or adjust Modbus GPIO pins and BLE settings.
-4.  Click the **"Send Configuration"** button. The flasher will automatically program your settings and reboot the ESP32.
-5.  The device will boot up and connect to your WiFi network. In the integrated terminal monitor at the bottom of the page, you will see a log message indicating it has connected and received an IP address. **Note down this IP address!** You will need it to open the control interface.
+### Fields
 
-**Note on Motor Initialization**: When the firmware boots up, it automatically talks to your motor. If standard communication fails, it intelligently scans across different speeds (baud rates) and device IDs. If it finds a motor running at a different speed, it will automatically adjust the motor to the standard speed (`115200` baud) and print a message in the log asking you to power-cycle the motor. If you see this, simply unplug the 24V motor power for 3 seconds and plug it back in!
+| Section | What to set |
+| --- | --- |
+| **WiFi** | Toggle **Enable WiFi**. When enabled, enter SSID and password. Disable WiFi if you will use BLE / USB-only. |
+| **GPIO Pins** | Modbus **TX**, **RX**, and **DE/RE** (defaults `18` / `19` / `20`). Change these if your wiring differs (especially on ESP32-S3 where 19/20 may be USB). |
+| **Motor / Modbus** | Optional timing: read timeout (ms), RX inter-byte (µs), inter-frame quiet (µs), scan delay (µs). Leave at `0` for firmware auto defaults (at 115200: **10 ms** frame timeout, **750 µs** inter-byte, **350 µs** inter-frame). Baud rate `115200` and device ID `1` are fixed in the UI. |
+| **BLE** | **Enable Bluetooth Low Energy (BLE)** — leave on unless you want BLE off. |
+
+### Send Configuration
+
+1.  Keep USB connected. Status should be **Flash complete**, **Connected to …**, or **Configuration complete** (those states enable **Send Configuration**). If you previously **Disconnect**ed, click **Connect** again first.
+2.  Click **Send Configuration**. The flasher resets the device, waits for boot, then sends UART CLI commands (`set-wifi-*`, `set-pin-modbus-*`, `set-modbus-*`, `set-ble-enabled`, then `reset`) and waits for each ACK in **Console**.
+3.  After a successful send, it automatically starts **Serial** monitoring. Look for WiFi association and a line like `http://<hostname>.local` / an assigned IP. **Copy the IP** (or use `http://ossm.local` if mDNS works on your network) to open the control UI later.
+4.  Use **Stop** to pause monitoring, **Monitor** to attach again, or **Reset** to pulse the chip without sending config. **Disconnect** releases the Web Serial port.
+
+If configuration fails (timeout waiting for ACK), check **Console** / **Serial**, ensure you are on the Native USB port, then **Connect** (if needed) and try **Send Configuration** again.
+
+**Note on Motor Initialization**: On every boot the firmware talks to the servo over Modbus. If the motor does not answer at `115200`, the firmware scans other baud rates / slave IDs. If it finds the motor on a different baud rate, it rewrites the drive to `115200` and asks you (in the serial log) to power-cycle the **motor's 24V** supply — unplug motor power for ~3 seconds, then plug it back in.
 
 ## Part 5: Usage
 
@@ -153,12 +178,12 @@ Example: `http://192.168.1.123` or `http://ossm.local`
 
 Key interface features include:
 - **Toggleable Real-Time Motor Position Diagram**: Visualizes the full stroke range (`0% – 100%`), physical hardware limits (`pos_min` / `pos_max`), active stroke window with distinct **Left Limit** and **Right Limit** boundaries, and an animated puck showing live motor position at 30 FPS. Can be toggled on or off using the Activity icon in the header, with toggle state persisted across browser sessions.
-- **Resilient High-Frequency Live Telemetry (`WsDataManager`)**: Uses a single-owner WebSocket client (`client.ts`) to stream real-time motor updates and loop statistics (`ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, `dt_mdev_ms`) at up to **30 FPS (`33ms`)** over WebSocket or BLE. On the firmware side, WebSocket sessions use **split asynchronous RX/TX tasks** (`edge_nal::TcpSplit`) and heap-allocated string payloads (`alloc::string::String`) backed by a **4-buffer shared pool (`NET_BUFFER_POOL`)**, preventing buffer starvation or connection drops when concurrent HTTP REST requests arrive during active streaming.
+- **Resilient High-Frequency Live Telemetry (`WsDataManager`)**: Uses a single-owner WebSocket client (`client.ts`) to stream real-time motor updates and loop statistics (`ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, `dt_mdev_ms`) at up to **30 FPS (`33ms`)** over WiFi WebSocket (`/ws/command`). BLE live telemetry uses a separate path (`ble.ts` / GATT `CHAR_STATE` notifications), not this WebSocket manager. On the firmware side, WebSocket sessions use **split asynchronous RX/TX tasks** (`edge_nal::TcpSplit`) and heap-allocated string payloads backed by a **4-buffer shared pool (`NET_BUFFER_POOL`)**, preventing buffer starvation when concurrent HTTP REST requests arrive during active streaming.
 - **Interactive Motion Control & Spline Editor**: Adjust BPM (speed), stroke depth, top/bottom depth anchoring, stroke reversal, pause/resume modes, or design custom periodic trajectories with interactive spline control points.
 
 ### Serial Commands
 
-You can also control the motor using the serial monitor. Here is a list of available commands. This is useful for testing and debugging.
+You can also drive the device over USB serial (115200 baud, `\r\n`). In `flasher.html`, use the **Serial** panel (or **Monitor**) for interactive CLI; the **Console** panel is for flash/config tool messages only. The same commands work in any serial terminal.
 
 ```
 help                           - Show this help message
@@ -382,8 +407,8 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 *   `modbus_tx` (number): GPIO pin number assigned to Modbus TX (DI).
 *   `modbus_rx` (number): GPIO pin number assigned to Modbus RX (RO).
 *   `modbus_de_re` (number): GPIO pin number assigned to Modbus DE/RE control.
-*   `modbus_timeout_ms` (number): Modbus per-read timeout in milliseconds (`0` = auto based on baud rate: 15ms @ 115200 baud).
-*   `modbus_rx_timeout_us` (number): Modbus RX inter-byte timeout ($t_{1.5}$) in microseconds (`0` = auto: 1750µs @ 115200 baud to accommodate slave MCU response jitter without mid-frame timeouts).
+*   `modbus_timeout_ms` (number): Modbus per-read timeout in milliseconds (`0` = auto based on baud rate: **10ms** @ 115200 baud, max `1000`).
+*   `modbus_rx_timeout_us` (number): Modbus RX inter-byte timeout ($t_{1.5}$) in microseconds (`0` = auto: **750µs** @ 115200 baud per Modbus RTU for >19200 bps).
 *   `modbus_scan_delay_us` (number): Modbus scan inter-probe delay in microseconds (`0` = use Modbus t3.5 timing only, up to `200000`).
 *   `modbus_inter_frame_delay_us` (number): Modbus inter-frame quiet interval ($t_{3.5}$) in microseconds (`0` = auto based on baud rate: 350µs @ 115200 baud, enabling <3ms total end-to-end request-response cycle time for >300 Hz position updates).
 
@@ -398,7 +423,7 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 
 *   **Method:** `POST`
 *   **Description:** Triggers a soft reset and restarts the ESP32 microcontroller.
-*   **Response Body:** `"Restarting device"`
+*   **Response Body:** `{"ok":true}`
 
 #### `GET /ws/command`
 
@@ -473,8 +498,9 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
   "jsonrpc": "2.0",
   "method": "set-config",
   "params": {
-    "motion": { ... },
-    "driver": { ... }
+    "bpm": 60,
+    "depth": 0.8,
+    "paused": false
   },
   "id": 6
 }
@@ -490,10 +516,10 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
   "id": 7
 }
 ```
-        *   When subscribed, the server periodically pushes lightweight JSON-RPC notifications of the form `{"jsonrpc": "2.0", "method": "state", "params": { ...StateResponse... }}`. Supports intervals down to `20ms` (`50 FPS`).
-        *   **Asynchronous RX/TX Architecture**: WebSocket sessions split the underlying TCP connection into separate read (`ws_recv`) and write (`ws_send`) tasks communicating via an Embassy channel with heap-allocated strings (`alloc::string::String`). High-frequency state pushes never block or delay incoming JSON-RPC command processing.
-        *   **Compact GATT vs. Full Push State**: Over Bluetooth Low Energy (BLE), direct GATT reads of the state characteristic (`CHAR_STATE`) return a compact representation (<120 bytes) to fit cleanly within a single BLE ATT packet without truncation. Full state payloads (including loop telemetry and history arrays) are streamed via `subscribe-state` push notifications.
-        *   **Idle Auto-Disconnect**: To conserve device memory and TCP connection handler slots (`HANDLER_TASKS`), the embedded web interface automatically disconnects the WebSocket after 3 seconds of inactivity when no active listeners remain.
+        *   When subscribed, the server periodically pushes lightweight JSON-RPC notifications of the form `{"jsonrpc": "2.0", "method": "state", "params": { ...StateResponse... }}`. Supports intervals down to `20ms` (`50 FPS`). Re-sending `subscribe-state` adjusts the interval without unsubscribing first.
+        *   **Asynchronous RX/TX Architecture**: WebSocket sessions split the underlying TCP connection into separate read (`ws_recv`) and write (`ws_send`) tasks communicating via an Embassy channel with heap-allocated strings. High-frequency state pushes never block or delay incoming JSON-RPC command processing.
+        *   **BLE Telemetry**: GATT reads/notifications on `CHAR_STATE` use a **compact** JSON subset (chunked when needed). Full `StateResponse` (loop telemetry, history arrays, etc.) is available via JSON-RPC `get-state` on `CHAR_RPC`. BLE `subscribe-state` pushes the compact format on `CHAR_STATE`, not the full WiFi WebSocket payload.
+        *   **Idle Auto-Disconnect**: To conserve device memory and WebSocket session slots (`WS_MAX` = 3 concurrent), the embedded web interface automatically disconnects the WebSocket after 3 seconds of inactivity when no active listeners remain.
         *   **Persistent Position Diagram Toggle**: The UI remembers the visibility toggle state of the Motor Position Diagram in browser `localStorage`.
     *   **Unsubscribe State**: Stops periodic state pushing.
 ```json

@@ -34,6 +34,7 @@ from rich.live import Live
 import httpx2
 import serial
 
+
 def load_env():
     """Loads environment variables from .env file in workspace root."""
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
@@ -41,6 +42,7 @@ def load_env():
         load_dotenv(env_path)
     else:
         load_dotenv()
+
 
 load_env()
 
@@ -50,6 +52,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
 
 # BLE UUIDs
 class BleUUID(StrEnum):
@@ -80,6 +83,7 @@ class BleChunkReassembler:
     Remaining bytes are the payload fragment. Fragments are concatenated
     in index order once all chunks arrive.
     """
+
     def __init__(self):
         self._chunks: dict[int, bytes] = {}
         self._total: int = 0
@@ -107,7 +111,9 @@ class BleChunkReassembler:
         self._chunks[index] = payload
 
         if len(self._chunks) >= self._total:
-            result = b"".join(self._chunks[i] for i in range(self._total) if i in self._chunks)
+            result = b"".join(
+                self._chunks[i] for i in range(self._total) if i in self._chunks
+            )
             self._chunks.clear()
             self._total = 0
             return result
@@ -117,8 +123,10 @@ class BleChunkReassembler:
 
 # --- Pydantic Request / Response Schemas ---
 
+
 class MotorControllerConfig(BaseModel):
     """Motor controller configuration request/response payload (/config or CHAR_CONFIG)."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     bpm: float = 36.0
     depth: float = 1.0
@@ -134,6 +142,7 @@ class MotorControllerConfig(BaseModel):
 
 class StreamStatus(BaseModel):
     """Streaming buffer status sub-object."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     buffered: int = 0
     stream_time: float = 0.0
@@ -142,6 +151,7 @@ class StreamStatus(BaseModel):
 
 class StreamWaypoint(BaseModel):
     """Individual motion trajectory waypoint."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     ts: int
     pos: float
@@ -150,6 +160,7 @@ class StreamWaypoint(BaseModel):
 
 class StateResponse(BaseModel):
     """Motor telemetry state response payload (/state or CHAR_STATE)."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     config: MotorControllerConfig
     t: float = 0.0
@@ -165,6 +176,7 @@ class StateResponse(BaseModel):
 
 class StatusResponse(BaseModel):
     """Combined status response returned by get_status()."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     state: StateResponse
     config: MotorControllerConfig
@@ -172,6 +184,7 @@ class StatusResponse(BaseModel):
 
 class PinConfiguration(BaseModel):
     """RS-485 Modbus GPIO pin configuration payload (/pin-config or CHAR_PIN_CONFIG)."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     modbus_tx: int = 18
     modbus_rx: int = 19
@@ -185,6 +198,7 @@ class PinConfiguration(BaseModel):
 
 class NetworkConfiguration(BaseModel):
     """WiFi, DHCP, static IP, and mDNS configuration payload (/network-config or CHAR_NETWORK_CONFIG)."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     hostname: str = "ossm"
     dhcp_enabled: bool = True
@@ -196,6 +210,7 @@ class NetworkConfiguration(BaseModel):
 
 class PausedControl(BaseModel):
     """Immediate pause and park control payload (/paused or CHAR_PAUSED)."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     paused: Optional[bool] = None
     position: Optional[float] = None
@@ -204,12 +219,14 @@ class PausedControl(BaseModel):
 
 class SubscribeParams(BaseModel):
     """Parameters for JSON-RPC subscribe-state method."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     interval_ms: int = 300
 
 
 class WaypointsInput(BaseModel):
     """Payload for set-waypoints JSON-RPC command."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     waypoints: list[StreamWaypoint]
     reset_timestamp: bool = Field(default=False, alias="reset-timestamp")
@@ -217,6 +234,7 @@ class WaypointsInput(BaseModel):
 
 class RpcRequest(BaseModel):
     """JSON-RPC 2.0 command request payload (/ws/command or CHAR_RPC)."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     jsonrpc: str = "2.0"
     method: str
@@ -226,6 +244,7 @@ class RpcRequest(BaseModel):
 
 class RpcError(BaseModel):
     """JSON-RPC 2.0 error object."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     code: int
     message: str
@@ -233,6 +252,7 @@ class RpcError(BaseModel):
 
 class RpcResponse(BaseModel):
     """JSON-RPC 2.0 command response payload."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     jsonrpc: str = "2.0"
     id: Optional[int | str] = None
@@ -242,6 +262,7 @@ class RpcResponse(BaseModel):
 
 class WsNotification(BaseModel):
     """WebSocket / BLE push notification payload."""
+
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     jsonrpc: str = "2.0"
     method: str
@@ -252,7 +273,15 @@ class WsNotification(BaseModel):
 
 class DeviceBackend:
     """Helper class managing communication across WiFi, BLE, and Serial modes asynchronously."""
-    def __init__(self, mode: str, ip: str = "192.168.24.63", port: str = "/dev/ttyACM0", baud: int = 115200, ble_addr: str = ""):
+
+    def __init__(
+        self,
+        mode: str,
+        ip: str = "192.168.24.63",
+        port: str = "/dev/ttyACM0",
+        baud: int = 115200,
+        ble_addr: str = "",
+    ):
         self.mode = mode.lower()
         self.ip = ip
         self.port = port
@@ -267,59 +296,156 @@ class DeviceBackend:
         return self._http_client
 
     # --- Serial Helpers ---
+    DEFAULT_SERIAL_COMMAND_TIMEOUT = 10
+
     def _get_serial(self):
         if not hasattr(self, "_s") or self._s is None or not self._s.is_open:
-            self._s = serial.Serial(self.port, self.baud, timeout=0.1)
+            self._s = serial.Serial(
+                self.port, self.baud, timeout=0.2, write_timeout=1.0
+            )
+            self._s.dtr = True
+            self._s.rts = False
         return self._s
 
-    async def _serial_command(self, cmd: str, wait_response: bool = True) -> list[str]:
-        try:
-            s = self._get_serial()
-            s.reset_input_buffer()
-            s.write(f"{cmd}\r\n".encode("utf-8"))
-            s.flush()
-            lines = []
-            if wait_response:
-                start_time = time.time()
-                while time.time() - start_time < 1.2:
-                    while s.in_waiting:
-                        line = s.readline().decode("utf-8", errors="ignore").strip()
-                        if line and not (line in cmd or cmd in line):
-                            lines.append(line)
-                    text = "\n".join(lines)
-                    if "ok" in text or ("{" in text and "}" in text):
-                        break
-                    await asyncio.sleep(0.01)
-            return lines
-        except Exception as e:
-            console.print(f"[bold red]Serial Error:[/bold red] Could not send command '{cmd}' to {self.port}: {e}")
-            sys.exit(1)
+    async def _serial_command(
+        self,
+        cmd: str,
+        wait_response: bool = True,
+        timeout: float = DEFAULT_SERIAL_COMMAND_TIMEOUT,
+    ) -> list[str]:
+        for attempt in range(2):
+            start_time = time.time()
+            try:
+                s = self._get_serial()
+                s.write_timeout = timeout
+                if time.time() - start_time >= timeout:
+                    raise TimeoutError(f"Serial command timed out before send: '{cmd}'")
+                s.reset_input_buffer()
+                s.write(f"{cmd}\r\n".encode("utf-8"))
+                s.flush()
+                lines = []
+                if wait_response:
+                    while time.time() - start_time < timeout:
+                        while s.in_waiting:
+                            line = s.readline().decode("utf-8", errors="ignore").strip()
+                            if line and not (line in cmd or cmd in line):
+                                lines.append(line)
+                        text = "\n".join(lines)
+                        if any(
+                            kw in text.lower()
+                            for kw in (
+                                "ok",
+                                "restart to apply",
+                                "saved",
+                                "enabled",
+                                "disabled",
+                                "set to",
+                                "resetting",
+                                "hostname set",
+                                "updated",
+                                "saving",
+                                "configuration",
+                                "got ip",
+                            )
+                        ) or ("{" in text and "}" in text):
+                            break
+                        await asyncio.sleep(0.01)
+                return lines
+            except Exception as e:
+                if hasattr(self, "_s") and self._s is not None:
+                    try:
+                        self._s.close()
+                    except Exception:
+                        pass
+                    self._s = None
+                if attempt == 0:
+                    await asyncio.sleep(0.3)
+                    continue
+                console.print(
+                    f"[bold red]Serial Error:[/bold red] Could not send command '{cmd}' to {self.port}: {e}"
+                )
+                sys.exit(1)
 
     # --- BLE Helpers ---
     async def _get_ble_client(self):
         from bleak import BleakScanner, BleakClient
-        if hasattr(self, "_ble_client") and self._ble_client and self._ble_client.is_connected:
+
+        if (
+            hasattr(self, "_ble_client")
+            and self._ble_client
+            and self._ble_client.is_connected
+        ):
             return self._ble_client
-        if not self.ble_addr:
+        if (
+            not self.ble_addr
+            or not hasattr(self, "_ble_device")
+            or not self._ble_device
+        ):
             console.print("[dim]Scanning for advertising OSSM BLE device...[/dim]")
             device = await BleakScanner.find_device_by_filter(
-                lambda d, adv: d.name and "OSSM" in d.name,
-                timeout=12.0
+                lambda d, adv: "OSSM" in (d.name or adv.local_name or ""), timeout=12.0
             )
             if not device:
-                console.print("[bold red]BLE Error:[/bold red] No advertising OSSM device found.")
+                console.print(
+                    "[bold red]BLE Error:[/bold red] No advertising OSSM device found."
+                )
                 sys.exit(1)
-            console.print(f"[dim]Found OSSM device: [bold green]{device.name}[/bold green] [{device.address}][/dim]")
+            console.print(
+                f"[dim]Found OSSM device: [bold green]{device.name or 'OSSM'}[/bold green] [{device.address}][/dim]"
+            )
             self.ble_addr = device.address
-        client = BleakClient(self.ble_addr)
-        await client.connect()
-        self._ble_client = client
-        return client
+            self._ble_device = device
+
+        for attempt in range(1, 5):
+            try:
+                # Always re-scan after a failed attempt — BlueZ device paths
+                # go stale when the peripheral drops mid-connect.
+                if attempt > 1 or not getattr(self, "_ble_device", None):
+                    console.print(
+                        "[dim]Re-scanning to refresh BLE device handle...[/dim]"
+                    )
+                    self._ble_device = None
+                    self.ble_addr = None
+                    device = await BleakScanner.find_device_by_filter(
+                        lambda d, adv: "OSSM" in (d.name or adv.local_name or ""),
+                        timeout=10.0,
+                    )
+                    if not device:
+                        raise RuntimeError("OSSM BLE advertisement not found")
+                    self._ble_device = device
+                    self.ble_addr = device.address
+                target = self._ble_device
+                client = BleakClient(target, timeout=20.0)
+                await client.connect()
+                # Tiny settle so GATT discovery finishes before first read.
+                await asyncio.sleep(0.25)
+                self._ble_client = client
+                return client
+            except Exception as e:
+                self._ble_client = None
+                self._ble_device = None
+                self.ble_addr = None
+                if attempt == 4:
+                    raise
+                console.print(
+                    f"[dim yellow]BLE connect attempt {attempt} failed ({e}), retrying...[/dim yellow]"
+                )
+                await asyncio.sleep(2.0 + attempt)
 
     async def _disconnect_ble(self):
-        if self._ble_client and self._ble_client.is_connected:
-            await self._ble_client.disconnect()
-        self._ble_client = None
+        if self._ble_client:
+            try:
+                if self._ble_client.is_connected:
+                    await self._ble_client.disconnect()
+            except Exception:
+                pass
+            finally:
+                self._ble_client = None
+                # Give the peripheral time to return to advertising before the
+                # next connect (BlueZ device path goes stale otherwise).
+                await asyncio.sleep(1.0)
+                self._ble_device = None
+                self.ble_addr = None
 
     async def disconnect(self):
         """Disconnect any persistent BLE or HTTP connections."""
@@ -349,7 +475,9 @@ class DeviceBackend:
                     config = res_cfg.json()
                 return {"state": state, "config": config}
             except Exception as e:
-                console.print(f"[bold red]WiFi Error:[/bold red] Failed to reach http://{self.ip}: {e}")
+                console.print(
+                    f"[bold red]WiFi Error:[/bold red] Failed to reach http://{self.ip}: {e}"
+                )
                 sys.exit(1)
         elif self.mode == "ble":
             client = await self._get_ble_client()
@@ -357,14 +485,14 @@ class DeviceBackend:
             config_raw = await client.read_gatt_char(BleUUID.CHAR_CONFIG)
             return {
                 "state": json.loads(state_raw.decode("utf-8")),
-                "config": json.loads(config_raw.decode("utf-8"))
+                "config": json.loads(config_raw.decode("utf-8")),
             }
         elif self.mode == "serial":
             lines = await self._serial_command("get-status")
             text = "\n".join(lines)
             if "{" in text and "}" in text:
                 try:
-                    return json.loads(text[text.find("{"):text.rfind("}")+1])
+                    return json.loads(text[text.find("{") : text.rfind("}") + 1])
                 except Exception:
                     pass
             lines = await self._serial_command("get-motor-config")
@@ -372,10 +500,13 @@ class DeviceBackend:
             text = "\n".join(lines)
             if "{" in text and "}" in text:
                 try:
-                    config = json.loads(text[text.find("{"):text.rfind("}")+1])
+                    config = json.loads(text[text.find("{") : text.rfind("}") + 1])
                 except Exception:
                     pass
-            return {"config": config, "state": {"position": 0.0, "speed": 0.0, "config": config}}
+            return {
+                "config": config,
+                "state": {"position": 0.0, "speed": 0.0, "config": config},
+            }
         else:
             console.print(f"[bold red]Error:[/bold red] Unsupported mode '{self.mode}'")
             sys.exit(1)
@@ -392,7 +523,9 @@ class DeviceBackend:
                 res = await client.post(f"http://{self.ip}/config", json=full_config)
                 return res.json()
             except Exception as e:
-                console.print(f"[bold red]WiFi Error:[/bold red] Failed to post config to http://{self.ip}: {e}")
+                console.print(
+                    f"[bold red]WiFi Error:[/bold red] Failed to post config to http://{self.ip}: {e}"
+                )
                 sys.exit(1)
         elif self.mode == "ble":
             client = await self._get_ble_client()
@@ -401,27 +534,39 @@ class DeviceBackend:
             res_raw = await client.read_gatt_char(BleUUID.CHAR_CONFIG)
             return json.loads(res_raw.decode("utf-8"))
         elif self.mode == "serial":
-            payload = json.dumps(full_config, separators=(',', ':'))
-            await self._serial_command(f"set-motor-config {payload}", wait_response=False)
+            payload = json.dumps(full_config, separators=(",", ":"))
+            await self._serial_command(
+                f"set-motor-config {payload}", wait_response=False
+            )
             return full_config
         return {}
 
     async def set_paused(self, paused: bool, position: Optional[float] = None) -> dict:
         payload = {"paused": paused}
         if position is not None:
-            payload["paused_position"] = position
+            payload["position"] = position
         if self.mode == "wifi":
             try:
                 client = await self._get_http_client()
                 res = await client.post(f"http://{self.ip}/paused", json=payload)
                 return res.json()
             except Exception as e:
-                console.print(f"[bold red]WiFi Error:[/bold red] Failed to post paused state: {e}")
+                console.print(
+                    f"[bold red]WiFi Error:[/bold red] Failed to post paused state: {e}"
+                )
                 sys.exit(1)
         elif self.mode == "ble":
             client = await self._get_ble_client()
-            await client.write_gatt_char(BleUUID.CHAR_PAUSED, json.dumps(payload).encode("utf-8"), response=True)
+            # Canonical BLE/HTTP paused payload uses "position", not the
+            # motor-config field name "paused_position".
+            await client.write_gatt_char(
+                BleUUID.CHAR_PAUSED, json.dumps(payload).encode("utf-8"), response=True
+            )
+            await asyncio.sleep(0.15)
             res_raw = await client.read_gatt_char(BleUUID.CHAR_CONFIG)
+            if not res_raw:
+                await asyncio.sleep(0.2)
+                res_raw = await client.read_gatt_char(BleUUID.CHAR_CONFIG)
             return json.loads(res_raw.decode("utf-8"))
         elif self.mode == "serial":
             curr = (await self.get_status()).get("config", {})
@@ -429,9 +574,13 @@ class DeviceBackend:
             return await self.set_config(curr)
         return {}
 
-    async def send_waypoints(self, waypoints: list[dict], reset_timestamp: bool = False) -> dict:
+    async def send_waypoints(
+        self, waypoints: list[dict], reset_timestamp: bool = False
+    ) -> dict:
         if reset_timestamp:
-            return await self.send_rpc("set-waypoints", {"waypoints": waypoints, "reset-timestamp": True})
+            return await self.send_rpc(
+                "set-waypoints", {"waypoints": waypoints, "reset-timestamp": True}
+            )
         else:
             return await self.send_rpc("append-waypoints", waypoints)
 
@@ -449,7 +598,7 @@ class DeviceBackend:
             text = "\n".join(lines)
             if "{" in text and "}" in text:
                 try:
-                    return json.loads(text[text.find("{"):text.rfind("}")+1])
+                    return json.loads(text[text.find("{") : text.rfind("}") + 1])
                 except Exception:
                     pass
             return {}
@@ -462,27 +611,52 @@ class DeviceBackend:
             return res.json()
         elif self.mode == "ble":
             client = await self._get_ble_client()
-            await client.write_gatt_char(BleUUID.CHAR_PIN_CONFIG, json.dumps(pin_dict).encode("utf-8"), response=True)
+            await client.write_gatt_char(
+                BleUUID.CHAR_PIN_CONFIG,
+                json.dumps(pin_dict).encode("utf-8"),
+                response=True,
+            )
             raw = await client.read_gatt_char(BleUUID.CHAR_PIN_CONFIG)
             return json.loads(raw.decode("utf-8"))
         elif self.mode == "serial":
             if "modbus_tx" in pin_dict:
-                await self._serial_command(f"set-pin-modbus-tx {pin_dict['modbus_tx']}", wait_response=False)
+                await self._serial_command(
+                    f"set-pin-modbus-tx {pin_dict['modbus_tx']}", wait_response=False
+                )
             if "modbus_rx" in pin_dict:
-                await self._serial_command(f"set-pin-modbus-rx {pin_dict['modbus_rx']}", wait_response=False)
+                await self._serial_command(
+                    f"set-pin-modbus-rx {pin_dict['modbus_rx']}", wait_response=False
+                )
             if "modbus_de_re" in pin_dict:
-                await self._serial_command(f"set-pin-modbus-de-re {pin_dict['modbus_de_re']}", wait_response=False)
+                await self._serial_command(
+                    f"set-pin-modbus-de-re {pin_dict['modbus_de_re']}",
+                    wait_response=False,
+                )
             if "modbus_timeout_ms" in pin_dict:
-                await self._serial_command(f"set-modbus-timeout-ms {pin_dict['modbus_timeout_ms']}", wait_response=False)
+                await self._serial_command(
+                    f"set-modbus-timeout-ms {pin_dict['modbus_timeout_ms']}",
+                    wait_response=False,
+                )
             if "modbus_rx_timeout_us" in pin_dict:
-                await self._serial_command(f"set-modbus-rx-timeout-us {pin_dict['modbus_rx_timeout_us']}", wait_response=False)
+                await self._serial_command(
+                    f"set-modbus-rx-timeout-us {pin_dict['modbus_rx_timeout_us']}",
+                    wait_response=False,
+                )
             if "modbus_scan_delay_us" in pin_dict:
-                await self._serial_command(f"set-modbus-scan-delay-us {pin_dict['modbus_scan_delay_us']}", wait_response=False)
+                await self._serial_command(
+                    f"set-modbus-scan-delay-us {pin_dict['modbus_scan_delay_us']}",
+                    wait_response=False,
+                )
             if "modbus_inter_frame_delay_us" in pin_dict:
-                await self._serial_command(f"set-modbus-inter-frame-delay-us {pin_dict['modbus_inter_frame_delay_us']}", wait_response=False)
+                await self._serial_command(
+                    f"set-modbus-inter-frame-delay-us {pin_dict['modbus_inter_frame_delay_us']}",
+                    wait_response=False,
+                )
             if "ble_enabled" in pin_dict:
                 val = "true" if pin_dict["ble_enabled"] else "false"
-                await self._serial_command(f"set-ble-enabled {val}", wait_response=False)
+                await self._serial_command(
+                    f"set-ble-enabled {val}", wait_response=False
+                )
             return await self.get_pin_config()
         return {}
 
@@ -500,7 +674,7 @@ class DeviceBackend:
             text = "\n".join(lines)
             if "{" in text and "}" in text:
                 try:
-                    return json.loads(text[text.find("{"):text.rfind("}")+1])
+                    return json.loads(text[text.find("{") : text.rfind("}") + 1])
                 except Exception:
                     pass
             return {}
@@ -513,23 +687,40 @@ class DeviceBackend:
             return res.json()
         elif self.mode == "ble":
             client = await self._get_ble_client()
-            await client.write_gatt_char(BleUUID.CHAR_NETWORK_CONFIG, json.dumps(net_dict).encode("utf-8"), response=True)
+            await client.write_gatt_char(
+                BleUUID.CHAR_NETWORK_CONFIG,
+                json.dumps(net_dict).encode("utf-8"),
+                response=True,
+            )
             raw = await client.read_gatt_char(BleUUID.CHAR_NETWORK_CONFIG)
             return json.loads(raw.decode("utf-8"))
         elif self.mode == "serial":
             if "hostname" in net_dict:
-                await self._serial_command(f"set-hostname {net_dict['hostname']}", wait_response=False)
+                await self._serial_command(
+                    f"set-hostname {net_dict['hostname']}", wait_response=False
+                )
             if "dhcp_enabled" in net_dict:
                 val = "true" if net_dict["dhcp_enabled"] else "false"
-                await self._serial_command(f"set-dhcp-enabled {val}", wait_response=False)
+                await self._serial_command(
+                    f"set-dhcp-enabled {val}", wait_response=False
+                )
             if "static_ip" in net_dict:
-                await self._serial_command(f"set-static-ip {net_dict['static_ip']}", wait_response=False)
+                await self._serial_command(
+                    f"set-static-ip {net_dict['static_ip']}", wait_response=False
+                )
             if "static_mask" in net_dict:
-                await self._serial_command(f"set-static-mask {net_dict['static_mask']}", wait_response=False)
+                await self._serial_command(
+                    f"set-static-mask {net_dict['static_mask']}", wait_response=False
+                )
             if "static_gateway" in net_dict:
-                await self._serial_command(f"set-static-gateway {net_dict['static_gateway']}", wait_response=False)
+                await self._serial_command(
+                    f"set-static-gateway {net_dict['static_gateway']}",
+                    wait_response=False,
+                )
             if "static_dns" in net_dict:
-                await self._serial_command(f"set-static-dns {net_dict['static_dns']}", wait_response=False)
+                await self._serial_command(
+                    f"set-static-dns {net_dict['static_dns']}", wait_response=False
+                )
             return await self.get_network_config()
         return {}
 
@@ -543,22 +734,30 @@ class DeviceBackend:
         elif self.mode == "ble":
             client = await self._get_ble_client()
             cmd = {"jsonrpc": "2.0", "method": "restart", "id": 1}
-            await client.write_gatt_char(BleUUID.CHAR_RPC, json.dumps(cmd).encode("utf-8"), response=True)
+            await client.write_gatt_char(
+                BleUUID.CHAR_RPC, json.dumps(cmd).encode("utf-8"), response=True
+            )
             self._ble_client = None
         elif self.mode == "serial":
             await self._serial_command("reset", wait_response=False)
 
     def ws_connect(self):
         import websockets
+
         return websockets.connect(f"ws://{self.ip}/ws/command", ping_interval=None)
 
-    async def send_rpc(self, method: str, params: Optional[Any] = None, rpc_id: int = 1) -> dict:
+    async def send_rpc(
+        self, method: str, params: Optional[Any] = None, rpc_id: int = 1
+    ) -> dict:
         cmd = {"jsonrpc": "2.0", "method": method, "id": rpc_id}
         if params is not None:
             cmd["params"] = params
         if self.mode == "wifi":
             import websockets
-            async with websockets.connect(f"ws://{self.ip}/ws/command", ping_interval=None) as ws:
+
+            async with websockets.connect(
+                f"ws://{self.ip}/ws/command", ping_interval=None
+            ) as ws:
                 await ws.send(json.dumps(cmd))
                 msg = await ws.recv()
                 return json.loads(msg)
@@ -571,11 +770,14 @@ class DeviceBackend:
                 return {"jsonrpc": "2.0", "id": rpc_id, "result": st}
             if method in ("set-waypoints", "append-waypoints", "reset-timestamp"):
                 client = await self._get_ble_client()
-                await client.write_gatt_char(BleUUID.CHAR_RPC, json.dumps(cmd).encode("utf-8"), response=True)
+                await client.write_gatt_char(
+                    BleUUID.CHAR_RPC, json.dumps(cmd).encode("utf-8"), response=True
+                )
                 return {"jsonrpc": "2.0", "id": rpc_id, "result": "ok"}
             client = await self._get_ble_client()
             res_data = []
             reassembler = BleChunkReassembler()
+
             def _cb(sender, data):
                 payload = reassembler.feed(bytes(data))
                 if payload is None:
@@ -586,8 +788,11 @@ class DeviceBackend:
                         res_data.append(msg)
                 except Exception:
                     pass
+
             await client.start_notify(BleUUID.CHAR_RPC, _cb)
-            await client.write_gatt_char(BleUUID.CHAR_RPC, json.dumps(cmd).encode("utf-8"), response=True)
+            await client.write_gatt_char(
+                BleUUID.CHAR_RPC, json.dumps(cmd).encode("utf-8"), response=True
+            )
             for _ in range(25):
                 if res_data:
                     break
@@ -596,15 +801,21 @@ class DeviceBackend:
             return res_data[0] if res_data else {}
         elif self.mode == "serial":
             if method in ("set-waypoints", "append-waypoints"):
-                payload_str = json.dumps(params, separators=(',', ':'))
-                await self._serial_command(f"{method} {payload_str}", wait_response=True)
+                payload_str = json.dumps(params, separators=(",", ":"))
+                await self._serial_command(
+                    f"{method} {payload_str}", wait_response=True
+                )
                 return {"result": "ok"}
             elif method in ("get-state", "get_state"):
                 lines = await self._serial_command("get-state")
                 text = "\n".join(lines)
                 if "{" in text and "}" in text:
                     try:
-                        return {"result": json.loads(text[text.find("{"):text.rfind("}")+1])}
+                        return {
+                            "result": json.loads(
+                                text[text.find("{") : text.rfind("}") + 1]
+                            )
+                        }
                     except Exception:
                         pass
                 return {}
@@ -621,10 +832,13 @@ class DeviceBackend:
         if self.mode != "serial":
             return None
         import re
+
         start_time = time.time()
         buffer = ""
         try:
-            with serial.Serial(self.port, self.baud, timeout=0.1) as s:
+            with serial.Serial(
+                self.port, self.baud, timeout=0.1, write_timeout=1.0
+            ) as s:
                 while time.time() - start_time < timeout:
                     if s.in_waiting:
                         chunk = s.read(s.in_waiting).decode("utf-8", errors="replace")
@@ -634,21 +848,30 @@ class DeviceBackend:
                             line = line.strip()
                             if line:
                                 print(f"  {line}")
-                                ip_match = re.search(r"(?:sta ip:|got ip:|ip:\s*)([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", line, re.IGNORECASE)
+                                ip_match = re.search(
+                                    r"(?:sta ip:|got ip:|ip:\s*)([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})",
+                                    line,
+                                    re.IGNORECASE,
+                                )
                                 if ip_match:
                                     return ip_match.group(1)
                     else:
                         await asyncio.sleep(0.05)
         except Exception as e:
-            console.print(f"[bold red]Serial Error:[/bold red] Could not monitor for IP: {e}")
+            console.print(
+                f"[bold red]Serial Error:[/bold red] Could not monitor for IP: {e}"
+            )
         return None
 
-    async def monitor_serial(self):
+    async def monitor_serial(self, timeout: Optional[float] = None):
         if self.mode != "serial":
             return
         try:
-            with serial.Serial(self.port, self.baud, timeout=0.1) as s:
-                while True:
+            with serial.Serial(
+                self.port, self.baud, timeout=0.1, write_timeout=1.0
+            ) as s:
+                start_time = time.time()
+                while timeout is None or time.time() - start_time < timeout:
                     if s.in_waiting:
                         chunk = s.read(s.in_waiting).decode("utf-8", errors="replace")
                         print(chunk, end="", flush=True)
@@ -657,6 +880,7 @@ class DeviceBackend:
             print("\nExiting monitor mode.")
         except Exception as e:
             console.print(f"[bold red]Serial Error:[/bold red] Monitor failed: {e}")
+
 
 def resolve_backend(ctx: typer.Context, mode_override: Optional[str]) -> DeviceBackend:
     backend: DeviceBackend = ctx.obj
@@ -675,11 +899,33 @@ def resolve_backend(ctx: typer.Context, mode_override: Optional[str]) -> DeviceB
 @app.callback()
 def main(
     ctx: typer.Context,
-    mode: str = typer.Option("wifi", "--mode", "-m", help="Communication mode: wifi, ble, or serial"),
-    ip: str = typer.Option(os.environ.get("DEVICE_IP", "192.168.24.63"), "--ip", "-i", help="Target IP address for WiFi mode"),
-    port: str = typer.Option(os.environ.get("DEVICE_PORT", "/dev/ttyACM0"), "--port", "-p", help="Serial port path for USB serial mode"),
-    baud: int = typer.Option(int(os.environ.get("DEVICE_BAUD", "115200")), "--baud", "-b", help="Baud rate for serial mode"),
-    ble_addr: str = typer.Option(os.environ.get("DEVICE_BLE_ADDR", ""), "--ble-addr", "-a", help="BLE device MAC/address (auto-scans if empty)"),
+    mode: str = typer.Option(
+        "wifi", "--mode", "-m", help="Communication mode: wifi, ble, or serial"
+    ),
+    ip: str = typer.Option(
+        os.environ.get("DEVICE_IP", "192.168.24.63"),
+        "--ip",
+        "-i",
+        help="Target IP address for WiFi mode",
+    ),
+    port: str = typer.Option(
+        os.environ.get("DEVICE_PORT", "/dev/ttyACM0"),
+        "--port",
+        "-p",
+        help="Serial port path for USB serial mode",
+    ),
+    baud: int = typer.Option(
+        int(os.environ.get("DEVICE_BAUD", "115200")),
+        "--baud",
+        "-b",
+        help="Baud rate for serial mode",
+    ),
+    ble_addr: str = typer.Option(
+        os.environ.get("DEVICE_BLE_ADDR", ""),
+        "--ble-addr",
+        "-a",
+        help="BLE device MAC/address (auto-scans if empty)",
+    ),
 ):
     ctx.obj = DeviceBackend(mode=mode, ip=ip, port=port, baud=baud, ble_addr=ble_addr)
 
@@ -688,26 +934,51 @@ def main(
 @app.command()
 def status(
     ctx: typer.Context,
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """View current device status, motor coordinates, and configuration."""
     backend = resolve_backend(ctx, mode)
-    with console.status(f"[bold cyan]Fetching device status via {backend.mode.upper()}..."):
+    with console.status(
+        f"[bold cyan]Fetching device status via {backend.mode.upper()}..."
+    ):
         data = asyncio.run(backend.get_status())
 
     config = data.get("config", {})
     state = data.get("state", {})
 
-    table = Table(title=f"OSSM Device Status ({backend.mode.upper()})", show_header=True, header_style="bold magenta")
+    table = Table(
+        title=f"OSSM Device Status ({backend.mode.upper()})",
+        show_header=True,
+        header_style="bold magenta",
+    )
     table.add_column("Parameter", style="cyan", justify="right")
     table.add_column("Value", style="green")
 
-    table.add_row("Operating State", "[bold red]PAUSED[/bold red]" if config.get("paused", True) else "[bold green]RUNNING[/bold green]")
-    table.add_row("Motor Connected", "[bold green]YES[/bold green]" if state.get("motor_connected", True) else "[bold red]NO[/bold red]")
+    table.add_row(
+        "Operating State",
+        (
+            "[bold red]PAUSED[/bold red]"
+            if config.get("paused", True)
+            else "[bold green]RUNNING[/bold green]"
+        ),
+    )
+    table.add_row(
+        "Motor Connected",
+        (
+            "[bold green]YES[/bold green]"
+            if state.get("motor_connected", True)
+            else "[bold red]NO[/bold red]"
+        ),
+    )
     if "modbus_stats" in state and state["modbus_stats"]:
         mst = state["modbus_stats"]
         sr = mst.get("success_rate", 0.0)
-        table.add_row("Modbus Success Rate", f"{sr:.1f}% ({mst.get('successful_requests', 0)} ok / {mst.get('failed_requests', 0)} fail)")
+        table.add_row(
+            "Modbus Success Rate",
+            f"{sr:.1f}% ({mst.get('successful_requests', 0)} ok / {mst.get('failed_requests', 0)} fail)",
+        )
     table.add_row("BPM (Speed)", f"{config.get('bpm', 0.0):.1f}")
     table.add_row("Stroke Depth", f"{config.get('depth', 0.0) * 100.0:.1f}%")
     table.add_row("Wave Function", f"{config.get('wave_func', 'sine').upper()}")
@@ -723,10 +994,18 @@ def status(
 def run(
     ctx: typer.Context,
     bpm: float = typer.Option(30.0, "--bpm", "-s", help="Speed in Beats Per Minute"),
-    depth: float = typer.Option(0.8, "--depth", "-d", help="Stroke depth ratio (0.0 to 1.0)"),
-    wave: str = typer.Option("sine", "--wave", "-w", help="Wave function: sine, triangle, square, spline"),
-    reversed_stroke: bool = typer.Option(False, "--reversed", "-r", help="Reverse stroke trajectory"),
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    depth: float = typer.Option(
+        0.8, "--depth", "-d", help="Stroke depth ratio (0.0 to 1.0)"
+    ),
+    wave: str = typer.Option(
+        "sine", "--wave", "-w", help="Wave function: sine, triangle, square, spline"
+    ),
+    reversed_stroke: bool = typer.Option(
+        False, "--reversed", "-r", help="Reverse stroke trajectory"
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """Start the motor with specified motion parameters."""
     backend = resolve_backend(ctx, mode)
@@ -737,16 +1016,27 @@ def run(
         "wave_func": wave.lower(),
         "reversed": reversed_stroke,
     }
-    with console.status(f"[bold green]Starting motor at {bpm} BPM via {backend.mode.upper()}..."):
+    with console.status(
+        f"[bold green]Starting motor at {bpm} BPM via {backend.mode.upper()}..."
+    ):
         res = asyncio.run(backend.set_config(config_update))
-    console.print(Panel(f"[bold green]Motor Running![/bold green]\nBPM: [cyan]{res.get('bpm', bpm)}[/cyan] | Depth: [cyan]{res.get('depth', depth)*100:.1f}%[/cyan] | Wave: [cyan]{res.get('wave_func', wave)}[/cyan]", title="Action"))
+    console.print(
+        Panel(
+            f"[bold green]Motor Running![/bold green]\nBPM: [cyan]{res.get('bpm', bpm)}[/cyan] | Depth: [cyan]{res.get('depth', depth)*100:.1f}%[/cyan] | Wave: [cyan]{res.get('wave_func', wave)}[/cyan]",
+            title="Action",
+        )
+    )
 
 
 @app.command()
 def pause(
     ctx: typer.Context,
-    position: Optional[float] = typer.Option(None, "--pos", "-pos", help="Target park position ratio (0.0=bottom, 1.0=top)"),
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    position: Optional[float] = typer.Option(
+        None, "--pos", "-pos", help="Target park position ratio (0.0=bottom, 1.0=top)"
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """Pause the motor immediately or park at a fixed position."""
     backend = resolve_backend(ctx, mode)
@@ -759,7 +1049,9 @@ def pause(
 @app.command()
 def resume(
     ctx: typer.Context,
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """Resume motor movement with current settings."""
     backend = resolve_backend(ctx, mode)
@@ -772,24 +1064,41 @@ def resume(
 def config(
     ctx: typer.Context,
     bpm: Optional[float] = typer.Option(None, "--bpm", help="Update BPM speed"),
-    depth: Optional[float] = typer.Option(None, "--depth", help="Update stroke depth (0.0 to 1.0)"),
-    wave: Optional[str] = typer.Option(None, "--wave", help="Update wave function (sine, triangle, square, spline)"),
-    sharpness: Optional[float] = typer.Option(None, "--sharpness", help="Update curve sharpness"),
-    reversed_stroke: Optional[bool] = typer.Option(None, "--reversed/--no-reversed", help="Toggle stroke reversal"),
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    depth: Optional[float] = typer.Option(
+        None, "--depth", help="Update stroke depth (0.0 to 1.0)"
+    ),
+    wave: Optional[str] = typer.Option(
+        None, "--wave", help="Update wave function (sine, triangle, square, spline)"
+    ),
+    sharpness: Optional[float] = typer.Option(
+        None, "--sharpness", help="Update curve sharpness"
+    ),
+    reversed_stroke: Optional[bool] = typer.Option(
+        None, "--reversed/--no-reversed", help="Toggle stroke reversal"
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """View or update motor controller configuration."""
     backend = resolve_backend(ctx, mode)
-    with console.status(f"[bold cyan]Reading configuration via {backend.mode.upper()}..."):
+    with console.status(
+        f"[bold cyan]Reading configuration via {backend.mode.upper()}..."
+    ):
         curr_data = asyncio.run(backend.get_status())
     curr_config = curr_data.get("config", {})
 
     changes = {}
-    if bpm is not None: changes["bpm"] = bpm
-    if depth is not None: changes["depth"] = depth
-    if wave is not None: changes["wave_func"] = wave.lower()
-    if sharpness is not None: changes["sharpness"] = sharpness
-    if reversed_stroke is not None: changes["reversed"] = reversed_stroke
+    if bpm is not None:
+        changes["bpm"] = bpm
+    if depth is not None:
+        changes["depth"] = depth
+    if wave is not None:
+        changes["wave_func"] = wave.lower()
+    if sharpness is not None:
+        changes["sharpness"] = sharpness
+    if reversed_stroke is not None:
+        changes["reversed"] = reversed_stroke
 
     if changes:
         with console.status(f"[bold cyan]Applying configuration changes..."):
@@ -805,26 +1114,40 @@ def pins(
     ctx: typer.Context,
     tx: Optional[int] = typer.Option(None, "--tx", help="Modbus UART TX GPIO Pin"),
     rx: Optional[int] = typer.Option(None, "--rx", help="Modbus UART RX GPIO Pin"),
-    de_re: Optional[int] = typer.Option(None, "--de-re", help="Modbus UART DE/RE GPIO Pin"),
-    ble_enabled: Optional[bool] = typer.Option(None, "--ble/--no-ble", help="Enable or disable Bluetooth Low Energy"),
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    de_re: Optional[int] = typer.Option(
+        None, "--de-re", help="Modbus UART DE/RE GPIO Pin"
+    ),
+    ble_enabled: Optional[bool] = typer.Option(
+        None, "--ble/--no-ble", help="Enable or disable Bluetooth Low Energy"
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """View or update RS-485 Modbus pin configuration and BLE enable flag."""
     backend = resolve_backend(ctx, mode)
-    with console.status(f"[bold cyan]Reading pin configuration via {backend.mode.upper()}..."):
+    with console.status(
+        f"[bold cyan]Reading pin configuration via {backend.mode.upper()}..."
+    ):
         pin_cfg = asyncio.run(backend.get_pin_config())
 
     changes = {}
-    if tx is not None: changes["modbus_tx"] = tx
-    if rx is not None: changes["modbus_rx"] = rx
-    if de_re is not None: changes["modbus_de_re"] = de_re
-    if ble_enabled is not None: changes["ble_enabled"] = ble_enabled
+    if tx is not None:
+        changes["modbus_tx"] = tx
+    if rx is not None:
+        changes["modbus_rx"] = rx
+    if de_re is not None:
+        changes["modbus_de_re"] = de_re
+    if ble_enabled is not None:
+        changes["ble_enabled"] = ble_enabled
 
     if changes:
         with console.status(f"[bold cyan]Applying pin configuration updates..."):
             pin_cfg.update(changes)
             pin_cfg = asyncio.run(backend.set_pin_config(pin_cfg))
-        console.print("[bold green]✓ Pin Configuration Updated (Reboot required to apply hardware changes):[/bold green]")
+        console.print(
+            "[bold green]✓ Pin Configuration Updated (Reboot required to apply hardware changes):[/bold green]"
+        )
 
     console.print_json(data=pin_cfg)
 
@@ -832,32 +1155,48 @@ def pins(
 @app.command()
 def net(
     ctx: typer.Context,
-    hostname: Optional[str] = typer.Option(None, "--hostname", "-h", help="mDNS hostname"),
-    dhcp: Optional[bool] = typer.Option(None, "--dhcp/--no-dhcp", help="Enable or disable DHCP"),
+    hostname: Optional[str] = typer.Option(
+        None, "--hostname", "-h", help="mDNS hostname"
+    ),
+    dhcp: Optional[bool] = typer.Option(
+        None, "--dhcp/--no-dhcp", help="Enable or disable DHCP"
+    ),
     ip: Optional[str] = typer.Option(None, "--ip", help="Static IP address"),
     mask: Optional[str] = typer.Option(None, "--mask", help="Subnet mask"),
     gateway: Optional[str] = typer.Option(None, "--gateway", help="Gateway address"),
     dns: Optional[str] = typer.Option(None, "--dns", help="DNS server address"),
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """View or configure Network and mDNS settings."""
     backend = resolve_backend(ctx, mode)
-    with console.status(f"[bold cyan]Fetching current network configuration ({backend.mode.upper()})..."):
+    with console.status(
+        f"[bold cyan]Fetching current network configuration ({backend.mode.upper()})..."
+    ):
         net_cfg = asyncio.run(backend.get_network_config())
 
     changes = {}
-    if hostname is not None: changes["hostname"] = hostname
-    if dhcp is not None: changes["dhcp_enabled"] = dhcp
-    if ip is not None: changes["static_ip"] = ip
-    if mask is not None: changes["static_mask"] = mask
-    if gateway is not None: changes["static_gateway"] = gateway
-    if dns is not None: changes["static_dns"] = dns
+    if hostname is not None:
+        changes["hostname"] = hostname
+    if dhcp is not None:
+        changes["dhcp_enabled"] = dhcp
+    if ip is not None:
+        changes["static_ip"] = ip
+    if mask is not None:
+        changes["static_mask"] = mask
+    if gateway is not None:
+        changes["static_gateway"] = gateway
+    if dns is not None:
+        changes["static_dns"] = dns
 
     if changes:
         with console.status(f"[bold cyan]Applying network configuration updates..."):
             net_cfg.update(changes)
             net_cfg = asyncio.run(backend.set_network_config(net_cfg))
-        console.print("[bold green]✓ Network Configuration Updated (Reboot required to apply):[/bold green]")
+        console.print(
+            "[bold green]✓ Network Configuration Updated (Reboot required to apply):[/bold green]"
+        )
 
     console.print_json(data=net_cfg)
 
@@ -867,39 +1206,65 @@ def wifi(
     ctx: typer.Context,
     ssid: str = typer.Option(..., "--ssid", help="WiFi network SSID"),
     password: str = typer.Option(..., "--password", help="WiFi network Password"),
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """Configure WiFi credentials (USB Serial mode recommended)."""
     backend = resolve_backend(ctx, mode)
     if backend.mode != "serial":
-        console.print("[bold yellow]Warning:[/bold yellow] Configuring WiFi over WiFi/BLE may cause immediate disconnection.")
+        console.print(
+            "[bold yellow]Warning:[/bold yellow] Configuring WiFi over WiFi/BLE may cause immediate disconnection."
+        )
     console.print(f"[cyan]Setting WiFi SSID to [bold]{ssid}[/bold]...[/cyan]")
     if backend.mode == "serial":
-        asyncio.run(backend._serial_command(f"set-wifi-ssid {ssid}", wait_response=False))
-        asyncio.run(backend._serial_command(f"set-wifi-password {password}", wait_response=False))
-        console.print("[bold green]✓ WiFi credentials saved to NVS over USB Serial![/bold green]")
+        asyncio.run(
+            backend._serial_command(f"set-wifi-ssid {ssid}", wait_response=False)
+        )
+        asyncio.run(
+            backend._serial_command(
+                f"set-wifi-password {password}", wait_response=False
+            )
+        )
+        console.print(
+            "[bold green]✓ WiFi credentials saved to NVS over USB Serial![/bold green]"
+        )
         console.print("Run [cyan]ossm.py restart --mode serial[/cyan] to connect.")
     else:
-        console.print("[bold red]Error:[/bold red] WiFi configuration currently supported via --mode serial.")
+        console.print(
+            "[bold red]Error:[/bold red] WiFi configuration currently supported via --mode serial."
+        )
 
 
 @app.command()
 def monitor(
     ctx: typer.Context,
-    duration: int = typer.Option(30, "--duration", "-t", help="Duration in seconds to monitor live telemetry"),
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    duration: int = typer.Option(
+        30, "--duration", "-t", help="Duration in seconds to monitor live telemetry"
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """Monitor live motor coordinates and speed in real-time over WebSocket or BLE."""
     backend = resolve_backend(ctx, mode)
-    console.print(f"[bold cyan]Starting real-time telemetry monitoring ({backend.mode.upper()}) for {duration}s...[/bold cyan]")
+    console.print(
+        f"[bold cyan]Starting real-time telemetry monitoring ({backend.mode.upper()}) for {duration}s...[/bold cyan]"
+    )
     console.print("Press [bold red]Ctrl+C[/bold red] to exit early.\n")
 
     if backend.mode == "wifi":
         import websockets
+
         async def _ws_monitor():
             uri = f"ws://{backend.ip}/ws/command"
             async with websockets.connect(uri, ping_interval=None) as ws:
-                sub_cmd = {"jsonrpc": "2.0", "method": "subscribe-state", "params": {"interval_ms": 150}, "id": 1}
+                sub_cmd = {
+                    "jsonrpc": "2.0",
+                    "method": "subscribe-state",
+                    "params": {"interval_ms": 150},
+                    "id": 1,
+                }
                 await ws.send(json.dumps(sub_cmd))
                 start_t = time.time()
                 with Live(refresh_per_second=8) as live:
@@ -908,26 +1273,44 @@ def monitor(
                             msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
                             data = json.loads(msg)
                             if "state" in data or "result" in data:
-                                st = data.get("state") or (data.get("result") if isinstance(data.get("result"), dict) else {})
+                                st = data.get("state") or (
+                                    data.get("result")
+                                    if isinstance(data.get("result"), dict)
+                                    else {}
+                                )
                                 if "position" in st:
-                                    tbl = Table(title="Live Motor Telemetry (WiFi)", show_header=True, header_style="bold green")
+                                    tbl = Table(
+                                        title="Live Motor Telemetry (WiFi)",
+                                        show_header=True,
+                                        header_style="bold green",
+                                    )
                                     tbl.add_column("Metric", style="cyan")
                                     tbl.add_column("Value", style="magenta")
-                                    tbl.add_row("Position (mm)", f"{st.get('position', 0.0):.3f}")
-                                    tbl.add_row("Speed (mm/s)", f"{st.get('speed', 0.0):.2f}")
-                                    tbl.add_row("Trajectory y", f"{st.get('y', 0.0):.3f}")
+                                    tbl.add_row(
+                                        "Position (mm)",
+                                        f"{st.get('position', 0.0):.3f}",
+                                    )
+                                    tbl.add_row(
+                                        "Speed (mm/s)", f"{st.get('speed', 0.0):.2f}"
+                                    )
+                                    tbl.add_row(
+                                        "Trajectory y", f"{st.get('y', 0.0):.3f}"
+                                    )
                                     live.update(tbl)
                         except asyncio.TimeoutError:
                             pass
                 unsub_cmd = {"jsonrpc": "2.0", "method": "unsubscribe-state", "id": 2}
                 await ws.send(json.dumps(unsub_cmd))
+
         asyncio.run(_ws_monitor())
 
     elif backend.mode == "ble":
+
         async def _ble_monitor():
             client = await backend._get_ble_client()
             state_data = {"pos": 0.0, "speed": 0.0, "y": 0.0}
             reassembler = BleChunkReassembler()
+
             def _cb(sender, data):
                 payload = reassembler.feed(bytes(data))
                 if payload is None:
@@ -941,13 +1324,24 @@ def monitor(
                     pass
 
             await client.start_notify(BleUUID.CHAR_STATE, _cb)
-            sub_cmd = {"jsonrpc": "2.0", "method": "subscribe-state", "params": {"interval_ms": 150}, "id": 1}
-            await client.write_gatt_char(BleUUID.CHAR_RPC, json.dumps(sub_cmd).encode("utf-8"), response=True)
+            sub_cmd = {
+                "jsonrpc": "2.0",
+                "method": "subscribe-state",
+                "params": {"interval_ms": 150},
+                "id": 1,
+            }
+            await client.write_gatt_char(
+                BleUUID.CHAR_RPC, json.dumps(sub_cmd).encode("utf-8"), response=True
+            )
 
             start_t = time.time()
             with Live(refresh_per_second=8) as live:
                 while time.time() - start_t < duration:
-                    tbl = Table(title="Live Motor Telemetry (BLE)", show_header=True, header_style="bold green")
+                    tbl = Table(
+                        title="Live Motor Telemetry (BLE)",
+                        show_header=True,
+                        header_style="bold green",
+                    )
                     tbl.add_column("Metric", style="cyan")
                     tbl.add_column("Value", style="magenta")
                     tbl.add_row("Position (mm)", f"{state_data['pos']:.3f}")
@@ -957,21 +1351,30 @@ def monitor(
                     await asyncio.sleep(0.12)
 
             unsub_cmd = {"jsonrpc": "2.0", "method": "unsubscribe-state", "id": 2}
-            await client.write_gatt_char(BleUUID.CHAR_RPC, json.dumps(unsub_cmd).encode("utf-8"), response=True)
+            await client.write_gatt_char(
+                BleUUID.CHAR_RPC, json.dumps(unsub_cmd).encode("utf-8"), response=True
+            )
             await client.stop_notify(BleUUID.CHAR_STATE)
+
         asyncio.run(_ble_monitor())
     else:
-        console.print("[bold red]Error:[/bold red] Monitor mode is supported in wifi and ble modes.")
+        console.print(
+            "[bold red]Error:[/bold red] Monitor mode is supported in wifi and ble modes."
+        )
 
 
 @app.command()
 def restart(
     ctx: typer.Context,
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """Reboot the target microcontroller."""
     backend = resolve_backend(ctx, mode)
-    console.print(f"[bold red]Rebooting OSSM device via {backend.mode.upper()}...[/bold red]")
+    console.print(
+        f"[bold red]Rebooting OSSM device via {backend.mode.upper()}...[/bold red]"
+    )
     asyncio.run(backend.restart_device())
     console.print("[bold green]✓ Restart command issued.[/bold green]")
 
@@ -980,10 +1383,18 @@ def restart(
 def play(
     ctx: typer.Context,
     script_path: str = typer.Argument(..., help="Path to .funscript JSON file"),
-    speed: float = typer.Option(1.0, "--speed", "-s", help="Playback speed multiplier (e.g. 1.0)"),
-    min_depth: float = typer.Option(0.0, "--min-depth", help="Minimum stroke depth limit (0.0 to 1.0)"),
-    max_depth: float = typer.Option(1.0, "--max-depth", help="Maximum stroke depth limit (0.0 to 1.0)"),
-    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Override mode: wifi, ble, or serial"),
+    speed: float = typer.Option(
+        1.0, "--speed", "-s", help="Playback speed multiplier (e.g. 1.0)"
+    ),
+    min_depth: float = typer.Option(
+        0.0, "--min-depth", help="Minimum stroke depth limit (0.0 to 1.0)"
+    ),
+    max_depth: float = typer.Option(
+        1.0, "--max-depth", help="Maximum stroke depth limit (0.0 to 1.0)"
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
 ):
     """Play a .funscript file with chunked waypoint streaming."""
     if not os.path.exists(script_path):
@@ -995,20 +1406,26 @@ def play(
 
     actions = doc.get("actions", [])
     if not actions:
-        console.print("[bold red]Error:[/bold red] Invalid or empty .funscript file (no actions found).")
+        console.print(
+            "[bold red]Error:[/bold red] Invalid or empty .funscript file (no actions found)."
+        )
         raise typer.Exit(code=1)
 
     actions.sort(key=lambda a: a.get("at", 0))
     backend = resolve_backend(ctx, mode)
 
     async def _run_play():
-        console.print(f"[bold green]Starting funscript playback ({len(actions)} actions) via {backend.mode.upper()}...[/bold green]")
-        await backend.set_config({
-            "streaming": True,
-            "paused": False,
-            "bpm": 30.0,
-            "depth": 1.0,
-        })
+        console.print(
+            f"[bold green]Starting funscript playback ({len(actions)} actions) via {backend.mode.upper()}...[/bold green]"
+        )
+        await backend.set_config(
+            {
+                "streaming": True,
+                "paused": False,
+                "bpm": 30.0,
+                "depth": 1.0,
+            }
+        )
 
         try:
             idx = 0
@@ -1050,17 +1467,23 @@ def play(
                             chunk.append({"ts": int(rel_ms), "pos": mapped_pos})
                         await backend.send_waypoints(chunk, reset_timestamp=False)
 
-                    table = Table(title=f"Funscript Playback ({os.path.basename(script_path)})")
+                    table = Table(
+                        title=f"Funscript Playback ({os.path.basename(script_path)})"
+                    )
                     table.add_column("Metric", style="cyan", no_wrap=True)
                     table.add_column("Value", style="bold green")
-                    table.add_row("Progress", f"{elapsed:.1f}s / {total_duration_sec:.1f}s")
+                    table.add_row(
+                        "Progress", f"{elapsed:.1f}s / {total_duration_sec:.1f}s"
+                    )
                     table.add_row("Sent Actions", f"{idx} / {total_actions}")
                     table.add_row("Device Buffered", str(buffered))
                     table.add_row("Speed Multiplier", f"{speed:.2f}x")
                     live.update(table)
                     await asyncio.sleep(0.2)
 
-            console.print("[bold green]✓ Funscript playback completed cleanly.[/bold green]")
+            console.print(
+                "[bold green]✓ Funscript playback completed cleanly.[/bold green]"
+            )
         except KeyboardInterrupt:
             console.print("\n[bold yellow]Playback interrupted by user.[/bold yellow]")
         finally:

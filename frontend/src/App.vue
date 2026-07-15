@@ -66,6 +66,7 @@ const isInitialized = ref(false)
 const mode = ref<api.ConnectionMode>(api.getConnectionMode())
 const bleConnecting = ref(false)
 const isHttps = window.location.protocol === 'https:'
+const BLE_STATE_INTERVAL_MS = 100
 
 const isWifiModeAvailable = computed(() => {
   return !isHttps || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
@@ -85,7 +86,8 @@ async function syncLiveStateSubscription() {
   if (!isInitialized.value) return
   if (showDiagram.value || showSettings.value) {
     try {
-      await api.subscribeState(onMotorStateUpdate, 33)
+      const intervalMs = mode.value === 'bluetooth' ? BLE_STATE_INTERVAL_MS : 33
+      await api.subscribeState(onMotorStateUpdate, intervalMs)
     } catch (e) {
       console.warn('Could not subscribe to live motor state:', e)
     }
@@ -99,18 +101,27 @@ watch([showDiagram, showSettings], () => {
 })
 
 async function switchMode(newMode: api.ConnectionMode) {
+  if (mode.value === newMode) {
+    return
+  }
+
+  try {
+    await api.unsubscribeState(onMotorStateUpdate)
+  } catch (e) {
+    console.warn('Failed to clean previous state subscription during mode switch:', e)
+  }
+  api.disconnectBle()
+
   mode.value = newMode
   api.setConnectionMode(newMode)
   connected.value = false
   motorReady.value = false
+  isInitialized.value = false
   motorState.value = null
   error.value = null
   
   if (newMode === 'wifi') {
-    api.disconnectBle()
     await fetchConfig()
-  } else {
-    api.disconnectBle()
   }
 }
 
@@ -119,8 +130,11 @@ async function connectToBle() {
   error.value = null
   try {
     const ok = await api.connectBle(() => {
+      void api.unsubscribeState(onMotorStateUpdate)
+      isInitialized.value = false
       connected.value = false
       motorReady.value = false
+      motorState.value = null
       error.value = 'Bluetooth disconnected'
     })
     if (ok) {
@@ -166,7 +180,15 @@ async function setPaused(paused: boolean) {
     let updatedConfig
     if (paused && pauseMode.value === 'in-place') {
       const state = await stateMachine.executeControl(() => api.getState())
-      updatedConfig = await stateMachine.executeControl(() => api.setPaused({ paused: true, position: state.y }))
+      const pausePos =
+        typeof state.y === 'number'
+          ? state.y
+          : typeof state.shaped_y === 'number'
+            ? state.shaped_y
+            : config.value.paused_position
+      updatedConfig = await stateMachine.executeControl(() =>
+        api.setPaused({ paused: true, position: pausePos }),
+      )
     }
     else {
       updatedConfig = await stateMachine.executeControl(() => api.setPaused({ paused }))
@@ -207,6 +229,8 @@ async function fetchConfig() {
   if (mode.value === 'bluetooth' && !api.isBleConnected()) {
     connected.value = false
     motorReady.value = false
+    isInitialized.value = false
+    motorState.value = null
     return
   }
 
@@ -223,6 +247,8 @@ async function fetchConfig() {
     console.error(e)
     connected.value = false
     motorReady.value = false
+    isInitialized.value = false
+    motorState.value = null
     error.value = 'Failed to connect to device'
     return
   }
@@ -334,6 +360,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   void api.unsubscribeState(onMotorStateUpdate)
+  api.disconnectBle()
 })
 
 // when wave_func is changed to thrust, set sharpness to 0.1

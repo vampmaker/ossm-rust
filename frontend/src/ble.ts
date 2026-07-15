@@ -7,6 +7,14 @@ const PAUSED_UUID  = '6e400004-b5a3-f393-e0a9-e50e24dcca9e'
 const PIN_UUID     = '6e400005-b5a3-f393-e0a9-e50e24dcca9e'
 const RPC_UUID     = '6e400006-b5a3-f393-e0a9-e50e24dcca9e'
 const NET_UUID     = '6e400007-b5a3-f393-e0a9-e50e24dcca9e'
+const BLE_DISCOVERY_TIMEOUT_MS = 45_000
+const BLE_CONNECT_TIMEOUT_MS = 15_000
+const BLE_GATT_OP_TIMEOUT_MS = 8_000
+const BLE_NOTIFICATION_OP_TIMEOUT_MS = 10_000
+const BLE_IO_RETRIES = 3
+
+const textDecoder = new TextDecoder('utf-8')
+const textEncoder = new TextEncoder()
 
 class BleChunkReassembler {
   private chunks = new Map<number, Uint8Array>()
@@ -23,7 +31,7 @@ class BleChunkReassembler {
     if (total === 1 && index === 0) {
       this.chunks.clear()
       this.total = 0
-      return new TextDecoder('utf-8').decode(fragment)
+      return textDecoder.decode(fragment)
     }
 
     if (total !== this.total) {
@@ -49,7 +57,7 @@ class BleChunkReassembler {
       }
       this.chunks.clear()
       this.total = 0
-      return new TextDecoder('utf-8').decode(combined)
+      return textDecoder.decode(combined)
     }
 
     return null
@@ -73,10 +81,169 @@ let rpcChar: BluetoothRemoteGATTCharacteristic | null = null
 let netConfigChar: BluetoothRemoteGATTCharacteristic | null = null
 
 const stateReassembler = new BleChunkReassembler()
+const rpcReassembler = new BleChunkReassembler()
 const bleStateListeners = new Set<(state: MotorState) => void>()
 let bleNotificationStarted = false
 let connectInProgress = false
+let disconnectCallback: (() => void) | null = null
+let deviceDisconnectHandler: ((event: Event) => void) | null = null
+let stateNotificationHandler: ((event: Event) => void) | null = null
+let rpcNotificationHandler: ((event: Event) => void) | null = null
 let gattLock = Promise.resolve()
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function withTimeout<T>(operation: Promise<T>, timeoutMs: number, operationName: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error(`BLE ${operationName} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    operation.then(
+      result => {
+        clearTimeout(timeout)
+        resolve(result)
+      },
+      error => {
+        clearTimeout(timeout)
+        reject(error)
+      },
+    )
+  })
+}
+
+function normalizeBleError(error: unknown): Error {
+  if (error instanceof DOMException) {
+    if (error.name === 'NotFoundError') {
+      return new Error('No compatible OSSM BLE device was selected or discovered.')
+    }
+    if (error.name === 'SecurityError') {
+      return new Error('Web Bluetooth requires a secure context (HTTPS or localhost).')
+    }
+    if (error.name === 'NotSupportedError') {
+      return new Error('Web Bluetooth is not supported by this browser/device.')
+    }
+    if (error.name === 'NetworkError') {
+      return new Error('BLE connection was lost during the operation.')
+    }
+  }
+  if (error instanceof Error) {
+    return error
+  }
+  return new Error(String(error))
+}
+
+function detachDeviceDisconnectListener(): void {
+  if (device && deviceDisconnectHandler) {
+    device.removeEventListener('gattserverdisconnected', deviceDisconnectHandler)
+  }
+  deviceDisconnectHandler = null
+}
+
+function detachStateNotificationListener(): void {
+  if (stateChar && stateNotificationHandler) {
+    stateChar.removeEventListener('characteristicvaluechanged', stateNotificationHandler)
+  }
+  stateNotificationHandler = null
+}
+
+function detachRpcNotificationListener(): void {
+  if (rpcChar && rpcNotificationHandler) {
+    rpcChar.removeEventListener('characteristicvaluechanged', rpcNotificationHandler)
+  }
+  rpcNotificationHandler = null
+}
+
+function clearBleSession(clearDevice = true): void {
+  detachStateNotificationListener()
+  detachRpcNotificationListener()
+  if (clearDevice) {
+    detachDeviceDisconnectListener()
+  }
+  bleStateListeners.clear()
+  stateReassembler.reset()
+  rpcReassembler.reset()
+  bleNotificationStarted = false
+
+  configChar = null
+  stateChar = null
+  pausedChar = null
+  pinConfigChar = null
+  rpcChar = null
+  netConfigChar = null
+  service = null
+  gattServer = null
+
+  if (clearDevice) {
+    device = null
+    disconnectCallback = null
+  }
+
+  // Ensure stale hung operations do not permanently block future operations.
+  gattLock = Promise.resolve()
+}
+
+async function requestDeviceWithFallback(bluetooth: Bluetooth): Promise<BluetoothDevice> {
+  // One chooser with OR filters: name-based discovery is reliable for OSSM's
+  // CompleteLocalName, and the service UUID filter covers scanners that match
+  // services in advertising data. Avoid stacked requestDevice() calls — each
+  // opens a new chooser and leaves the previous attempt hanging.
+  const options: BluetoothRequestDeviceOptions = {
+    filters: [
+      { name: 'OSSM' },
+      { namePrefix: 'OSSM' },
+      { services: [SERVICE_UUID] },
+    ],
+    optionalServices: [SERVICE_UUID],
+  }
+
+  try {
+    return await withTimeout(
+      bluetooth.requestDevice(options),
+      BLE_DISCOVERY_TIMEOUT_MS,
+      'device discovery',
+    )
+  } catch (error) {
+    throw normalizeBleError(error)
+  }
+}
+
+function normalizeMotorState(raw: unknown): MotorState {
+  const state = (raw ?? {}) as MotorState & Record<string, unknown>
+  const config = (state.config ?? {}) as MotorState['config']
+  const y =
+    typeof state.y === 'number'
+      ? state.y
+      : typeof state.shaped_y === 'number'
+        ? state.shaped_y
+        : typeof config.paused_position === 'number'
+          ? config.paused_position
+          : 0
+  const shapedY = typeof state.shaped_y === 'number' ? state.shaped_y : y
+
+  return {
+    ...state,
+    config,
+    y,
+    shaped_y: shapedY,
+    position: typeof state.position === 'number' ? state.position : 0,
+    speed: typeof state.speed === 'number' ? state.speed : 0,
+    t: typeof state.t === 'number' ? state.t : 0,
+    x: typeof state.x === 'number' ? state.x : 0,
+  } as MotorState
+}
+
+function requireConnectedCharacteristic(
+  char: BluetoothRemoteGATTCharacteristic | null,
+  label: string,
+): BluetoothRemoteGATTCharacteristic {
+  if (!char || !gattServer || !gattServer.connected) {
+    throw new Error(`BLE not connected (${label})`)
+  }
+  return char
+}
 
 async function withGattLock<T>(fn: () => Promise<T>): Promise<T> {
   const previous = gattLock
@@ -93,7 +260,8 @@ async function withGattLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export async function connectBle(onDisconnect?: () => void): Promise<boolean> {
-  if (!navigator.bluetooth) {
+  const bluetooth = navigator.bluetooth
+  if (!bluetooth) {
     throw new Error('Web Bluetooth is not supported in this browser.')
   }
   if (isBleConnected()) {
@@ -105,34 +273,98 @@ export async function connectBle(onDisconnect?: () => void): Promise<boolean> {
 
   connectInProgress = true
   try {
-    device = await navigator.bluetooth.requestDevice({
-      filters: [
-        { name: 'OSSM' },
-        { namePrefix: 'OSSM' }
-      ],
-      optionalServices: [SERVICE_UUID]
-    })
+    clearBleSession()
+    disconnectCallback = onDisconnect ?? null
 
-    if (onDisconnect) {
-      device.addEventListener('gattserverdisconnected', () => {
-        gattServer = null
-        stateReassembler.reset()
-        bleNotificationStarted = false
-        onDisconnect()
-      })
+    device = await requestDeviceWithFallback(bluetooth)
+    if (!device.gatt) {
+      throw new Error('Selected BLE device does not expose a GATT server.')
     }
 
-    gattServer = await device.gatt!.connect()
-    service = await gattServer.getPrimaryService(SERVICE_UUID)
+    deviceDisconnectHandler = () => {
+      const cb = disconnectCallback
+      clearBleSession(false)
+      if (cb) {
+        cb()
+      }
+    }
+    device.addEventListener('gattserverdisconnected', deviceDisconnectHandler)
 
-    configChar = await service.getCharacteristic(CONFIG_UUID)
-    stateChar = await service.getCharacteristic(STATE_UUID)
-    pausedChar = await service.getCharacteristic(PAUSED_UUID)
-    pinConfigChar = await service.getCharacteristic(PIN_UUID)
-    rpcChar = await service.getCharacteristic(RPC_UUID)
-    netConfigChar = await service.getCharacteristic(NET_UUID)
+    gattServer = await withTimeout(
+      device.gatt.connect(),
+      BLE_CONNECT_TIMEOUT_MS,
+      'GATT connect',
+    )
+    service = await withTimeout(
+      gattServer.getPrimaryService(SERVICE_UUID),
+      BLE_GATT_OP_TIMEOUT_MS,
+      'service discovery',
+    )
+
+    configChar = await withTimeout(
+      service.getCharacteristic(CONFIG_UUID),
+      BLE_GATT_OP_TIMEOUT_MS,
+      'config characteristic discovery',
+    )
+    stateChar = await withTimeout(
+      service.getCharacteristic(STATE_UUID),
+      BLE_GATT_OP_TIMEOUT_MS,
+      'state characteristic discovery',
+    )
+    pausedChar = await withTimeout(
+      service.getCharacteristic(PAUSED_UUID),
+      BLE_GATT_OP_TIMEOUT_MS,
+      'paused characteristic discovery',
+    )
+    pinConfigChar = await withTimeout(
+      service.getCharacteristic(PIN_UUID),
+      BLE_GATT_OP_TIMEOUT_MS,
+      'pin characteristic discovery',
+    )
+    rpcChar = await withTimeout(
+      service.getCharacteristic(RPC_UUID),
+      BLE_GATT_OP_TIMEOUT_MS,
+      'rpc characteristic discovery',
+    )
+    netConfigChar = await withTimeout(
+      service.getCharacteristic(NET_UUID),
+      BLE_GATT_OP_TIMEOUT_MS,
+      'network characteristic discovery',
+    )
+
+    if (rpcChar) {
+      if (!rpcNotificationHandler) {
+        rpcNotificationHandler = (event: Event) => {
+          const target = event.target as BluetoothRemoteGATTCharacteristic
+          if (target && target.value) {
+            try {
+              const reassembled = rpcReassembler.feed(target.value)
+              if (reassembled) {
+                console.log('BLE RPC response:', JSON.parse(reassembled))
+              }
+            } catch (e) {
+              console.error('BLE RPC notification parse error:', e)
+            }
+          }
+        }
+        rpcChar.addEventListener('characteristicvaluechanged', rpcNotificationHandler)
+      }
+      try {
+        await withTimeout(
+          rpcChar.startNotifications(),
+          BLE_NOTIFICATION_OP_TIMEOUT_MS,
+          'start rpc notifications',
+        )
+      } catch (e) {
+        console.warn('Could not start initial RPC notifications during connect:', e)
+      }
+    }
 
     return true
+  } catch (error) {
+    disconnectCallback = null
+    disconnectBle()
+    throw normalizeBleError(error)
   } finally {
     connectInProgress = false
   }
@@ -143,61 +375,72 @@ export function isBleConnected(): boolean {
 }
 
 export function disconnectBle(): void {
-  if (gattServer && gattServer.connected) {
-    gattServer.disconnect()
+  disconnectCallback = null
+  detachDeviceDisconnectListener()
+  try {
+    if (gattServer && gattServer.connected) {
+      gattServer.disconnect()
+    }
+  } catch (error) {
+    console.warn('BLE disconnect warning:', error)
   }
-  stateReassembler.reset()
-  bleNotificationStarted = false
-  device = null
-  gattServer = null
-  service = null
+  clearBleSession()
 }
 
 async function readJson<T>(char: BluetoothRemoteGATTCharacteristic | null): Promise<T> {
-  if (!char) throw new Error('BLE not connected')
+  const targetChar = requireConnectedCharacteristic(char, 'read')
   return withGattLock(async () => {
     let lastErr: unknown
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= BLE_IO_RETRIES; attempt++) {
       try {
-        const val = await char.readValue()
-        const decoder = new TextDecoder('utf-8')
-        const jsonStr = decoder.decode(val)
-        return JSON.parse(jsonStr)
+        const val = await withTimeout(
+          targetChar.readValue(),
+          BLE_GATT_OP_TIMEOUT_MS,
+          `read ${targetChar.uuid}`,
+        )
+        const jsonStr = textDecoder.decode(val)
+        return JSON.parse(jsonStr) as T
       } catch (e) {
         lastErr = e
-        if (attempt < 3) {
-          await new Promise(r => setTimeout(r, 100 * attempt))
+        if (attempt < BLE_IO_RETRIES) {
+          await delay(100 * attempt)
         }
       }
     }
-    throw lastErr || new Error('BLE read failed')
+    throw normalizeBleError(lastErr || new Error('BLE read failed'))
   })
 }
 
 async function writeJson(char: BluetoothRemoteGATTCharacteristic | null, data: unknown): Promise<void> {
-  if (!char) throw new Error('BLE not connected')
-  const encoder = new TextEncoder()
-  const bytes = encoder.encode(JSON.stringify(data))
+  const targetChar = requireConnectedCharacteristic(char, 'write')
+  const bytes = textEncoder.encode(JSON.stringify(data))
   return withGattLock(async () => {
     let lastErr: unknown
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= BLE_IO_RETRIES; attempt++) {
       try {
-        if ('writeValueWithResponse' in char && typeof (char as any).writeValueWithResponse === 'function') {
-          await (char as any).writeValueWithResponse(bytes)
-        } else if ('writeValueWithoutResponse' in char && typeof (char as any).writeValueWithoutResponse === 'function') {
-          await (char as any).writeValueWithoutResponse(bytes)
+        // Prefer write-with-response for reliable motor/config control over BLE.
+        if (typeof targetChar.writeValueWithResponse === 'function') {
+          await withTimeout(
+            targetChar.writeValueWithResponse(bytes),
+            BLE_GATT_OP_TIMEOUT_MS,
+            `write ${targetChar.uuid}`,
+          )
         } else {
-          await char.writeValue(bytes)
+          await withTimeout(
+            targetChar.writeValue(bytes),
+            BLE_GATT_OP_TIMEOUT_MS,
+            `write ${targetChar.uuid}`,
+          )
         }
         return
       } catch (e) {
         lastErr = e
-        if (attempt < 3) {
-          await new Promise(r => setTimeout(r, 100 * attempt))
+        if (attempt < BLE_IO_RETRIES) {
+          await delay(100 * attempt)
         }
       }
     }
-    throw lastErr || new Error('BLE write failed')
+    throw normalizeBleError(lastErr || new Error('BLE write failed'))
   })
 }
 
@@ -207,18 +450,19 @@ export async function getConfig(): Promise<MotorControllerConfig> {
 
 export async function setConfig(config: MotorControllerConfig): Promise<MotorControllerConfig> {
   await writeJson(configChar, config)
-  await new Promise(r => setTimeout(r, 50))
+  await delay(50)
   return readJson<MotorControllerConfig>(configChar)
 }
 
 export async function setPaused(payload: PausedControlPayload): Promise<MotorControllerConfig> {
   await writeJson(pausedChar, payload)
-  await new Promise(r => setTimeout(r, 50))
+  await delay(50)
   return readJson<MotorControllerConfig>(configChar)
 }
 
 export async function getState(): Promise<MotorState> {
-  return readJson<MotorState>(stateChar)
+  const raw = await readJson<unknown>(stateChar)
+  return normalizeMotorState(raw)
 }
 
 export async function getPinConfig(): Promise<PinConfiguration> {
@@ -227,7 +471,7 @@ export async function getPinConfig(): Promise<PinConfiguration> {
 
 export async function setPinConfig(config: PinConfiguration): Promise<PinConfiguration> {
   await writeJson(pinConfigChar, config)
-  await new Promise(r => setTimeout(r, 50))
+  await delay(50)
   return readJson<PinConfiguration>(pinConfigChar)
 }
 
@@ -237,7 +481,7 @@ export async function getNetworkConfig(): Promise<NetworkConfiguration> {
 
 export async function setNetworkConfig(config: NetworkConfiguration): Promise<NetworkConfiguration> {
   await writeJson(netConfigChar, config)
-  await new Promise(r => setTimeout(r, 50))
+  await delay(50)
   return readJson<NetworkConfiguration>(netConfigChar)
 }
 
@@ -253,32 +497,63 @@ export async function sendRpc(method: string, params?: unknown): Promise<void> {
 }
 
 export async function subscribeState(onState: (state: MotorState) => void, intervalMs = 33): Promise<void> {
-  if (!stateChar || !rpcChar) throw new Error('BLE not connected')
+  const targetStateChar = requireConnectedCharacteristic(stateChar, 'state notifications')
+  const targetRpcChar = requireConnectedCharacteristic(rpcChar, 'subscribe-state')
+  // BLE ATT throughput is limited; keep a floor so notify floods don't drop links.
+  const clampedIntervalMs = Math.max(50, Math.min(5000, intervalMs))
   bleStateListeners.add(onState)
   if (!bleNotificationStarted) {
     await withGattLock(async () => {
       if (!bleNotificationStarted) {
-        stateChar!.addEventListener('characteristicvaluechanged', (event) => {
-          const target = event.target as BluetoothRemoteGATTCharacteristic
-          if (target && target.value) {
-            try {
-              const reassembled = stateReassembler.feed(target.value)
-              if (reassembled) {
-                const state = JSON.parse(reassembled) as MotorState
-                bleStateListeners.forEach(listener => listener(state))
+        if (!stateNotificationHandler) {
+          stateNotificationHandler = (event: Event) => {
+            const target = event.target as BluetoothRemoteGATTCharacteristic
+            if (target && target.value) {
+              try {
+                const reassembled = stateReassembler.feed(target.value)
+                if (reassembled) {
+                  const state = normalizeMotorState(JSON.parse(reassembled))
+                  bleStateListeners.forEach(listener => listener(state))
+                }
+              } catch (e) {
+                console.error('BLE notification parse error:', e)
               }
-            } catch (e) {
-              console.error('BLE notification parse error:', e)
             }
           }
-        })
-        await stateChar!.startNotifications()
+          targetStateChar.addEventListener('characteristicvaluechanged', stateNotificationHandler)
+        }
+        await withTimeout(
+          targetStateChar.startNotifications(),
+          BLE_NOTIFICATION_OP_TIMEOUT_MS,
+          'start state notifications',
+        )
+        if (targetRpcChar && !rpcNotificationHandler) {
+          rpcNotificationHandler = (event: Event) => {
+            const target = event.target as BluetoothRemoteGATTCharacteristic
+            if (target && target.value) {
+              try {
+                const reassembled = rpcReassembler.feed(target.value)
+                if (reassembled) {
+                  console.log('BLE RPC response:', JSON.parse(reassembled))
+                }
+              } catch (e) {
+                console.error('BLE RPC notification parse error:', e)
+              }
+            }
+          }
+          targetRpcChar.addEventListener('characteristicvaluechanged', rpcNotificationHandler)
+          await withTimeout(
+            targetRpcChar.startNotifications(),
+            BLE_NOTIFICATION_OP_TIMEOUT_MS,
+            'start rpc notifications',
+          )
+        }
         bleNotificationStarted = true
       }
     })
   }
-  const req = { jsonrpc: '2.0', method: 'subscribe-state', params: { interval_ms: intervalMs }, id: 1 }
-  await writeJson(rpcChar, req)
+  const req = { jsonrpc: '2.0', method: 'subscribe-state', params: { interval_ms: clampedIntervalMs }, id: 1 }
+  await writeJson(targetRpcChar, req)
 }
 
 export async function unsubscribeState(onState?: (state: MotorState) => void): Promise<void> {
@@ -292,10 +567,15 @@ export async function unsubscribeState(onState?: (state: MotorState) => void): P
       const req = { jsonrpc: '2.0', method: 'unsubscribe-state', id: 1 }
       await writeJson(rpcChar, req)
       await withGattLock(async () => {
-        await stateChar!.stopNotifications()
+        await withTimeout(
+          stateChar!.stopNotifications(),
+          BLE_NOTIFICATION_OP_TIMEOUT_MS,
+          'stop state notifications',
+        )
       })
       bleNotificationStarted = false
       stateReassembler.reset()
+      detachStateNotificationListener()
     } catch (e) {
       console.warn('Error unsubscribing BLE state:', e)
     }

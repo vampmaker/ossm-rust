@@ -142,8 +142,8 @@ impl StorageManager {
     }
 
     fn set_json<T: Serialize>(&mut self, key: &str, value: &T) -> Result<()> {
-        crate::buffers::serialize_to_scratchpad(value, |json_str| self.set_string(key, json_str))
-            .map_err(|_| FirmwareError::Json)?
+        let json = serde_json::to_string(value).map_err(|_| FirmwareError::Json)?;
+        self.set_string(key, &json)
     }
 
     fn get_json<T: DeserializeOwned>(&mut self, key: &str) -> Result<T> {

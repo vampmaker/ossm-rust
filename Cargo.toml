@@ -55,8 +55,12 @@ esp-hal = { version = "1.1", features = ["unstable", "rt", "log-04"] }
 esp-rtos = { version = "0.3", features = ["embassy", "esp-radio", "esp-alloc", "log-04"] }
 esp-radio = { version = "1.0.0-beta.0", features = ["wifi", "ble", "coex", "unstable", "log-04"] }
 esp-alloc = { version = "0.10", features = ["nightly"] }
-esp-backtrace = { version = "0.15", features = ["panic-handler", "println"] }
-esp-println = { version = "0.13", default-features = false, features = ["jtag-serial", "critical-section", "log"] }
+# Unwind for our custom #[panic_handler]. Do not enable panic-handler /
+# exception-handler (those clash with console::panic / esp-hal). esp-println is
+# required by esp-backtrace's build gate only — never init it as the logger.
+esp-backtrace = { version = "0.15", default-features = false, features = ["println"] }
+esp-println = { version = "0.13", default-features = false, features = ["jtag-serial", "critical-section"] }
+rtt-target = "0.6"
 
 esp-storage = "0.8"
 esp-nvs = "0.4"

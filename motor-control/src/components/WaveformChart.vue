@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import type { DriveState } from '../lib/registers'
 import GroupBox from './GroupBox.vue'
+
+const { t } = useI18n()
 
 const props = defineProps<{
   state: DriveState | null
@@ -188,29 +191,28 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <GroupBox caption="波形显示" class="h-full flex flex-col">
+  <GroupBox :caption="t('panels.waveform')" class="h-full flex flex-col">
     <div class="flex flex-wrap items-center gap-3 text-[11px] mb-1.5 px-1 select-none">
       <label class="flex items-center gap-1 cursor-pointer font-medium">
         <input v-model="visibility.current" type="checkbox" class="accent-yellow-600" />
-        <span style="color: #ca8a04">电流</span>
+        <span style="color: #ca8a04">{{ t('waveform.current') }}</span>
       </label>
       <label class="flex items-center gap-1 cursor-pointer font-medium">
         <input v-model="visibility.pwm" type="checkbox" class="accent-fuchsia-600" />
-        <span style="color: #c026d3">输出脉宽</span>
+        <span style="color: #c026d3">{{ t('waveform.pwm') }}</span>
       </label>
       <label class="flex items-center gap-1 cursor-pointer font-medium">
         <input v-model="visibility.speed" type="checkbox" class="accent-cyan-600" />
-        <span style="color: #0891b2">转速</span>
+        <span style="color: #0891b2">{{ t('waveform.speed') }}</span>
       </label>
       <label class="flex items-center gap-1 cursor-pointer font-medium">
         <input v-model="visibility.voltage" type="checkbox" class="accent-gray-500" />
-        <span style="color: #6b7280">电压</span>
+        <span style="color: #6b7280">{{ t('waveform.voltage') }}</span>
       </label>
-      <span class="text-gray-600 ml-auto">X: 0..{{ X_MAX }} · Y: ±{{ Y_MAX }} · /32768</span>
+      <span class="text-gray-600 ml-auto">{{ t('waveform.axisHint', { xMax: X_MAX, yMax: Y_MAX }) }}</span>
     </div>
     <div class="relative flex-1 w-full min-h-[260px] border border-gray-500 bg-white shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] overflow-hidden">
       <canvas ref="canvasRef" class="absolute inset-0 w-full h-full" />
     </div>
   </GroupBox>
 </template>
-

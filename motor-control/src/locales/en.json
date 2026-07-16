@@ -1,0 +1,237 @@
+{
+  "meta": {
+    "title": "YZ_AIM_v2_61",
+    "subtitle": "57AIM30 PC Control",
+    "headerHint": "Local Serial / Remote Modbus WebSocket"
+  },
+  "panels": {
+    "waveform": "Waveform Display",
+    "paramList": "Modbus Control Parameters",
+    "telemetry": "Motor Running Parameters",
+    "driver": "Driver Settings",
+    "modbusRead": "Modbus Read",
+    "status": "Driver Run Status",
+    "send": "Modbus Send",
+    "sendEcho": "Sent Data",
+    "commLog": "Comm Log"
+  },
+  "connect": {
+    "connectionType": "Connection:",
+    "localSerial": "Local Serial",
+    "remoteWebSocket": "Remote WebSocket",
+    "baudRate": "Baud rate:",
+    "wsUrl": "WS URL:",
+    "wsUrlPlaceholder": "ws://ossm.lan/ws/modbus",
+    "openSerial": "Open serial",
+    "closeSerial": "Close serial",
+    "connect": "Connect",
+    "disconnect": "Disconnect",
+    "webSerialUnsupported": "This browser does not support Web Serial. Use Remote WebSocket instead."
+  },
+  "waveform": {
+    "current": "Current",
+    "pwm": "PWM",
+    "speed": "Speed",
+    "voltage": "Voltage",
+    "axisHint": "X: 0..{xMax} · Y: ±{yMax} · /32768"
+  },
+  "telemetry": {
+    "current": "Current:",
+    "pwm": "PWM:",
+    "speed": "Speed:",
+    "temperature": "Temp:",
+    "voltage": "Voltage:",
+    "unitA": "(A)",
+    "unitPercent": "(%)",
+    "unitRmin": "(r/min)",
+    "unitC": "(℃)",
+    "unitV": "(V)"
+  },
+  "driver": {
+    "mode": "Mode:",
+    "direction": "Dir:",
+    "enable": "EN:",
+    "speedMode": "Speed mode",
+    "positionMode": "Position mode",
+    "disabled": "Disabled",
+    "enabled": "Enabled",
+    "forward": "Forward",
+    "reverse": "Reverse"
+  },
+  "modbusRead": {
+    "deviceAddress": "Device address:",
+    "startReading": "Start reading",
+    "addressScan": "Address scan",
+    "pollInterval": "Read period"
+  },
+  "paramList": {
+    "modbusEnable": "Modbus enable:",
+    "en": "EN (enable):",
+    "pu": "PU (steps):",
+    "puTotal": "PU (total):",
+    "targetSpeed": "Target speed:",
+    "acceleration": "Acceleration:",
+    "weakField": "Weak-field angle:",
+    "speedKp": "Speed loop Kp:",
+    "speedKi": "Speed loop Ki:",
+    "positionKp": "Position loop Kp:",
+    "speedFeedforward": "Speed feedforward:",
+    "dirPolarity": "DIR polarity:",
+    "eGearRatio": "Electronic gear:",
+    "saveFlag": "Param save:",
+    "staticMaxOutput": "Static max output:",
+    "specialFunction": "Special function:",
+    "hintEnable": "Enabled",
+    "hintDisable": "Disabled",
+    "hintRmin": "( r/min )",
+    "hintAccel": "(r/min)/s",
+    "hintAngle": "(0.1°)",
+    "hintFeedforward": "V/KRPM",
+    "hintNegativeLogic": "Negative logic",
+    "hintPositiveLogic": "Positive logic",
+    "saveNotSaved": "Not saved",
+    "saveSaving": "Saving",
+    "saveSaved": "Saved",
+    "saveButton": "Save parameters",
+    "saveTriggered": "Parameter save triggered",
+    "saveFailed": "Save failed: {message}"
+  },
+  "send": {
+    "paramType": "Param type:",
+    "paramData": "Param data:",
+    "paramMeaning": "Meaning:",
+    "send": "Send",
+    "sent": "Sent {label}",
+    "showAdvanced": "Advanced (raw frame)",
+    "hideAdvanced": "Hide advanced",
+    "rawPlaceholder": "e.g. 01 03 00 00 00 1A C4 0B",
+    "appendCrc": "Append CRC16",
+    "waitResponse": "Wait for response",
+    "timeoutMs": "Timeout (ms):",
+    "sendRaw": "Send raw frame",
+    "sendFailed": "Send failed: {message}",
+    "rawSentWithResponse": "Sent {bytes} bytes, function=0x{code}",
+    "rawSentNoWait": "Sent {bytes} bytes (no wait)",
+    "invalidHex": "Invalid hex: {token}"
+  },
+  "sendType": {
+    "0": {
+      "label": "0 Modbus enable",
+      "description": "Modbus enable 1: enable, 0: disable"
+    },
+    "1": {
+      "label": "1 EN (enable)",
+      "description": "Driver enable, 0: disable, 1: enable"
+    },
+    "2": {
+      "label": "2 Target speed",
+      "description": "Motor speed, unit r/min"
+    },
+    "3": {
+      "label": "3 Motor acceleration",
+      "description": "Speed mode: acceleration range 0~30000 (r/min)/s"
+    },
+    "4": {
+      "label": "4 Weak-field angle",
+      "description": "Weak-field angle, range 0~200, unit 0.1°"
+    },
+    "5": {
+      "label": "5 Speed loop Kp",
+      "description": "Speed control KP, range 0~10000 = 0.0 to 10.0×"
+    },
+    "6": {
+      "label": "6 Speed loop Ki",
+      "description": "Speed loop KI, range 5~2000 = integral time 5ms~2000ms"
+    },
+    "7": {
+      "label": "7 Position loop Kp",
+      "description": "Position loop KP, range 1~5000"
+    },
+    "8": {
+      "label": "8 Speed feedforward",
+      "description": "Speed feedforward, 327 = 1 (V/KRPM)"
+    },
+    "9": {
+      "label": "9 DIR polarity",
+      "description": "Pulse mode DIR polarity, 0: negative logic, 1: positive logic"
+    },
+    "10": {
+      "label": "10 Electronic gear numerator",
+      "description": "Electronic gear numerator"
+    },
+    "11": {
+      "label": "11 Electronic gear denominator",
+      "description": "Electronic gear denominator"
+    },
+    "12": {
+      "label": "12 Parameter save",
+      "description": "Parameter save flag, 0: do not save, 1: save"
+    },
+    "13": {
+      "label": "13 PU (steps)",
+      "description": "PU total steps for the motor"
+    },
+    "14": {
+      "label": "14 Device address",
+      "description": "Change device address; write the new address"
+    },
+    "15": {
+      "label": "15 Temperature compensation",
+      "description": "Modify temperature"
+    },
+    "16": {
+      "label": "16 Static max output",
+      "description": "Static max output, range 0~600 = 0~60.0%"
+    },
+    "17": {
+      "label": "17 Special function",
+      "description": "Range 10~32768 = 0.1~360°, 2 = encoder follow mode"
+    },
+    "18": {
+      "label": "18 PU (total steps)",
+      "description": "PU total steps for the motor"
+    }
+  },
+  "warning": {
+    "0x00": "Normal operation",
+    "0x10": "Drive overheat (>70°C)",
+    "0x20": "Flash write failed",
+    "0x11": "Drive overheat stop (>90°C)",
+    "0x12": "Overcurrent",
+    "0x13": "Undervoltage",
+    "0x14": "Stall",
+    "0x15": "Pulse frequency too high",
+    "unknown": "Unknown error (0x{code})"
+  },
+  "status": {
+    "waitingRead": "Waiting to read driver"
+  },
+  "errors": {
+    "emptyInput": "Input is empty",
+    "hexOddLength": "Hex length without spaces must be even",
+    "noBytesParsed": "No bytes parsed",
+    "portDisconnected": "Port disconnected",
+    "noResponse": "No response received",
+    "notConnected": "Not connected",
+    "timeout": "Timeout",
+    "wsConnectFailed": "WebSocket connection failed: {url}",
+    "wsDisconnected": "WebSocket disconnected",
+    "invalidRtuResponse": "Invalid Modbus RTU response",
+    "unexpectedResponse": "Unexpected Modbus response"
+  },
+  "toasts": {
+    "connectFailed": "Connection failed: {message}",
+    "scanFound": "Address scan found device: {address}",
+    "modbusError": "Modbus error: 0x{code}",
+    "pollFailed": "Poll failed: {message}"
+  },
+  "commLog": {
+    "title": "Comm log",
+    "clear": "Clear",
+    "empty": "No traffic yet"
+  },
+  "locale": {
+    "en": "EN",
+    "zh": "中文"
+  }
+}

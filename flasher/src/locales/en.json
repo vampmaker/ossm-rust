@@ -1,0 +1,137 @@
+{
+  "meta": {
+    "title": "OSSM Flasher",
+    "subtitle": "Flash firmware and configure your OSSM device over USB"
+  },
+  "browser": {
+    "unsupportedTitle": "Web Serial API not supported",
+    "unsupportedHint": "Please use Google Chrome or Microsoft Edge (version 89+)."
+  },
+  "status": {
+    "idle": "Not connected",
+    "connecting": "Connecting...",
+    "connected": "Connected to {chip}",
+    "flashing": "Flashing... {progress}%",
+    "flashComplete": "Flash complete",
+    "sendingConfig": "Sending configuration...",
+    "configComplete": "Configuration complete",
+    "monitoring": "Monitoring serial output",
+    "error": "Error"
+  },
+  "actions": {
+    "connect": "Connect",
+    "monitor": "Monitor",
+    "stop": "Stop",
+    "reset": "Reset",
+    "disconnect": "Disconnect",
+    "flash": "Flash Firmware",
+    "flashing": "Flashing... {progress}%",
+    "sendConfig": "Send Configuration",
+    "sending": "Sending...",
+    "resetDefaults": "Reset to defaults"
+  },
+  "flash": {
+    "title": "Flash Firmware",
+    "githubBefore": "Download the latest firmware from",
+    "githubLink": "GitHub Releases",
+    "githubAfter": ", then upload the",
+    "binExt": ".bin",
+    "githubAfterFile": "file below.",
+    "dropHint": "Drop .bin file here or click to browse",
+    "fileSize": "{size} KB",
+    "addressLabel": "Flash address:",
+    "addressPlaceholder": "0x0"
+  },
+  "config": {
+    "title": "Device Configuration",
+    "wifi": {
+      "legend": "WiFi",
+      "enable": "Enable WiFi",
+      "ssid": "SSID",
+      "ssidPlaceholder": "Your WiFi network",
+      "password": "Password",
+      "passwordPlaceholder": "WiFi password"
+    },
+    "gpio": {
+      "legend": "GPIO Pins",
+      "modbusTx": "Modbus TX",
+      "modbusRx": "Modbus RX",
+      "modbusDeRe": "Modbus DE/RE"
+    },
+    "modbus": {
+      "legend": "Motor / Modbus",
+      "baudRate": "Baud Rate",
+      "deviceId": "Device ID",
+      "readTimeout": "Read timeout (ms)",
+      "readTimeoutHint": "0 = 10ms",
+      "rxInterByte": "RX inter-byte (µs)",
+      "rxInterByteHint": "0 = Auto (750µs {'@'} 115200)",
+      "interFrameQuiet": "Inter-frame quiet (µs)",
+      "interFrameQuietHint": "0 = Auto (350µs {'@'} 115200)",
+      "scanDelay": "Scan delay (µs)",
+      "scanDelayHint": "0 = t3.5"
+    },
+    "ble": {
+      "enable": "Enable Bluetooth Low Energy (BLE)"
+    },
+    "sentMonitoring": "Configuration sent. Monitoring device output."
+  },
+  "terminals": {
+    "console": "Console",
+    "serial": "Serial"
+  },
+  "log": {
+    "waitingActivity": "Waiting for activity...",
+    "waitingSerial": "Waiting for serial data...",
+    "configResetDefaults": "Configuration fields reset to defaults.",
+    "bootloaderResetting": "Device is in bootloader mode. Resetting to normal mode...",
+    "hardResetFailed": "Hard reset via esptool failed. Continuing...",
+    "monitorStarted": "--- Monitor started (115200 baud) ---",
+    "monitorStreamEnded": "Monitor stream ended. Reconnecting...",
+    "monitorError": "Monitor error: {message}",
+    "monitorStoppedFailures": "Monitor stopped after repeated reconnect failures.",
+    "monitorReconnecting": "Reconnecting monitor ({attempt}/{max})...",
+    "monitorStopped": "--- Monitor stopped ---",
+    "loadedFirmware": "Loaded firmware: {name} ({size} KB)",
+    "requestingPort": "Requesting serial port...",
+    "connectingEsp": "Connecting to ESP device...",
+    "connectedChip": "Connected: {chip}",
+    "connectionFailed": "Connection failed: {message}",
+    "disconnected": "Disconnected.",
+    "invalidFlashAddress": "Invalid flash address.",
+    "flashingFile": "Flashing {name} at {address}...",
+    "flashCompleteResetting": "Flash complete. Resetting device...",
+    "deviceResetReady": "Device reset. Ready for configuration.",
+    "flashFailed": "Flash failed: {message}",
+    "bootDetected": "Device boot detected.",
+    "preparingConfig": "Preparing to send configuration...",
+    "togglingReset": "Toggling DTR/RTS to reset device...",
+    "waitingBoot": "Waiting for device to boot (up to 15s)...",
+    "bootNotDetected": "Warning: Did not detect boot message, sending config anyway...",
+    "commandSent": "> {cmd}",
+    "ackReceived": "ACK received.",
+    "configSentResetting": "Configuration sent. Resetting device to apply...",
+    "resetAckMissing": "Reset ACK not seen; continuing with monitor attach.",
+    "configCompleteRestarting": "Configuration complete. Device is restarting with new settings.",
+    "configFailed": "Configuration failed: {message}",
+    "noPortConnectFirst": "No serial port available. Please use Connect first.",
+    "noPort": "No serial port available.",
+    "resettingDevice": "Resetting device...",
+    "deviceReset": "Device reset.",
+    "resetFailed": "Reset failed: {message}"
+  },
+  "errors": {
+    "noPort": "No serial port available.",
+    "noPortConnectFirst": "No serial port available. Please use Connect first.",
+    "streamsUnavailable": "Serial port streams unavailable.",
+    "serialStreamsUnavailable": "Serial streams unavailable.",
+    "acquireMonitorReader": "Failed to acquire monitor reader.",
+    "openStreams": "Failed to open serial streams.",
+    "streamEndedWaitingAck": "Stream ended while waiting for ACK: {expected}",
+    "timeoutWaitingAck": "Timeout waiting for ACK: {expected}"
+  },
+  "locale": {
+    "en": "EN",
+    "zh": "中文"
+  }
+}

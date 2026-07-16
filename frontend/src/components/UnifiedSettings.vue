@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import type { PinConfiguration, NetworkConfiguration, MotorState } from '../types'
 
 const props = defineProps<{
@@ -19,6 +20,8 @@ const emit = defineEmits<{
   (e: 'reset'): void
   (e: 'restart'): void
 }>()
+
+const { t } = useI18n()
 
 function updatePinField<K extends keyof PinConfiguration>(
   key: K,
@@ -58,9 +61,9 @@ const averageUpdateRate = computed(() => {
     <!-- Header -->
     <div class="flex items-center justify-between border-b border-gray-200 pb-4">
       <div>
-        <h2 class="text-2xl font-bold text-gray-800">Unified Device Settings</h2>
+        <h2 class="text-2xl font-bold text-gray-800">{{ t('settings.title') }}</h2>
         <p class="text-sm text-gray-500 mt-1">
-          Configure motor Modbus communication, WiFi network credentials, and Bluetooth (BLE) settings.
+          {{ t('settings.subtitle') }}
         </p>
       </div>
       <button
@@ -68,35 +71,34 @@ const averageUpdateRate = computed(() => {
         :disabled="!connected || saving"
         @click="emit('save')"
       >
-        {{ saving ? 'Saving...' : 'Save Settings' }}
+        {{ saving ? t('settings.saving') : t('settings.save') }}
       </button>
     </div>
 
     <p v-if="saved" class="text-sm font-semibold text-green-600 bg-green-50 p-3 rounded border border-green-200">
-      ✓ Settings successfully saved! Please restart the device to apply changes.
+      {{ t('settings.saved') }}
     </p>
 
     <!-- SECTION 1: MOTOR CONNECTION & MODBUS CONFIG -->
     <div class="space-y-4">
       <div class="flex items-center space-x-2 border-b border-gray-100 pb-2">
-        <h3 class="text-lg font-bold text-gray-800">Motor Connection & Modbus Configuration</h3>
+        <h3 class="text-lg font-bold text-gray-800">{{ t('settings.motorSection') }}</h3>
       </div>
 
       <!-- Device operating mode -->
       <div class="rounded-lg border border-gray-200 bg-white p-4 space-y-2">
-        <label class="block text-sm font-semibold text-gray-700">Device Operating Mode</label>
+        <label class="block text-sm font-semibold text-gray-700">{{ t('settings.operatingMode') }}</label>
         <select
           class="w-full border border-gray-300 rounded px-3 py-2 text-sm"
           :value="pinConfig.operating_mode ?? 'servo'"
           :disabled="!connected"
           @change="updatePinField('operating_mode', ($event.target as HTMLSelectElement).value as PinConfiguration['operating_mode'])"
         >
-          <option value="servo">Servo Control (OSSM motion)</option>
-          <option value="rtu_relay">RTU Relay (Modbus TCP + WebSocket bridge)</option>
+          <option value="servo">{{ t('settings.modeServo') }}</option>
+          <option value="rtu_relay">{{ t('settings.modeRtuRelay') }}</option>
         </select>
         <p class="text-xs text-gray-500">
-          Restart required after changing mode. In RTU Relay mode the motor controller is disabled;
-          use Modbus TCP :502 or <code class="font-mono">/ws/modbus</code> for remote drive control.
+          {{ t('settings.modeHint') }}
         </p>
       </div>
 
@@ -106,7 +108,7 @@ const averageUpdateRate = computed(() => {
           v-if="(pinConfig.operating_mode ?? 'servo') === 'rtu_relay'"
           class="text-sm text-gray-600"
         >
-          Motor update-rate telemetry is not available in RTU relay mode.
+          {{ t('settings.relayTelemetryUnavailable') }}
         </div>
         <template v-else>
           <div class="flex flex-wrap items-center justify-between gap-2">
@@ -115,15 +117,15 @@ const averageUpdateRate = computed(() => {
                 class="inline-block h-3 w-3 rounded-full"
                 :class="motorUpdateRate !== null && motorUpdateRate > 0 ? 'bg-green-500 animate-pulse' : 'bg-red-400'"
               />
-              <span class="text-sm font-semibold text-gray-700">Motor Update Rate Telemetry</span>
+              <span class="text-sm font-semibold text-gray-700">{{ t('settings.updateRateTitle') }}</span>
             </div>
             <div>
               <span v-if="motorUpdateRate !== null" class="font-mono text-xl font-bold text-blue-600">
                 {{ motorUpdateRate }}
-                <span class="text-xs font-normal text-gray-500">updates/sec (Hz)</span>
+                <span class="text-xs font-normal text-gray-500">{{ t('settings.updatesPerSec') }}</span>
               </span>
               <span v-else class="text-xs font-medium text-gray-400">
-                Not available
+                {{ t('settings.notAvailable') }}
               </span>
             </div>
           </div>
@@ -131,14 +133,14 @@ const averageUpdateRate = computed(() => {
             v-if="state && typeof state.dt_avg_ms === 'number'"
             class="mt-2 flex flex-wrap items-center justify-between border-t border-gray-200 pt-2 text-xs text-gray-600"
           >
-            <span>Loop dt (min/avg/max): <strong class="font-mono text-gray-800">{{ state.dt_min_ms?.toFixed(1) }} / {{ state.dt_avg_ms?.toFixed(1) }} / {{ state.dt_max_ms?.toFixed(1) }} ms</strong></span>
-            <span>mdev: <strong class="font-mono text-gray-800">{{ state.dt_mdev_ms?.toFixed(2) }} ms</strong></span>
+            <span>{{ t('settings.loopDt') }} <strong class="font-mono text-gray-800">{{ state.dt_min_ms?.toFixed(1) }} / {{ state.dt_avg_ms?.toFixed(1) }} / {{ state.dt_max_ms?.toFixed(1) }} ms</strong></span>
+            <span>{{ t('settings.mdev') }} <strong class="font-mono text-gray-800">{{ state.dt_mdev_ms?.toFixed(2) }} ms</strong></span>
           </div>
           <div
             v-else-if="motorUpdateRate !== null && state?.update_history"
             class="mt-2 flex items-center justify-between border-t border-gray-200 pt-2 text-xs text-gray-500"
           >
-            <span>10s Avg: <strong class="font-mono text-gray-700">{{ averageUpdateRate }} Hz</strong></span>
+            <span>{{ t('settings.tenSecAvg') }} <strong class="font-mono text-gray-700">{{ averageUpdateRate }} Hz</strong></span>
           </div>
 
           <!-- Modbus Timing & Percentiles Table (1s Rolling Window) -->
@@ -147,30 +149,34 @@ const averageUpdateRate = computed(() => {
             class="mt-3 border-t border-gray-200 pt-3"
           >
             <div class="flex flex-wrap items-center justify-between text-xs mb-2">
-              <span class="font-semibold text-gray-700">Modbus Telemetry (1s Window)</span>
+              <span class="font-semibold text-gray-700">{{ t('settings.modbusTelemetry') }}</span>
               <span
                 class="rounded-full px-2 py-0.5 font-bold"
                 :class="state.modbus_stats.success_rate >= 98 ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-800'"
               >
-                Success: {{ state.modbus_stats.success_rate.toFixed(1) }}% ({{ state.modbus_stats.successful_requests }} ok / {{ state.modbus_stats.failed_requests }} fail)
+                {{ t('settings.successRate', {
+                  rate: state.modbus_stats.success_rate.toFixed(1),
+                  ok: state.modbus_stats.successful_requests,
+                  fail: state.modbus_stats.failed_requests,
+                }) }}
               </span>
             </div>
             <div class="overflow-x-auto">
               <table class="w-full text-left font-mono text-[11px] text-gray-700 border-collapse">
                 <thead>
                   <tr class="border-b border-gray-200 text-gray-500">
-                    <th class="py-1 pr-2">Metric (µs)</th>
-                    <th class="py-1 px-1">Min</th>
-                    <th class="py-1 px-1">P5</th>
-                    <th class="py-1 px-1">P50</th>
-                    <th class="py-1 px-1">P95</th>
-                    <th class="py-1 px-1">Max</th>
-                    <th class="py-1 pl-1">Mean±MDev</th>
+                    <th class="py-1 pr-2">{{ t('settings.metricUs') }}</th>
+                    <th class="py-1 px-1">{{ t('settings.min') }}</th>
+                    <th class="py-1 px-1">{{ t('settings.p5') }}</th>
+                    <th class="py-1 px-1">{{ t('settings.p50') }}</th>
+                    <th class="py-1 px-1">{{ t('settings.p95') }}</th>
+                    <th class="py-1 px-1">{{ t('settings.max') }}</th>
+                    <th class="py-1 pl-1">{{ t('settings.meanMdev') }}</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-gray-100">
                   <tr>
-                    <td class="py-1 pr-2 font-semibold text-gray-800">Round Trip</td>
+                    <td class="py-1 pr-2 font-semibold text-gray-800">{{ t('settings.roundTrip') }}</td>
                     <td class="py-1 px-1">{{ state.modbus_stats.round_trip.min }}</td>
                     <td class="py-1 px-1">{{ state.modbus_stats.round_trip.pct5 }}</td>
                     <td class="py-1 px-1">{{ state.modbus_stats.round_trip.pct50 }}</td>
@@ -179,7 +185,7 @@ const averageUpdateRate = computed(() => {
                     <td class="py-1 pl-1">{{ state.modbus_stats.round_trip.mean }}±{{ state.modbus_stats.round_trip.mdev }}</td>
                   </tr>
                   <tr>
-                    <td class="py-1 pr-2 font-semibold text-gray-800">Slave Latency</td>
+                    <td class="py-1 pr-2 font-semibold text-gray-800">{{ t('settings.slaveLatency') }}</td>
                     <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.min }}</td>
                     <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.pct5 }}</td>
                     <td class="py-1 px-1">{{ state.modbus_stats.slave_latency.pct50 }}</td>
@@ -188,7 +194,7 @@ const averageUpdateRate = computed(() => {
                     <td class="py-1 pl-1">{{ state.modbus_stats.slave_latency.mean }}±{{ state.modbus_stats.slave_latency.mdev }}</td>
                   </tr>
                   <tr>
-                    <td class="py-1 pr-2 font-semibold text-gray-800">RX Duration</td>
+                    <td class="py-1 pr-2 font-semibold text-gray-800">{{ t('settings.rxDuration') }}</td>
                     <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.min }}</td>
                     <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.pct5 }}</td>
                     <td class="py-1 px-1">{{ state.modbus_stats.rx_duration.pct50 }}</td>
@@ -206,7 +212,7 @@ const averageUpdateRate = computed(() => {
       <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
         <div>
           <label for="modbus-tx-pin" class="mb-1 block text-sm font-medium text-gray-700">
-            Modbus TX Pin
+            {{ t('settings.modbusTx') }}
           </label>
           <input
             id="modbus-tx-pin"
@@ -221,7 +227,7 @@ const averageUpdateRate = computed(() => {
         </div>
         <div>
           <label for="modbus-rx-pin" class="mb-1 block text-sm font-medium text-gray-700">
-            Modbus RX Pin
+            {{ t('settings.modbusRx') }}
           </label>
           <input
             id="modbus-rx-pin"
@@ -236,7 +242,7 @@ const averageUpdateRate = computed(() => {
         </div>
         <div>
           <label for="modbus-de-re-pin" class="mb-1 block text-sm font-medium text-gray-700">
-            Modbus DE/RE Pin
+            {{ t('settings.modbusDeRe') }}
           </label>
           <input
             id="modbus-de-re-pin"
@@ -254,8 +260,8 @@ const averageUpdateRate = computed(() => {
       <div class="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
         <div>
           <label for="modbus-timeout-ms" class="mb-1 block text-sm font-medium text-gray-700">
-            Read Timeout (ms)
-            <span class="text-xs text-gray-400 block font-normal">0 = Auto (10ms @ 115200)</span>
+            {{ t('settings.readTimeout') }}
+            <span class="text-xs text-gray-400 block font-normal">{{ t('settings.readTimeoutHint') }}</span>
           </label>
           <input
             id="modbus-timeout-ms"
@@ -270,8 +276,8 @@ const averageUpdateRate = computed(() => {
         </div>
         <div>
           <label for="modbus-rx-timeout-us" class="mb-1 block text-sm font-medium text-gray-700">
-            RX Inter-Byte (µs)
-            <span class="text-xs text-gray-400 block font-normal">0 = Auto (1750µs @ 115200)</span>
+            {{ t('settings.rxInterByte') }}
+            <span class="text-xs text-gray-400 block font-normal">{{ t('settings.rxInterByteHint') }}</span>
           </label>
           <input
             id="modbus-rx-timeout-us"
@@ -286,8 +292,8 @@ const averageUpdateRate = computed(() => {
         </div>
         <div>
           <label for="modbus-inter-frame-delay-us" class="mb-1 block text-sm font-medium text-gray-700">
-            Inter-Frame Quiet (µs)
-            <span class="text-xs text-gray-400 block font-normal">0 = Auto (350µs @ 115200)</span>
+            {{ t('settings.interFrameQuiet') }}
+            <span class="text-xs text-gray-400 block font-normal">{{ t('settings.interFrameQuietHint') }}</span>
           </label>
           <input
             id="modbus-inter-frame-delay-us"
@@ -302,8 +308,8 @@ const averageUpdateRate = computed(() => {
         </div>
         <div>
           <label for="modbus-scan-delay-us" class="mb-1 block text-sm font-medium text-gray-700">
-            Scan Delay (µs)
-            <span class="text-xs text-gray-400 block font-normal">0 = Modbus t3.5 only</span>
+            {{ t('settings.scanDelay') }}
+            <span class="text-xs text-gray-400 block font-normal">{{ t('settings.scanDelayHint') }}</span>
           </label>
           <input
             id="modbus-scan-delay-us"
@@ -322,7 +328,7 @@ const averageUpdateRate = computed(() => {
     <!-- SECTION 2: WIFI & BLE SECTION -->
     <div class="space-y-4 pt-4 border-t border-gray-200">
       <div class="flex items-center space-x-2 border-b border-gray-100 pb-2">
-        <h3 class="text-lg font-bold text-gray-800">WiFi & Bluetooth (BLE) Interfaces</h3>
+        <h3 class="text-lg font-bold text-gray-800">{{ t('settings.wifiBleSection') }}</h3>
       </div>
 
       <!-- Independent Interface Toggles -->
@@ -334,11 +340,11 @@ const averageUpdateRate = computed(() => {
             :checked="pinConfig.ble_enabled ?? true"
             class="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
             :disabled="!connected || saving || props.mode === 'bluetooth'"
-            :title="props.mode === 'bluetooth' ? 'Cannot disable BLE while connected via BLE' : ''"
+            :title="props.mode === 'bluetooth' ? t('settings.cannotDisableBle') : ''"
             @change="updatePinField('ble_enabled', ($event.target as HTMLInputElement).checked)"
           >
           <label for="ble-enabled" class="text-sm font-semibold text-gray-800">
-            Enable Bluetooth Low Energy (BLE)
+            {{ t('settings.enableBle') }}
           </label>
         </div>
 
@@ -349,11 +355,11 @@ const averageUpdateRate = computed(() => {
             :checked="netConfig.wifi_enabled ?? true"
             class="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
             :disabled="!connected || saving || props.mode === 'wifi'"
-            :title="props.mode === 'wifi' ? 'Cannot disable WiFi while connected via WiFi' : ''"
+            :title="props.mode === 'wifi' ? t('settings.cannotDisableWifi') : ''"
             @change="updateNetField('wifi_enabled', ($event.target as HTMLInputElement).checked)"
           >
           <label for="wifi-enabled" class="text-sm font-semibold text-gray-800">
-            Enable WiFi Network & Web Interface
+            {{ t('settings.enableWifi') }}
           </label>
         </div>
       </div>
@@ -365,19 +371,19 @@ const averageUpdateRate = computed(() => {
         class="space-y-4 rounded-lg border border-blue-200 bg-blue-50/50 p-4"
       >
         <h4 class="text-sm font-bold uppercase tracking-wider text-blue-800">
-          WiFi Network Credentials & Hostname
+          {{ t('settings.wifiCredentials') }}
         </h4>
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <label for="wifi-ssid" class="mb-1 block text-sm font-medium text-gray-700">
-              WiFi SSID
+              {{ t('settings.wifiSsid') }}
             </label>
             <input
               id="wifi-ssid"
               type="text"
               maxlength="32"
-              placeholder="Enter WiFi Network Name"
+              :placeholder="t('settings.wifiSsidPlaceholder')"
               :value="netConfig.ssid"
               class="w-full rounded border border-gray-300 px-3 py-2 text-sm bg-white"
               :disabled="!connected || saving"
@@ -387,13 +393,13 @@ const averageUpdateRate = computed(() => {
 
           <div>
             <label for="wifi-password" class="mb-1 block text-sm font-medium text-gray-700">
-              WiFi Password
+              {{ t('settings.wifiPassword') }}
             </label>
             <input
               id="wifi-password"
               type="password"
               maxlength="64"
-              placeholder="Enter WiFi Password"
+              :placeholder="t('settings.wifiPasswordPlaceholder')"
               :value="netConfig.password"
               class="w-full rounded border border-gray-300 px-3 py-2 text-sm bg-white"
               :disabled="!connected || saving"
@@ -403,8 +409,8 @@ const averageUpdateRate = computed(() => {
 
           <div>
             <label for="net-hostname" class="mb-1 block text-sm font-medium text-gray-700">
-              Hostname (mDNS)
-              <span class="text-xs text-gray-400 block font-normal">Accessible at http://[hostname].local</span>
+              {{ t('settings.hostname') }}
+              <span class="text-xs text-gray-400 block font-normal">{{ t('settings.hostnameHint') }}</span>
             </label>
             <input
               id="net-hostname"
@@ -427,7 +433,7 @@ const averageUpdateRate = computed(() => {
             @change="updateNetField('dhcp_enabled', ($event.target as HTMLInputElement).checked)"
           >
           <label for="dhcp-enabled" class="text-sm font-medium text-gray-700">
-            Use DHCP (Automatic IP Address Assignment)
+            {{ t('settings.useDhcp') }}
           </label>
         </div>
 
@@ -436,7 +442,7 @@ const averageUpdateRate = computed(() => {
           class="grid grid-cols-1 gap-4 md:grid-cols-2 rounded bg-white p-3 border border-gray-200"
         >
           <div>
-            <label for="static-ip" class="mb-1 block text-sm font-medium">Static IP Address</label>
+            <label for="static-ip" class="mb-1 block text-sm font-medium">{{ t('settings.staticIp') }}</label>
             <input
               id="static-ip"
               type="text"
@@ -448,7 +454,7 @@ const averageUpdateRate = computed(() => {
             >
           </div>
           <div>
-            <label for="static-mask" class="mb-1 block text-sm font-medium">Subnet Mask</label>
+            <label for="static-mask" class="mb-1 block text-sm font-medium">{{ t('settings.subnetMask') }}</label>
             <input
               id="static-mask"
               type="text"
@@ -460,7 +466,7 @@ const averageUpdateRate = computed(() => {
             >
           </div>
           <div>
-            <label for="static-gateway" class="mb-1 block text-sm font-medium">Default Gateway</label>
+            <label for="static-gateway" class="mb-1 block text-sm font-medium">{{ t('settings.defaultGateway') }}</label>
             <input
               id="static-gateway"
               type="text"
@@ -472,7 +478,7 @@ const averageUpdateRate = computed(() => {
             >
           </div>
           <div>
-            <label for="static-dns" class="mb-1 block text-sm font-medium">DNS Server</label>
+            <label for="static-dns" class="mb-1 block text-sm font-medium">{{ t('settings.dnsServer') }}</label>
             <input
               id="static-dns"
               type="text"
@@ -494,14 +500,14 @@ const averageUpdateRate = computed(() => {
         :disabled="!connected || saving"
         @click="emit('reset')"
       >
-        Reset to defaults
+        {{ t('settings.resetDefaults') }}
       </button>
       <button
         class="rounded bg-amber-500 px-4 py-2 font-medium text-white hover:bg-amber-600 disabled:opacity-50"
         :disabled="!connected || saving"
         @click="emit('restart')"
       >
-        Restart Device
+        {{ t('settings.restartDevice') }}
       </button>
     </div>
   </div>

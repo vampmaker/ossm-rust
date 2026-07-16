@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { Settings, Bluetooth, Wifi, Activity } from '@lucide/vue'
 import MotorPositionDiagram from './components/MotorPositionDiagram.vue'
 import MainControl from './components/MainControl.vue'
@@ -8,7 +9,10 @@ import UnifiedSettings from './components/UnifiedSettings.vue'
 import FunscriptPlayer from './components/FunscriptPlayer.vue'
 import * as api from './api'
 import { stateMachine } from './connectionStateMachine'
+import { setLocale, type AppLocale } from './i18n'
 import type { MotorControllerConfig, PauseMode, PinConfiguration, NetworkConfiguration, MotorState } from './types'
+
+const { t, locale } = useI18n()
 
 const defaultConfig: MotorControllerConfig = {
   bpm: 60.0,
@@ -136,14 +140,14 @@ async function connectToBle() {
       connected.value = false
       motorReady.value = false
       motorState.value = null
-      error.value = 'Bluetooth disconnected'
+      error.value = t('errors.bluetoothDisconnected')
     })
     if (ok) {
       await fetchConfig()
     }
   } catch (e: any) {
     console.error(e)
-    error.value = e.message || 'Failed to connect to Bluetooth device'
+    error.value = e.message || t('errors.bleConnectFailed')
     connected.value = false
     motorReady.value = false
   } finally {
@@ -165,7 +169,7 @@ function setConfig(newConfig: MotorControllerConfig) {
     }
     catch (e) {
       console.error(e)
-      error.value = 'Failed to set config'
+      error.value = t('errors.setConfigFailed')
       motorReady.value = false
     }
   }, 200)
@@ -198,7 +202,7 @@ async function setPaused(paused: boolean) {
   }
   catch (e) {
     console.error(e)
-    error.value = 'Failed to set paused state'
+    error.value = t('errors.setPausedFailed')
     motorReady.value = false
   }
 }
@@ -217,7 +221,7 @@ function setPausedPosition(position: number) {
     }
     catch (e) {
       console.error(e)
-      error.value = 'Failed to set paused position'
+      error.value = t('errors.setPausedPositionFailed')
       motorReady.value = false
     }
   }, 100)
@@ -250,7 +254,7 @@ async function fetchConfig() {
     motorReady.value = false
     isInitialized.value = false
     motorState.value = null
-    error.value = 'Failed to connect to device'
+    error.value = t('errors.deviceConnectFailed')
     return
   }
 
@@ -269,7 +273,7 @@ async function fetchConfig() {
     console.error(e)
     motorReady.value = false
     isInitialized.value = false
-    error.value = 'Motor not initialized — Modbus settings are still available below'
+    error.value = t('errors.motorNotInitialized')
   }
 }
 
@@ -307,7 +311,7 @@ async function saveAllSettings() {
   }
   catch (e) {
     console.error(e)
-    error.value = 'Failed to save unified settings'
+    error.value = t('errors.saveSettingsFailed')
   }
   finally {
     pinConfigSaving.value = false
@@ -326,7 +330,7 @@ async function restartDevice() {
     await api.restartDevice()
     connected.value = false
     motorReady.value = false
-    error.value = 'Restart command sent. Reconnecting...'
+    error.value = t('errors.restartSent')
     setTimeout(() => {
       if (mode.value === 'wifi') {
         void fetchConfig()
@@ -337,8 +341,12 @@ async function restartDevice() {
   }
   catch (e) {
     console.error(e)
-    error.value = 'Failed to restart device'
+    error.value = t('errors.restartFailed')
   }
+}
+
+function switchLocale(next: AppLocale) {
+  setLocale(next)
 }
 
 stateMachine.onReconnect(async () => {
@@ -381,9 +389,27 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
     <div class="container mx-auto max-w-2xl p-4">
       <header class="mb-4 flex flex-wrap items-center justify-between gap-2">
         <h1 class="text-2xl font-bold">
-          OSSM-Rust Controller
+          {{ t('app.title') }}
         </h1>
         <div class="flex items-center space-x-3">
+          <!-- Locale switcher -->
+          <div class="flex rounded bg-gray-200 p-0.5 text-sm font-medium">
+            <button
+              class="rounded px-2 py-1 transition"
+              :class="locale === 'en' ? 'bg-white shadow text-blue-600 font-bold' : 'text-gray-600 hover:text-gray-900'"
+              @click="switchLocale('en')"
+            >
+              {{ t('locale.en') }}
+            </button>
+            <button
+              class="rounded px-2 py-1 transition"
+              :class="locale === 'zh' ? 'bg-white shadow text-blue-600 font-bold' : 'text-gray-600 hover:text-gray-900'"
+              @click="switchLocale('zh')"
+            >
+              {{ t('locale.zh') }}
+            </button>
+          </div>
+
           <!-- Mode switcher -->
           <div
             v-if="isWifiModeAvailable && isBleModeAvailable"
@@ -396,7 +422,7 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
               @click="switchMode('wifi')"
             >
               <Wifi :size="14" />
-              <span>WiFi</span>
+              <span>{{ t('app.wifi') }}</span>
             </button>
             <button
               v-if="isBleModeAvailable"
@@ -405,7 +431,7 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
               @click="switchMode('bluetooth')"
             >
               <Bluetooth :size="14" />
-              <span>BLE</span>
+              <span>{{ t('app.ble') }}</span>
             </button>
           </div>
 
@@ -417,13 +443,13 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
             @click="connectToBle"
           >
             <Bluetooth :size="16" />
-            <span>{{ bleConnecting ? 'Connecting...' : 'Connect BLE' }}</span>
+            <span>{{ bleConnecting ? t('app.connecting') : t('app.connectBle') }}</span>
           </button>
           <button
             class="rounded p-1.5 disabled:opacity-50"
             :class="showDiagram ? 'bg-blue-500 text-white hover:bg-blue-600' : 'bg-gray-200 hover:bg-gray-300'"
-            :title="showDiagram ? 'Hide motor position diagram' : 'Show motor position diagram'"
-            aria-label="Toggle motor position diagram"
+            :title="showDiagram ? t('app.hideDiagram') : t('app.showDiagram')"
+            :aria-label="t('app.toggleDiagram')"
             @click="showDiagram = !showDiagram"
           >
             <Activity :size="18" :stroke-width="2" />
@@ -431,8 +457,8 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
           <button
             class="rounded p-1.5 disabled:opacity-50"
             :class="showSettings ? 'bg-blue-500 text-white hover:bg-blue-600' : 'bg-gray-200 hover:bg-gray-300'"
-            :title="showSettings ? 'Hide settings' : 'Show settings'"
-            aria-label="Toggle settings"
+            :title="showSettings ? t('app.hideSettings') : t('app.showSettings')"
+            :aria-label="t('app.toggleSettings')"
             @click="showSettings = !showSettings"
           >
             <Settings :size="18" :stroke-width="2" />
@@ -441,18 +467,18 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
             class="h-3 w-3 rounded-full"
             :class="{ 'bg-green-500': connected, 'bg-red-500': !connected }"
           />
-          <span class="text-sm font-medium">{{ connected ? (motorReady ? 'Connected' : 'Modbus only') : 'Disconnected' }}</span>
+          <span class="text-sm font-medium">{{ connected ? (motorReady ? t('app.connected') : t('app.modbusOnly')) : t('app.disconnected') }}</span>
         </div>
       </header>
 
       <div v-if="mode === 'wifi' && isHttps" class="mb-4 rounded bg-amber-500 p-2.5 text-sm text-white shadow">
-        <strong>Note:</strong> You have switched to WiFi mode on an HTTPS webpage. This will not work if the device is hosted on HTTP due to browser Mixed Content restrictions. Convenient for debugging or plain HTTP hosting.
+        <strong>{{ t('app.httpsWifiNoteStrong') }}</strong> {{ t('app.httpsWifiNote') }}
       </div>
 
       <div v-if="error" class="mb-4 bg-red-500 p-2 text-white">
         {{ error }}
         <button class="ml-4 font-bold" @click="fetchConfig">
-          Retry
+          {{ t('app.retry') }}
         </button>
       </div>
 
@@ -465,11 +491,9 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
         <div class="flex items-center space-x-3">
           <span class="flex h-3 w-3 rounded-full bg-amber-500 animate-ping"></span>
           <div>
-            <p class="font-bold">RTU Relay Mode Active</p>
+            <p class="font-bold">{{ t('app.rtuRelayTitle') }}</p>
             <p class="text-xs text-amber-700">
-              Motor control is disabled. Use Modbus TCP on port 502 or WebSocket
-              <code class="font-mono">/ws/modbus</code> for remote drive access.
-              Change mode in Settings and restart to restore servo control.
+              {{ t('app.rtuRelayBody') }}
             </p>
           </div>
         </div>
@@ -477,7 +501,7 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
           @click="showSettings = true"
           class="rounded bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-700 shadow-sm"
         >
-          Open Settings
+          {{ t('app.openSettings') }}
         </button>
       </div>
 
@@ -491,12 +515,12 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
           <span class="flex h-3 w-3 rounded-full bg-amber-500 animate-ping"></span>
           <div>
             <p class="font-bold">
-              {{ !isMotorConnected ? 'Warning: Motor Not Connected or Detected' : 'Warning: Low Motor Update Rate (<50 Hz)' }}
+              {{ !isMotorConnected ? t('app.motorNotConnectedTitle') : t('app.lowUpdateRateTitle') }}
             </p>
             <p class="text-xs text-amber-700">
               {{ !isMotorConnected
-                ? 'Check Modbus wiring (TX/RX/DE/RE) and motor 24V power supply.'
-                : `Current motor update rate is ${motorUpdateRate} Hz (<50 Hz). Position loop performance may be degraded.`
+                ? t('app.motorNotConnectedBody')
+                : t('app.lowUpdateRateBody', { rate: motorUpdateRate })
               }}
             </p>
           </div>
@@ -505,7 +529,7 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
           @click="showSettings = true"
           class="rounded bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-700 shadow-sm"
         >
-          Check Settings
+          {{ t('app.checkSettings') }}
         </button>
       </div>
 

@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import type { ModbusTransport } from '../lib/transport'
 import GroupBox from './GroupBox.vue'
+
+const { t } = useI18n()
 
 const props = defineProps<{
   client: ModbusTransport
@@ -39,7 +42,7 @@ watch(
 </script>
 
 <template>
-  <GroupBox caption="发送数据">
+  <GroupBox :caption="t('panels.sendEcho')">
     <div
       class="font-mono text-[12px] text-[#800000] min-h-[1.6rem] px-1.5 py-0.5 bg-white border border-gray-400 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] truncate select-all"
       :title="lastTx"
@@ -48,4 +51,3 @@ watch(
     </div>
   </GroupBox>
 </template>
-

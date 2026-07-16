@@ -27,19 +27,20 @@ export enum ModbusRegister {
   POSITION_FORWARD = 25
 }
 
-export const WARNING_CODES: Record<number, string> = {
-  0x00: "Normal Operation / 运行正常",
-  0x10: "Drive Overheat (>70°C) / 驱动器过热( >70℃ )",
-  0x20: "Flash Write Failed / 写入flash失败",
-  0x11: "Drive Overheat Stop (>90°C) / 驱动器过热( >90℃),驱动器停机",
-  0x12: "Overcurrent / 驱动器过流报警",
-  0x13: "Undervoltage / 驱动器欠压报警",
-  0x14: "Stall / 驱动器失速报警",
-  0x15: "Pulse Frequency Too High / 驱动器脉冲输入频率过高"
-};
+import { i18n } from '../i18n'
 
-export function getWarningMessage(code: number): string {
-  return WARNING_CODES[code] || `Unknown Error (0x${code.toString(16)})`;
+const KNOWN_WARNING_CODES = new Set([0x00, 0x10, 0x20, 0x11, 0x12, 0x13, 0x14, 0x15])
+
+/** Accepts vue-i18n `t` or any (key, values?) => string. */
+type TranslateFn = (key: string, ...args: any[]) => any
+
+export function getWarningMessage(code: number, t?: TranslateFn): string {
+  const translate: TranslateFn = t ?? ((key, values) => i18n.global.t(key, values))
+  const hex = `0x${code.toString(16).padStart(2, '0')}`
+  if (KNOWN_WARNING_CODES.has(code)) {
+    return String(translate(`warning.${hex}`))
+  }
+  return String(translate('warning.unknown', { code: code.toString(16) }))
 }
 
 // Convert unsigned 16-bit to signed 16-bit

@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref, onUnmounted, computed, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { setLocale, type AppLocale } from './i18n'
 import { SerialModbusClient } from './lib/serial-port'
 import { WebSocketModbusClient } from './lib/websocket-modbus'
 import type { ModbusTransport } from './lib/transport'
@@ -15,6 +17,8 @@ import StatusConnectPanel from './components/StatusConnectPanel.vue'
 import ModbusSendPanel from './components/ModbusSendPanel.vue'
 import SendEchoStrip from './components/SendEchoStrip.vue'
 import CommLog from './components/CommLog.vue'
+
+const { t, locale } = useI18n()
 
 const serialClient = new SerialModbusClient()
 const wsClient = new WebSocketModbusClient()
@@ -43,6 +47,10 @@ watch(connectionType, (next) => {
   if (isConnected.value) return
   client.value = next === 'websocket' ? wsClient : serialClient
 })
+
+function switchLocale(next: AppLocale) {
+  setLocale(next)
+}
 
 function clampDeviceAddress() {
   const safe = Math.trunc(Number(deviceAddress.value))
@@ -84,7 +92,7 @@ async function toggleConnection() {
       isConnected.value = true
       startPolling()
     } catch (e: any) {
-      errorMsg.value = `连接失败: ${e.message}`
+      errorMsg.value = t('toasts.connectFailed', { message: e.message })
     }
   }
 }
@@ -124,13 +132,15 @@ async function pollLoop() {
         if (addressScanEnabled.value && nextState.warningCode === 0) {
           addressScanEnabled.value = false
           scanTickCounter.value = 0
-          errorMsg.value = `地址扫描找到设备: ${deviceAddress.value}`
+          errorMsg.value = t('toasts.scanFound', { address: deviceAddress.value })
         }
       } else if (response.isError) {
-        errorMsg.value = `Modbus 错误: 0x${response.errorCode?.toString(16)}`
+        errorMsg.value = t('toasts.modbusError', {
+          code: response.errorCode?.toString(16) ?? '?',
+        })
       }
     } catch (e: any) {
-      errorMsg.value = `轮询失败: ${e.message}`
+      errorMsg.value = t('toasts.pollFailed', { message: e.message })
     }
 
     advanceScanAddressIfNeeded()
@@ -154,11 +164,29 @@ onUnmounted(() => {
     <header class="bg-[#000080] text-white px-2.5 py-1 flex items-center justify-between shadow-sm select-none border-b border-gray-400">
       <div class="flex items-center gap-2">
         <div class="w-3.5 h-3.5 bg-white/20 border border-white/40 flex items-center justify-center text-[9px] font-bold">YZ</div>
-        <h1 class="text-[13px] font-bold tracking-wide">YZ_AIM_v2_61</h1>
-        <span class="text-[11px] text-blue-200">57AIM30 PC Control</span>
+        <h1 class="text-[13px] font-bold tracking-wide">{{ t('meta.title') }}</h1>
+        <span class="text-[11px] text-blue-200">{{ t('meta.subtitle') }}</span>
       </div>
       <div class="flex items-center gap-2">
-        <span class="text-[11px] text-blue-200 hidden sm:inline mr-2">Local Serial / Remote Modbus WebSocket</span>
+        <span class="text-[11px] text-blue-200 hidden sm:inline mr-2">{{ t('meta.headerHint') }}</span>
+        <div class="flex items-center gap-0 border border-white/40 overflow-hidden text-[11px]">
+          <button
+            type="button"
+            class="px-1.5 py-0.5 leading-none"
+            :class="locale === 'en' ? 'bg-white text-[#000080] font-bold' : 'bg-transparent text-blue-100 hover:bg-white/10'"
+            @click="switchLocale('en')"
+          >
+            {{ t('locale.en') }}
+          </button>
+          <button
+            type="button"
+            class="px-1.5 py-0.5 leading-none border-l border-white/40"
+            :class="locale === 'zh' ? 'bg-white text-[#000080] font-bold' : 'bg-transparent text-blue-100 hover:bg-white/10'"
+            @click="switchLocale('zh')"
+          >
+            {{ t('locale.zh') }}
+          </button>
+        </div>
         <div class="flex gap-0.5">
           <div class="w-4 h-3.5 bg-[#d4d0c8] border border-white border-r-gray-600 border-b-gray-600 flex items-center justify-center text-black text-[9px] font-bold leading-none">_</div>
           <div class="w-4 h-3.5 bg-[#d4d0c8] border border-white border-r-gray-600 border-b-gray-600 flex items-center justify-center text-black text-[9px] font-bold leading-none">□</div>
@@ -245,4 +273,3 @@ html, body {
   }
 }
 </style>
-

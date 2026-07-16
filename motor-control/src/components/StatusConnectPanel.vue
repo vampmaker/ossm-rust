@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { getWarningMessage, type DriveState } from '../lib/registers'
 import GroupBox from './GroupBox.vue'
+
+const { t } = useI18n()
 
 const props = defineProps<{
   state: DriveState | null
@@ -24,8 +27,8 @@ const baudOptions = [9600, 19200, 38400, 115200]
 
 const warningText = computed(() => {
   if (props.errorMsg) return props.errorMsg
-  if (!props.state) return '等待读取驱动器'
-  return getWarningMessage(props.state.warningCode)
+  if (!props.state) return t('status.waitingRead')
+  return getWarningMessage(props.state.warningCode, t)
 })
 
 const statusKind = computed(() => {
@@ -37,14 +40,14 @@ const statusKind = computed(() => {
 
 const connectCaption = computed(() => {
   if (props.isConnected) {
-    return props.connectionType === 'serial' ? '关闭串口' : '断开连接'
+    return props.connectionType === 'serial' ? t('connect.closeSerial') : t('connect.disconnect')
   }
-  return props.connectionType === 'serial' ? '打开串口' : '连接'
+  return props.connectionType === 'serial' ? t('connect.openSerial') : t('connect.connect')
 })
 </script>
 
 <template>
-  <GroupBox caption="驱动器运行状态" id="motor-control-connection">
+  <GroupBox :caption="t('panels.status')" id="motor-control-connection">
     <div class="flex flex-col gap-2 text-[12px] pt-0.5">
       <div
         class="min-h-[2.4rem] border px-1.5 py-1 text-center flex items-center justify-center leading-snug select-none"
@@ -61,11 +64,11 @@ const connectCaption = computed(() => {
         v-if="connectionType === 'serial' && !webSerialSupported"
         class="text-[11px] text-red-700 bg-red-50 border border-red-200 px-1 py-0.5"
       >
-        当前浏览器不支持 Web Serial，请改用 Remote WebSocket。
+        {{ t('connect.webSerialUnsupported') }}
       </div>
 
       <div class="flex items-center gap-1.5 flex-wrap">
-        <label for="mc-connection-type" class="text-gray-900 select-none">连接方式:</label>
+        <label for="mc-connection-type" class="text-gray-900 select-none">{{ t('connect.connectionType') }}</label>
         <select
           id="mc-connection-type"
           class="border border-gray-400 bg-white px-1 py-0.5 disabled:bg-gray-100 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] font-sans"
@@ -73,13 +76,13 @@ const connectCaption = computed(() => {
           :disabled="isConnected"
           @input="$emit('update:connectionType', ($event.target as HTMLSelectElement).value as 'serial' | 'websocket')"
         >
-          <option value="serial">Local Serial</option>
-          <option value="websocket">Remote WebSocket</option>
+          <option value="serial">{{ t('connect.localSerial') }}</option>
+          <option value="websocket">{{ t('connect.remoteWebSocket') }}</option>
         </select>
       </div>
 
       <div v-if="connectionType === 'serial'" class="flex items-center gap-1.5 flex-wrap">
-        <label for="mc-baud" class="text-gray-900 select-none">波特率:</label>
+        <label for="mc-baud" class="text-gray-900 select-none">{{ t('connect.baudRate') }}</label>
         <select
           id="mc-baud"
           class="border border-gray-400 bg-white px-1 py-0.5 disabled:bg-gray-100 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] font-mono"
@@ -92,14 +95,14 @@ const connectCaption = computed(() => {
       </div>
 
       <div v-else class="flex flex-col gap-0.5">
-        <label for="mc-ws-url" class="text-gray-900 select-none">WS URL:</label>
+        <label for="mc-ws-url" class="text-gray-900 select-none">{{ t('connect.wsUrl') }}</label>
         <input
           id="mc-ws-url"
           type="text"
           class="border border-gray-400 bg-white px-1 py-0.5 font-mono text-[11px] disabled:bg-gray-100 w-full shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)]"
           :value="wsUrl"
           :disabled="isConnected"
-          placeholder="ws://ossm.lan/ws/modbus"
+          :placeholder="t('connect.wsUrlPlaceholder')"
           @input="$emit('update:wsUrl', ($event.target as HTMLInputElement).value)"
         />
       </div>
@@ -115,4 +118,3 @@ const connectCaption = computed(() => {
     </div>
   </GroupBox>
 </template>
-

@@ -166,6 +166,7 @@ async def test_frontend(base_url: str):
             ],
         )
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        await context.add_init_script("localStorage.setItem('ossm_locale', 'en')")
         page = await context.new_page()
 
         ws_messages = []
@@ -398,6 +399,7 @@ async def test_flasher():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        await context.add_init_script("localStorage.setItem('ossm_locale', 'en')")
         page = await context.new_page()
 
         await page.goto(flasher_url, wait_until="load")
@@ -446,6 +448,8 @@ async def test_motor_control():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        # Force Chinese so VB panel caption assertions stay stable
+        await context.add_init_script("localStorage.setItem('ossm_locale', 'zh')")
         page = await context.new_page()
 
         await page.goto(mc_url, wait_until="load")
@@ -456,6 +460,7 @@ async def test_motor_control():
             or "57AIM30" in body
             or "Motor" in title
             or "Modbus" in body
+            or "电机" in body
         ), f"Unexpected motor-control content: title={title!r}"
         print("✓ Motor-control page successfully loaded")
 
@@ -569,6 +574,7 @@ async def _run_single_web_bluetooth_attempt(
     total_runs: int,
 ) -> None:
     context = await browser.new_context(viewport={"width": 1280, "height": 800})
+    await context.add_init_script("localStorage.setItem('ossm_locale', 'en')")
     page = await context.new_page()
     cdp = await context.new_cdp_session(page)
     await cdp.send("DeviceAccess.enable")

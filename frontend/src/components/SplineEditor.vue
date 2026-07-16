@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, onMounted } from 'vue'
+import { useI18n } from 'vue-i18n'
 import type { MotorControllerConfig } from '../types'
 
 const props = defineProps<{
@@ -10,6 +11,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'update:modelValue', config: MotorControllerConfig): void
 }>()
+
+const { t } = useI18n()
 
 interface SplinePreset {
   name: string
@@ -23,6 +26,21 @@ const presets = ref<SplinePreset[]>([
 ])
 const selectedPreset = ref<string>('')
 const pointsStr = ref<string>('')
+
+function displayPresetName(name: string): string {
+  switch (name) {
+    case 'Default Linear':
+      return t('spline.defaultLinear')
+    case 'Thrust':
+      return t('spline.thrust')
+    case 'Triangle':
+      return t('spline.triangle')
+    case 'Default':
+      return t('spline.default')
+    default:
+      return name
+  }
+}
 
 onMounted(() => {
   const savedPresets = localStorage.getItem('splinePresets')
@@ -78,7 +96,7 @@ function applyPoints() {
 }
 
 function addPreset() {
-  const name = prompt('Enter new preset name:')
+  const name = prompt(t('spline.promptNewName'))
   if (name && !presets.value.some(p => p.name === name)) {
     presets.value.push({ name, points: [0, 1] })
     selectedPreset.value = name
@@ -87,7 +105,7 @@ function addPreset() {
 
 function renamePreset() {
   const oldName = selectedPreset.value
-  const newName = prompt('Enter new name for preset:', oldName)
+  const newName = prompt(t('spline.promptRename'), oldName)
   if (newName && newName !== oldName && !presets.value.some(p => p.name === newName)) {
     const preset = presets.value.find(p => p.name === oldName)
     if (preset) {
@@ -98,7 +116,7 @@ function renamePreset() {
 }
 
 function deletePreset() {
-  if (confirm(`Are you sure you want to delete preset "${selectedPreset.value}"?`)) {
+  if (confirm(t('spline.confirmDelete', { name: selectedPreset.value }))) {
     presets.value = presets.value.filter(p => p.name !== selectedPreset.value)
     if (presets.value.length > 0) {
       const firstPreset = presets.value[0]
@@ -145,11 +163,11 @@ function importPresets() {
           }
         }
         else {
-          alert('Invalid preset file format.')
+          alert(t('spline.invalidFile'))
         }
       }
       catch (err) {
-        alert('Failed to import presets.')
+        alert(t('spline.importFailed'))
         console.error(err)
       }
     }
@@ -160,31 +178,31 @@ function importPresets() {
 
 <template>
   <div class="space-y-4 bg-white p-4 shadow-md">
-    <h2 class="text-xl font-bold">Spline Editor</h2>
+    <h2 class="text-xl font-bold">{{ t('spline.title') }}</h2>
 
     <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
       <div>
-        <label :for="`preset-select`" class="mb-1 block">Preset</label>
+        <label :for="`preset-select`" class="mb-1 block">{{ t('spline.preset') }}</label>
         <select :id="`preset-select`" v-model="selectedPreset" class="w-full border border-gray-300 bg-gray-50 p-2" :disabled="!connected">
           <option v-for="preset in presets" :key="preset.name" :value="preset.name">
-            {{ preset.name }}
+            {{ displayPresetName(preset.name) }}
           </option>
         </select>
       </div>
       <div class="flex items-end space-x-2">
         <button class="flex-1 bg-green-500 px-3 py-2 text-white hover:bg-green-600" :disabled="!connected" @click="addPreset">
-          New
+          {{ t('spline.new') }}
         </button>
         <button class="flex-1 bg-yellow-500 px-3 py-2 text-white hover:bg-yellow-600" :disabled="!connected" @click="renamePreset">
-          Rename
+          {{ t('spline.rename') }}
         </button>
         <button class="flex-1 bg-red-500 px-3 py-2 text-white hover:bg-red-600" :disabled="!connected" @click="deletePreset">
-          Delete
+          {{ t('spline.delete') }}
         </button>
       </div>
     </div>
     <div>
-      <label :for="`points-textarea`" class="mb-1 block">Points (space-separated, 0.0 to 1.0)</label>
+      <label :for="`points-textarea`" class="mb-1 block">{{ t('spline.points') }}</label>
       <textarea
         :id="`points-textarea`" v-model="pointsStr" class="w-full border border-gray-300 bg-gray-50 p-2" rows="3"
         :disabled="!connected" @blur="applyPoints"
@@ -193,10 +211,10 @@ function importPresets() {
 
     <div class="flex space-x-2">
       <button class="flex-1 bg-blue-500 px-4 py-2 text-white hover:bg-blue-600" @click="importPresets">
-        Import
+        {{ t('spline.import') }}
       </button>
       <button class="flex-1 bg-blue-500 px-4 py-2 text-white hover:bg-blue-600" @click="exportPresets">
-        Export
+        {{ t('spline.export') }}
       </button>
     </div>
   </div>

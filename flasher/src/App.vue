@@ -1,13 +1,18 @@
 <script setup lang="ts">
 /// <reference types="w3c-web-serial" />
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { ESPLoader, Transport } from 'esptool-js'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
+import { setLocale } from './i18n'
+import type { AppLocale } from './i18n'
 
 type Status = 'idle' | 'connecting' | 'connected' | 'flashing' | 'flash_done' | 'configuring' | 'config_done' | 'monitoring' | 'error'
 type SerialMode = 'idle' | 'bootloader' | 'config' | 'monitor'
+
+const { t, locale } = useI18n()
 
 const status = ref<Status>('idle')
 const chipName = ref('')
@@ -101,7 +106,7 @@ function persistDeviceConfig() {
 
 function resetDeviceConfig() {
   applyDeviceConfig(DEFAULT_DEVICE_CONFIG)
-  termLog('\x1b[33mConfiguration fields reset to defaults.\x1b[0m')
+  termLog(`\x1b[33m${t('log.configReset')}\x1b[0m`)
 }
 
 let transport: Transport | null = null
@@ -142,6 +147,14 @@ function termLog(line: string) {
   xterm?.writeln(line)
 }
 
+watch(
+  locale,
+  () => {
+    document.title = t('meta.title')
+  },
+  { immediate: true },
+)
+
 onMounted(() => {
   loadDeviceConfig()
 
@@ -180,7 +193,7 @@ onMounted(() => {
     xterm.loadAddon(fitAddon)
     xterm.open(terminalEl.value)
     fitAddon.fit()
-    xterm.writeln('\x1b[90mWaiting for activity...\x1b[0m')
+    xterm.writeln(`\x1b[90m${t('log.waitingActivity')}\x1b[0m`)
   }
 
   if (serialTerminalEl.value) {
@@ -196,7 +209,7 @@ onMounted(() => {
     serialXterm.loadAddon(serialFitAddon)
     serialXterm.open(serialTerminalEl.value)
     serialFitAddon.fit()
-    serialXterm.writeln('\x1b[90mWaiting for serial data...\x1b[0m')
+    serialXterm.writeln(`\x1b[90m${t('log.waitingSerial')}\x1b[0m`)
 
     serialXterm.onData(async (data) => {
       const encoder = new TextEncoder()
@@ -269,7 +282,7 @@ async function closePortNoLock() {
 }
 
 async function openPortNoLock(baudRate: number = 115200) {
-  if (!serialPort) throw new Error('No serial port available.')
+  if (!serialPort) throw new Error(t('errors.noPort'))
   if (!isPortOpenNoLock()) {
     await serialPort.open({ baudRate })
   }
@@ -306,11 +319,11 @@ async function cleanupEsptool() {
 
 async function ensureNormalModeFromBootloader() {
   if (esploader) {
-    termLog('\x1b[33mDevice is in bootloader mode. Resetting to normal mode...\x1b[0m')
+    termLog(`\x1b[33m${t('log.bootloaderReset')}\x1b[0m`)
     try {
       await esploader.after('hard_reset')
     } catch {
-      termLog('\x1b[90mHard reset via esptool failed. Continuing...\\x1b[0m')
+      termLog(`\x1b[90m${t('log.hardResetFailed')}\x1b[0m`)
     }
     await cleanupEsptool()
     await sleep(800)
@@ -324,7 +337,7 @@ async function enterConfigMode() {
     await releaseIoNoLock()
     await closePortNoLock()
     await openPortNoLock(115200)
-    if (!serialPort?.readable || !serialPort?.writable) throw new Error('Serial port streams unavailable.')
+    if (!serialPort?.readable || !serialPort?.writable) throw new Error(t('errors.streamsUnavailable'))
     sessionReader = serialPort.readable.getReader()
     sessionWriter = serialPort.writable.getWriter()
     serialMode.value = 'config'
@@ -379,7 +392,7 @@ async function enterMonitorMode(resetFirst: boolean) {
 async function monitorLoop(token: number, logStart: boolean) {
   if (logStart) {
     status.value = 'monitoring'
-    termLog('\x1b[1;36m--- Monitor started (115200 baud) ---\x1b[0m')
+    termLog(`\x1b[1;36m${t('log.monitorStarted')}\x1b[0m`)
   }
 
   let reconnectAttempts = 0
@@ -393,13 +406,13 @@ async function monitorLoop(token: number, logStart: boolean) {
         await releaseIoNoLock()
         await closePortNoLock()
         await openPortNoLock(115200)
-        if (!serialPort?.readable || !serialPort?.writable) throw new Error('Serial streams unavailable.')
+        if (!serialPort?.readable || !serialPort?.writable) throw new Error(t('errors.serialStreamsUnavailable'))
         const reader = serialPort.readable.getReader()
         sessionReader = reader
         sessionWriter = serialPort.writable.getWriter()
         return reader
       })
-      if (!activeReader) throw new Error('Failed to acquire monitor reader.')
+      if (!activeReader) throw new Error(t('errors.monitorReader'))
 
       reconnectAttempts = 0
       while (monitorRequested && token === monitorToken && serialMode.value === 'monitor') {
@@ -414,16 +427,16 @@ async function monitorLoop(token: number, logStart: boolean) {
     } catch (err: any) {
       if (!monitorRequested || token !== monitorToken || serialMode.value !== 'monitor') break
       if (String(err?.message || err) === '__STREAM_DONE__') {
-        termLog('\x1b[33mMonitor stream ended. Reconnecting...\x1b[0m')
+        termLog(`\x1b[33m${t('log.monitorStreamEnded')}\x1b[0m`)
       } else {
-        termLog(`\x1b[31mMonitor error:\x1b[0m ${err?.message || err}`)
+        termLog(`\x1b[31m${t('log.monitorError', { error: err?.message || err })}\x1b[0m`)
       }
       reconnectAttempts += 1
       if (reconnectAttempts > maxReconnectAttempts) {
-        termLog('\x1b[31mMonitor stopped after repeated reconnect failures.\x1b[0m')
+        termLog(`\x1b[31m${t('log.monitorStoppedFailures')}\x1b[0m`)
         break
       }
-      termLog(`\x1b[33mReconnecting monitor (${reconnectAttempts}/${maxReconnectAttempts})...\x1b[0m`)
+      termLog(`\x1b[33m${t('log.monitorReconnecting', { attempt: reconnectAttempts, max: maxReconnectAttempts })}\x1b[0m`)
       await sleep(1000)
     } finally {
       const tail = decoder.decode()
@@ -442,7 +455,7 @@ async function monitorLoop(token: number, logStart: boolean) {
     monitorRequested = false
     serialMode.value = 'idle'
     status.value = hasPort.value ? 'flash_done' : 'idle'
-    termLog('\x1b[1;36m--- Monitor stopped ---\x1b[0m')
+    termLog(`\x1b[1;36m${t('log.monitorStopped')}\x1b[0m`)
   }
 }
 
@@ -467,7 +480,7 @@ async function loadFile(file: File) {
   firmwareFile.value = file
   const buffer = await file.arrayBuffer()
   firmwareDataStr.value = arrayBufferToBinaryString(buffer)
-  termLog(`\x1b[32mLoaded firmware:\x1b[0m ${file.name} \x1b[90m(${(file.size / 1024).toFixed(1)} KB)\x1b[0m`)
+  termLog(`\x1b[32m${t('log.loadedFirmware', { name: file.name, size: (file.size / 1024).toFixed(1) })}\x1b[0m`)
 }
 
 const espTerminal = {
@@ -480,7 +493,7 @@ async function connect() {
   if (!webSerialSupported.value) return
   status.value = 'connecting'
   errorMessage.value = ''
-  termLog('\x1b[90mRequesting serial port...\x1b[0m')
+  termLog(`\x1b[90m${t('log.requestingPort')}\x1b[0m`)
   try {
     const port = await navigator.serial.requestPort()
     setPort(port)
@@ -491,16 +504,16 @@ async function connect() {
       romBaudrate: 115200,
       terminal: espTerminal,
     })
-    termLog('\x1b[33mConnecting to ESP device...\x1b[0m')
+    termLog(`\x1b[33m${t('log.connectingEsp')}\x1b[0m`)
     const chip = await esploader.main()
     chipName.value = chip
     serialMode.value = 'bootloader'
     status.value = 'connected'
-    termLog(`\x1b[1;32mConnected: ${chip}\x1b[0m`)
+    termLog(`\x1b[1;32m${t('log.connected', { chip })}\x1b[0m`)
   } catch (err: any) {
     status.value = 'error'
     errorMessage.value = err?.message || String(err)
-    termLog(`\x1b[1;31mConnection failed:\x1b[0m ${errorMessage.value}`)
+    termLog(`\x1b[1;31m${t('log.connectionFailed', { error: errorMessage.value })}\x1b[0m`)
   }
 }
 
@@ -510,19 +523,19 @@ async function disconnect() {
   setPort(null)
   chipName.value = ''
   status.value = 'idle'
-  termLog('\x1b[90mDisconnected.\x1b[0m')
+  termLog(`\x1b[90m${t('log.disconnected')}\x1b[0m`)
 }
 
 async function flash() {
   if (!esploader || !firmwareDataStr.value) return
   const address = parseInt(flashAddress.value, 16)
   if (isNaN(address)) {
-    termLog('\x1b[31mInvalid flash address.\x1b[0m')
+    termLog(`\x1b[31m${t('log.invalidAddress')}\x1b[0m`)
     return
   }
   status.value = 'flashing'
   flashProgress.value = 0
-  termLog(`\x1b[33mFlashing\x1b[0m ${firmwareFile.value?.name} at \x1b[36m0x${address.toString(16)}\x1b[0m...`)
+  termLog(`\x1b[33m${t('log.flashing', { name: firmwareFile.value?.name ?? '', address: `0x${address.toString(16)}` })}\x1b[0m`)
   try {
     await esploader.writeFlash({
       fileArray: [{ data: firmwareDataStr.value, address }],
@@ -536,16 +549,16 @@ async function flash() {
       },
     })
     flashProgress.value = 100
-    termLog('\x1b[1;32mFlash complete.\x1b[0m Resetting device...')
+    termLog(`\x1b[1;32m${t('log.flashComplete')}\x1b[0m`)
     await esploader.after('hard_reset')
     await cleanupEsptool()
     serialMode.value = 'idle'
     status.value = 'flash_done'
-    termLog('\x1b[32mDevice reset. Ready for configuration.\x1b[0m')
+    termLog(`\x1b[32m${t('log.deviceResetReady')}\x1b[0m`)
   } catch (err: any) {
     status.value = 'error'
     errorMessage.value = err?.message || String(err)
-    termLog(`\x1b[1;31mFlash failed:\x1b[0m ${errorMessage.value}`)
+    termLog(`\x1b[1;31m${t('log.flashFailed', { error: errorMessage.value })}\x1b[0m`)
   }
 }
 
@@ -568,8 +581,9 @@ async function waitForBoot(
       const text = decoder.decode(result.value, { stream: true })
       buffer += text
       serialXterm?.write(text)
+      // Firmware boot markers — do not translate
       if (buffer.includes('Hello, world!') || buffer.includes('ossm')) {
-        termLog('\x1b[1;32mDevice boot detected.\x1b[0m')
+        termLog(`\x1b[1;32m${t('log.bootDetected')}\x1b[0m`)
         return true
       }
     }
@@ -600,7 +614,7 @@ async function waitForAck(
 
     if (result === null) continue
     if (result.done) {
-      throw new Error(`Stream ended while waiting for ACK: ${expectedSubstrings.join(' | ')}`)
+      throw new Error(t('errors.streamEndedAck', { acks: expectedSubstrings.join(' | ') }))
     }
 
     if (result.value && result.value.length > 0) {
@@ -621,21 +635,22 @@ async function waitForAck(
 async function sendConfig() {
   status.value = 'configuring'
   errorMessage.value = ''
-  termLog('\x1b[33mPreparing to send configuration...\x1b[0m')
+  termLog(`\x1b[33m${t('log.preparingConfig')}\x1b[0m`)
   try {
-    if (!serialPort) throw new Error('No serial port available. Please use Connect first.')
+    if (!serialPort) throw new Error(t('errors.noPortConnect'))
     await ensureNormalModeFromBootloader()
     await enterConfigMode()
-    if (!sessionReader || !sessionWriter) throw new Error('Failed to open serial streams.')
+    if (!sessionReader || !sessionWriter) throw new Error(t('errors.openStreams'))
 
-    termLog('\x1b[90mToggling DTR/RTS to reset device...\x1b[0m')
+    termLog(`\x1b[90m${t('log.togglingDtr')}\x1b[0m`)
     await pulseResetSignalsNoLock(serialPort!)
-    termLog('\x1b[33mWaiting for device to boot (up to 15s)...\x1b[0m')
+    termLog(`\x1b[33m${t('log.waitingBoot')}\x1b[0m`)
     const booted = await waitForBoot(sessionReader, 15000)
     if (!booted) {
-      termLog('\x1b[33mWarning: Did not detect boot message, sending config anyway...\x1b[0m')
+      termLog(`\x1b[33m${t('log.bootNotDetected')}\x1b[0m`)
     }
 
+    // ACK substrings below are firmware protocol English — do not translate
     const commands: Array<{ cmd: string; ack: string[] }> = []
     commands.push({
       cmd: `set-wifi-enabled ${wifiEnabled.value}`,
@@ -692,34 +707,34 @@ async function sendConfig() {
       await sessionWriter.write(encoder.encode(item.cmd + '\r'))
       const acked = await waitForAck(sessionReader, item.ack, 10000)
       if (!acked) {
-        throw new Error(`Timeout waiting for ACK: ${item.ack.join(' | ')}`)
+        throw new Error(t('errors.ackTimeout', { acks: item.ack.join(' | ') }))
       }
-      termLog('\x1b[32mACK received.\x1b[0m')
+      termLog(`\x1b[32m${t('log.ackReceived')}\x1b[0m`)
     }
 
-    termLog('\x1b[32mConfiguration sent.\x1b[0m Resetting device to apply...')
+    termLog(`\x1b[32m${t('log.configSentReset')}\x1b[0m`)
     await sessionWriter.write(encoder.encode('reset\r'))
     const resetAcked = await waitForAck(sessionReader, ['Restarting device...'], 8000)
     if (!resetAcked) {
-      termLog('\x1b[33mReset ACK not seen; continuing with monitor attach.\x1b[0m')
+      termLog(`\x1b[33m${t('log.resetAckMissing')}\x1b[0m`)
     }
 
     await leaveCurrentMode()
     status.value = 'config_done'
-    termLog('\x1b[1;32mConfiguration complete. Device is restarting with new settings.\x1b[0m')
+    termLog(`\x1b[1;32m${t('log.configComplete')}\x1b[0m`)
     await sleep(500)
     await startMonitor(true)
   } catch (err: any) {
     await leaveCurrentMode()
     status.value = 'error'
     errorMessage.value = err?.message || String(err)
-    termLog(`\x1b[1;31mConfiguration failed:\x1b[0m ${errorMessage.value}`)
+    termLog(`\x1b[1;31m${t('log.configFailed', { error: errorMessage.value })}\x1b[0m`)
   }
 }
 
 async function startMonitor(resetFirst: boolean = true) {
   if (!serialPort) {
-    termLog('\x1b[31mNo serial port available. Please use Connect first.\x1b[0m')
+    termLog(`\x1b[31m${t('log.noPortConnect')}\x1b[0m`)
     return
   }
   await ensureNormalModeFromBootloader()
@@ -735,19 +750,19 @@ async function stopMonitor() {
 
 async function resetDevice() {
   if (!serialPort) {
-    termLog('\x1b[31mNo serial port available.\x1b[0m')
+    termLog(`\x1b[31m${t('log.noPort')}\x1b[0m`)
     return
   }
-  termLog('\x1b[33mResetting device...\x1b[0m')
+  termLog(`\x1b[33m${t('log.resetting')}\x1b[0m`)
   try {
     await ensureNormalModeFromBootloader()
     await performReset(true)
     status.value = hasPort.value ? 'flash_done' : 'idle'
-    termLog('\x1b[32mDevice reset.\x1b[0m')
+    termLog(`\x1b[32m${t('log.deviceReset')}\x1b[0m`)
   } catch (err: any) {
     status.value = 'error'
     errorMessage.value = err?.message || String(err)
-    termLog(`\x1b[31mReset failed:\x1b[0m ${errorMessage.value}`)
+    termLog(`\x1b[31m${t('log.resetFailed', { error: errorMessage.value })}\x1b[0m`)
   }
 }
 
@@ -762,15 +777,15 @@ function sleep(ms: number) {
 
 const statusLabel = computed(() => {
   switch (status.value) {
-    case 'idle': return 'Not connected'
-    case 'connecting': return 'Connecting...'
-    case 'connected': return `Connected to ${chipName.value}`
-    case 'flashing': return `Flashing... ${flashProgress.value}%`
-    case 'flash_done': return 'Flash complete'
-    case 'configuring': return 'Sending configuration...'
-    case 'config_done': return 'Configuration complete'
-    case 'monitoring': return 'Monitoring serial output'
-    case 'error': return 'Error'
+    case 'idle': return t('status.idle')
+    case 'connecting': return t('status.connecting')
+    case 'connected': return t('status.connected', { chip: chipName.value })
+    case 'flashing': return t('status.flashing', { progress: flashProgress.value })
+    case 'flash_done': return t('status.flashComplete')
+    case 'configuring': return t('status.sendingConfig')
+    case 'config_done': return t('status.configComplete')
+    case 'monitoring': return t('status.monitoring')
+    case 'error': return t('status.error')
   }
 })
 
@@ -787,19 +802,45 @@ const statusColor = computed(() => {
     case 'error': return 'text-red-600'
   }
 })
+
+function switchLocale(next: AppLocale) {
+  setLocale(next)
+}
 </script>
 
 <template>
   <div class="min-h-screen p-4 md:p-8 max-w-4xl mx-auto">
     <header class="mb-8">
-      <h1 class="text-3xl font-bold tracking-tight text-gray-900">OSSM Flasher</h1>
-      <p class="text-gray-500 mt-1">Flash firmware and configure your OSSM device over USB</p>
+      <div class="flex items-center justify-between gap-4">
+        <h1 class="text-3xl font-bold tracking-tight text-gray-900">{{ t('meta.title') }}</h1>
+        <div class="flex items-center space-x-3">
+          <div class="flex rounded bg-gray-200 p-0.5 text-sm font-medium">
+            <button
+              type="button"
+              class="rounded px-2.5 py-1 transition"
+              :class="locale === 'en' ? 'bg-white shadow text-blue-600 font-bold' : 'text-gray-600 hover:text-gray-900'"
+              @click="switchLocale('en')"
+            >
+              {{ t('locale.en') }}
+            </button>
+            <button
+              type="button"
+              class="rounded px-2.5 py-1 transition"
+              :class="locale === 'zh' ? 'bg-white shadow text-blue-600 font-bold' : 'text-gray-600 hover:text-gray-900'"
+              @click="switchLocale('zh')"
+            >
+              {{ t('locale.zh') }}
+            </button>
+          </div>
+        </div>
+      </div>
+      <p class="text-gray-500 mt-1">{{ t('meta.subtitle') }}</p>
     </header>
 
     <!-- Browser check -->
     <div v-if="!webSerialSupported" class="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
-      <p class="font-semibold text-red-700">Web Serial API not supported</p>
-      <p class="text-red-600 text-sm mt-1">Please use Google Chrome or Microsoft Edge (version 89+).</p>
+      <p class="font-semibold text-red-700">{{ t('browser.unsupportedTitle') }}</p>
+      <p class="text-red-600 text-sm mt-1">{{ t('browser.unsupportedHint') }}</p>
     </div>
 
     <!-- Status bar -->
@@ -824,35 +865,35 @@ const statusColor = computed(() => {
           :disabled="!webSerialSupported"
           class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white disabled:bg-gray-300 disabled:text-gray-500 rounded text-sm font-medium transition-colors"
         >
-          Connect
+          {{ t('actions.connect') }}
         </button>
         <button
           v-if="canMonitor"
           @click="startMonitor(true)"
           class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-700 text-white rounded text-sm font-medium transition-colors"
         >
-          Monitor
+          {{ t('actions.monitor') }}
         </button>
         <button
           v-if="status === 'monitoring'"
           @click="stopMonitor"
           class="px-4 py-1.5 bg-orange-500 hover:bg-orange-600 text-white rounded text-sm font-medium transition-colors"
         >
-          Stop
+          {{ t('actions.stop') }}
         </button>
         <button
           v-if="canReset"
           @click="resetDevice"
           class="px-4 py-1.5 bg-yellow-500 hover:bg-yellow-600 text-white rounded text-sm font-medium transition-colors"
         >
-          Reset
+          {{ t('actions.reset') }}
         </button>
         <button
           v-if="status === 'connected' || status === 'flash_done'"
           @click="disconnect"
           class="px-4 py-1.5 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded text-sm font-medium transition-colors"
         >
-          Disconnect
+          {{ t('actions.disconnect') }}
         </button>
       </div>
     </div>
@@ -860,12 +901,11 @@ const statusColor = computed(() => {
     <div class="grid gap-6 lg:grid-cols-2">
       <!-- Left column: Flash -->
       <section class="space-y-4">
-        <h2 class="text-lg font-semibold border-b border-gray-200 pb-2">Flash Firmware</h2>
+        <h2 class="text-lg font-semibold border-b border-gray-200 pb-2">{{ t('flash.title') }}</h2>
 
         <p class="text-sm text-gray-500">
-          Download the latest firmware from
-          <a href="https://github.com/vampmaker/ossm-rust/releases/" target="_blank" rel="noopener" class="text-blue-600 hover:text-blue-800 underline">GitHub Releases</a>,
-          then upload the <code class="text-xs bg-gray-100 px-1 py-0.5 rounded">.bin</code> file below.
+          {{ t('flash.githubBefore') }}
+          <a href="https://github.com/vampmaker/ossm-rust/releases/" target="_blank" rel="noopener" class="text-blue-600 hover:text-blue-800 underline">{{ t('flash.githubLink') }}</a>{{ t('flash.githubAfter') }} <span class="font-mono font-medium text-gray-700">{{ t('flash.binExt') }}</span> {{ t('flash.githubAfterFile') }}
         </p>
 
         <!-- File upload -->
@@ -885,17 +925,17 @@ const statusColor = computed(() => {
             <p class="text-gray-500 mt-1">{{ (firmwareFile.size / 1024).toFixed(1) }} KB</p>
           </div>
           <div v-else class="text-gray-400 text-sm">
-            <p class="font-medium">Drop .bin file here or click to browse</p>
+            <p class="font-medium">{{ t('flash.dropHint') }}</p>
           </div>
         </div>
 
         <!-- Flash address -->
         <div class="flex items-center gap-3">
-          <label class="text-sm text-gray-600 whitespace-nowrap">Flash address:</label>
+          <label class="text-sm text-gray-600 whitespace-nowrap">{{ t('flash.addressLabel') }}</label>
           <input
             v-model="flashAddress"
             class="bg-white border border-gray-300 rounded px-3 py-1.5 text-sm font-mono w-28 focus:border-blue-500 focus:outline-none"
-            placeholder="0x0"
+            :placeholder="t('flash.addressPlaceholder')"
           />
         </div>
 
@@ -905,7 +945,7 @@ const statusColor = computed(() => {
           :disabled="!canFlash"
           class="w-full py-2.5 bg-green-600 hover:bg-green-700 text-white disabled:bg-gray-300 disabled:text-gray-500 rounded font-medium transition-colors"
         >
-          {{ status === 'flashing' ? `Flashing... ${flashProgress}%` : 'Flash Firmware' }}
+          {{ status === 'flashing' ? t('actions.flashing', { progress: flashProgress }) : t('actions.flash') }}
         </button>
 
         <div v-if="status === 'flashing' || flashProgress > 0" class="w-full bg-gray-200 rounded-full h-2.5 overflow-hidden">
@@ -923,13 +963,13 @@ const statusColor = computed(() => {
 
       <!-- Right column: Configure -->
       <section class="space-y-4">
-        <h2 class="text-lg font-semibold border-b border-gray-200 pb-2">Device Configuration</h2>
+        <h2 class="text-lg font-semibold border-b border-gray-200 pb-2">{{ t('config.title') }}</h2>
 
         <div class="space-y-3">
           <!-- WiFi -->
           <fieldset class="space-y-2">
             <div class="flex items-center justify-between">
-              <legend class="text-sm font-medium text-gray-700">WiFi</legend>
+              <legend class="text-sm font-medium text-gray-700">{{ t('config.wifi.legend') }}</legend>
               <div class="flex items-center space-x-2">
                 <input
                   id="flasher-wifi-enabled"
@@ -938,27 +978,27 @@ const statusColor = computed(() => {
                   class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
                 />
                 <label for="flasher-wifi-enabled" class="text-xs font-medium text-gray-700">
-                  Enable WiFi
+                  {{ t('config.wifi.enable') }}
                 </label>
               </div>
             </div>
             <div v-if="wifiEnabled" class="space-y-2">
               <div>
-                <label class="text-xs text-gray-500">SSID</label>
+                <label class="text-xs text-gray-500">{{ t('config.wifi.ssid') }}</label>
                 <input
                   v-model="wifiSsid"
                   maxlength="32"
-                  placeholder="Your WiFi network"
+                  :placeholder="t('config.wifi.ssidPlaceholder')"
                   class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">Password</label>
+                <label class="text-xs text-gray-500">{{ t('config.wifi.password') }}</label>
                 <input
                   v-model="wifiPassword"
                   type="password"
                   maxlength="64"
-                  placeholder="WiFi password"
+                  :placeholder="t('config.wifi.passwordPlaceholder')"
                   class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
                 />
               </div>
@@ -967,10 +1007,10 @@ const statusColor = computed(() => {
 
           <!-- GPIO Pins -->
           <fieldset class="space-y-2">
-            <legend class="text-sm font-medium text-gray-700">GPIO Pins</legend>
+            <legend class="text-sm font-medium text-gray-700">{{ t('config.gpio.legend') }}</legend>
             <div class="grid grid-cols-3 gap-2">
               <div>
-                <label class="text-xs text-gray-500">Modbus TX</label>
+                <label class="text-xs text-gray-500">{{ t('config.gpio.modbusTx') }}</label>
                 <input
                   v-model.number="pinModbusTx"
                   type="number"
@@ -980,7 +1020,7 @@ const statusColor = computed(() => {
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">Modbus RX</label>
+                <label class="text-xs text-gray-500">{{ t('config.gpio.modbusRx') }}</label>
                 <input
                   v-model.number="pinModbusRx"
                   type="number"
@@ -990,7 +1030,7 @@ const statusColor = computed(() => {
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">Modbus DE/RE</label>
+                <label class="text-xs text-gray-500">{{ t('config.gpio.modbusDeRe') }}</label>
                 <input
                   v-model.number="pinModbusDeRe"
                   type="number"
@@ -1004,10 +1044,10 @@ const statusColor = computed(() => {
 
           <!-- Motor / Modbus -->
           <fieldset class="space-y-2">
-            <legend class="text-sm font-medium text-gray-700">Motor / Modbus</legend>
+            <legend class="text-sm font-medium text-gray-700">{{ t('config.modbus.legend') }}</legend>
             <div class="grid grid-cols-2 gap-2">
               <div>
-                <label class="text-xs text-gray-500">Baud Rate</label>
+                <label class="text-xs text-gray-500">{{ t('config.modbus.baudRate') }}</label>
                 <input
                   value="115200"
                   disabled
@@ -1015,7 +1055,7 @@ const statusColor = computed(() => {
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">Device ID</label>
+                <label class="text-xs text-gray-500">{{ t('config.modbus.deviceId') }}</label>
                 <input
                   value="1"
                   disabled
@@ -1023,7 +1063,7 @@ const statusColor = computed(() => {
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">Read timeout (ms) <span class="text-gray-400">0 = 10ms</span></label>
+                <label class="text-xs text-gray-500">{{ t('config.modbus.readTimeout') }} <span class="text-gray-400">{{ t('config.modbus.readTimeoutHint') }}</span></label>
                 <input
                   v-model.number="modbusTimeoutMs"
                   type="number"
@@ -1033,7 +1073,7 @@ const statusColor = computed(() => {
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">RX inter-byte (µs) <span class="text-gray-400">0 = Auto (750µs @ 115200)</span></label>
+                <label class="text-xs text-gray-500">{{ t('config.modbus.rxInterByte') }} <span class="text-gray-400">{{ t('config.modbus.rxInterByteHint') }}</span></label>
                 <input
                   v-model.number="modbusRxTimeoutUs"
                   type="number"
@@ -1043,7 +1083,7 @@ const statusColor = computed(() => {
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">Inter-frame quiet (µs) <span class="text-gray-400">0 = Auto (350µs @ 115200)</span></label>
+                <label class="text-xs text-gray-500">{{ t('config.modbus.interFrameQuiet') }} <span class="text-gray-400">{{ t('config.modbus.interFrameQuietHint') }}</span></label>
                 <input
                   v-model.number="modbusInterFrameDelayUs"
                   type="number"
@@ -1053,7 +1093,7 @@ const statusColor = computed(() => {
                 />
               </div>
               <div>
-                <label class="text-xs text-gray-500">Scan delay (µs) <span class="text-gray-400">0 = t3.5</span></label>
+                <label class="text-xs text-gray-500">{{ t('config.modbus.scanDelay') }} <span class="text-gray-400">{{ t('config.modbus.scanDelayHint') }}</span></label>
                 <input
                   v-model.number="modbusScanDelayUs"
                   type="number"
@@ -1071,7 +1111,7 @@ const statusColor = computed(() => {
                 class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
               />
               <label for="flasher-ble-enabled" class="text-xs font-medium text-gray-700">
-                Enable Bluetooth Low Energy (BLE)
+                {{ t('config.ble.enable') }}
               </label>
             </div>
           </fieldset>
@@ -1083,18 +1123,18 @@ const statusColor = computed(() => {
             :disabled="!canConfigure"
             class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white disabled:bg-gray-300 disabled:text-gray-500 rounded font-medium transition-colors"
           >
-            {{ status === 'configuring' ? 'Sending...' : 'Send Configuration' }}
+            {{ status === 'configuring' ? t('actions.sending') : t('actions.sendConfig') }}
           </button>
           <button
             @click="resetDeviceConfig"
             class="w-full py-2.5 bg-orange-500 hover:bg-orange-600 text-white rounded font-medium transition-colors"
           >
-            Reset to defaults
+            {{ t('actions.resetDefaults') }}
           </button>
         </div>
 
         <p v-if="status === 'config_done' || status === 'monitoring'" class="text-green-600 text-sm text-center">
-          Configuration sent. Monitoring device output.
+          {{ t('config.sentMonitoring') }}
         </p>
       </section>
     </div>
@@ -1102,14 +1142,14 @@ const statusColor = computed(() => {
     <!-- Logs -->
     <section class="mt-6 grid gap-4 lg:grid-cols-2">
       <div>
-        <h2 class="text-lg font-semibold border-b border-gray-200 pb-2 mb-2">Console</h2>
+        <h2 class="text-lg font-semibold border-b border-gray-200 pb-2 mb-2">{{ t('terminals.console') }}</h2>
         <div
           ref="terminalEl"
           class="border border-gray-200 rounded-lg overflow-hidden h-72 shadow-inner"
         />
       </div>
       <div>
-        <h2 class="text-lg font-semibold border-b border-gray-200 pb-2 mb-2">Serial</h2>
+        <h2 class="text-lg font-semibold border-b border-gray-200 pb-2 mb-2">{{ t('terminals.serial') }}</h2>
         <div
           ref="serialTerminalEl"
           class="border border-gray-200 rounded-lg overflow-hidden h-72 shadow-inner"

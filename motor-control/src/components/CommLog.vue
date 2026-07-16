@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import type { ModbusTransport, CommLogEntry } from '../lib/transport'
+
+const { t } = useI18n()
 
 const props = defineProps<{
   client: ModbusTransport
@@ -55,7 +58,7 @@ function clearLogs() {
       @click="isExpanded = !isExpanded"
     >
       <div class="flex items-center gap-2">
-        <span class="font-medium text-gray-900">通信日志</span>
+        <span class="font-medium text-gray-900">{{ t('commLog.title') }}</span>
         <span class="text-gray-600">({{ logs.length }})</span>
       </div>
       <div class="flex items-center gap-3">
@@ -65,7 +68,7 @@ function clearLogs() {
           class="text-gray-600 hover:text-gray-900 select-none"
           @click.stop="clearLogs"
         >
-          清空
+          {{ t('commLog.clear') }}
         </button>
         <span class="text-gray-600 select-none">{{ isExpanded ? '▲' : '▼' }}</span>
       </div>
@@ -76,7 +79,7 @@ function clearLogs() {
       class="p-2 border-t border-gray-400 bg-white h-40 overflow-y-auto font-mono text-[11px] shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)]"
     >
       <div v-if="logs.length === 0" class="text-gray-400 text-center py-4 italic select-none">
-        暂无通信
+        {{ t('commLog.empty') }}
       </div>
       <div
         v-for="(log, i) in logs"
@@ -95,4 +98,3 @@ function clearLogs() {
     </div>
   </div>
 </template>
-

@@ -1,4 +1,5 @@
 import type { MotorControllerConfig, PausedControlPayload, MotorState, PinConfiguration, NetworkConfiguration } from './types'
+import { i18n } from './i18n'
 
 const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e'
 const CONFIG_UUID  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'
@@ -117,16 +118,16 @@ function withTimeout<T>(operation: Promise<T>, timeoutMs: number, operationName:
 function normalizeBleError(error: unknown): Error {
   if (error instanceof DOMException) {
     if (error.name === 'NotFoundError') {
-      return new Error('No compatible OSSM BLE device was selected or discovered.')
+      return new Error(i18n.global.t('errors.bleNoDevice'))
     }
     if (error.name === 'SecurityError') {
-      return new Error('Web Bluetooth requires a secure context (HTTPS or localhost).')
+      return new Error(i18n.global.t('errors.bleSecureContext'))
     }
     if (error.name === 'NotSupportedError') {
-      return new Error('Web Bluetooth is not supported by this browser/device.')
+      return new Error(i18n.global.t('errors.bleNotSupported'))
     }
     if (error.name === 'NetworkError') {
-      return new Error('BLE connection was lost during the operation.')
+      return new Error(i18n.global.t('errors.bleNetworkError'))
     }
   }
   if (error instanceof Error) {
@@ -240,7 +241,7 @@ function requireConnectedCharacteristic(
   label: string,
 ): BluetoothRemoteGATTCharacteristic {
   if (!char || !gattServer || !gattServer.connected) {
-    throw new Error(`BLE not connected (${label})`)
+    throw new Error(i18n.global.t('errors.bleNotConnected', { label }))
   }
   return char
 }
@@ -262,13 +263,13 @@ async function withGattLock<T>(fn: () => Promise<T>): Promise<T> {
 export async function connectBle(onDisconnect?: () => void): Promise<boolean> {
   const bluetooth = navigator.bluetooth
   if (!bluetooth) {
-    throw new Error('Web Bluetooth is not supported in this browser.')
+    throw new Error(i18n.global.t('errors.bleNotSupportedBrowser'))
   }
   if (isBleConnected()) {
     return true
   }
   if (connectInProgress) {
-    throw new Error('BLE connection already in progress.')
+    throw new Error(i18n.global.t('errors.bleConnectInProgress'))
   }
 
   connectInProgress = true
@@ -278,7 +279,7 @@ export async function connectBle(onDisconnect?: () => void): Promise<boolean> {
 
     device = await requestDeviceWithFallback(bluetooth)
     if (!device.gatt) {
-      throw new Error('Selected BLE device does not expose a GATT server.')
+      throw new Error(i18n.global.t('errors.bleNoGatt'))
     }
 
     deviceDisconnectHandler = () => {
@@ -407,7 +408,7 @@ async function readJson<T>(char: BluetoothRemoteGATTCharacteristic | null): Prom
         }
       }
     }
-    throw normalizeBleError(lastErr || new Error('BLE read failed'))
+    throw normalizeBleError(lastErr || new Error(i18n.global.t('errors.bleReadFailed')))
   })
 }
 
@@ -440,7 +441,7 @@ async function writeJson(char: BluetoothRemoteGATTCharacteristic | null, data: u
         }
       }
     }
-    throw normalizeBleError(lastErr || new Error('BLE write failed'))
+    throw normalizeBleError(lastErr || new Error(i18n.global.t('errors.bleWriteFailed')))
   })
 }
 

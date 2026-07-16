@@ -1,0 +1,137 @@
+{
+  "meta": {
+    "title": "OSSM 烧录器",
+    "subtitle": "通过 USB 烧录固件并配置 OSSM 设备"
+  },
+  "browser": {
+    "unsupportedTitle": "不支持 Web Serial API",
+    "unsupportedHint": "请使用 Google Chrome 或 Microsoft Edge（89 及以上版本）。"
+  },
+  "status": {
+    "idle": "未连接",
+    "connecting": "正在连接...",
+    "connected": "已连接到 {chip}",
+    "flashing": "正在烧录... {progress}%",
+    "flashComplete": "烧录完成",
+    "sendingConfig": "正在发送配置...",
+    "configComplete": "配置完成",
+    "monitoring": "正在监视串口输出",
+    "error": "错误"
+  },
+  "actions": {
+    "connect": "连接",
+    "monitor": "监视",
+    "stop": "停止",
+    "reset": "复位",
+    "disconnect": "断开",
+    "flash": "烧录固件",
+    "flashing": "正在烧录... {progress}%",
+    "sendConfig": "发送配置",
+    "sending": "正在发送...",
+    "resetDefaults": "恢复默认"
+  },
+  "flash": {
+    "title": "烧录固件",
+    "githubBefore": "请从",
+    "githubLink": "GitHub Releases",
+    "githubAfter": "下载最新固件，然后在下方上传",
+    "binExt": ".bin",
+    "githubAfterFile": "文件。",
+    "dropHint": "将 .bin 文件拖放到此处，或点击浏览",
+    "fileSize": "{size} KB",
+    "addressLabel": "烧录地址：",
+    "addressPlaceholder": "0x0"
+  },
+  "config": {
+    "title": "设备配置",
+    "wifi": {
+      "legend": "WiFi",
+      "enable": "启用 WiFi",
+      "ssid": "SSID",
+      "ssidPlaceholder": "你的 WiFi 网络",
+      "password": "密码",
+      "passwordPlaceholder": "WiFi 密码"
+    },
+    "gpio": {
+      "legend": "GPIO 引脚",
+      "modbusTx": "Modbus TX",
+      "modbusRx": "Modbus RX",
+      "modbusDeRe": "Modbus DE/RE"
+    },
+    "modbus": {
+      "legend": "电机 / Modbus",
+      "baudRate": "波特率",
+      "deviceId": "设备 ID",
+      "readTimeout": "读取超时 (ms)",
+      "readTimeoutHint": "0 = 10ms",
+      "rxInterByte": "RX 字节间隔 (µs)",
+      "rxInterByteHint": "0 = 自动 (750µs {'@'} 115200)",
+      "interFrameQuiet": "帧间静默 (µs)",
+      "interFrameQuietHint": "0 = 自动 (350µs {'@'} 115200)",
+      "scanDelay": "扫描延迟 (µs)",
+      "scanDelayHint": "0 = t3.5"
+    },
+    "ble": {
+      "enable": "启用低功耗蓝牙 (BLE)"
+    },
+    "sentMonitoring": "配置已发送。正在监视设备输出。"
+  },
+  "terminals": {
+    "console": "控制台",
+    "serial": "串口"
+  },
+  "log": {
+    "waitingActivity": "等待操作...",
+    "waitingSerial": "等待串口数据...",
+    "configResetDefaults": "配置字段已恢复为默认值。",
+    "bootloaderResetting": "设备处于 bootloader 模式。正在复位到正常模式...",
+    "hardResetFailed": "通过 esptool 硬复位失败。继续...",
+    "monitorStarted": "--- 监视已启动 (115200 baud) ---",
+    "monitorStreamEnded": "监视流已结束。正在重连...",
+    "monitorError": "监视错误：{message}",
+    "monitorStoppedFailures": "多次重连失败，监视已停止。",
+    "monitorReconnecting": "正在重连监视 ({attempt}/{max})...",
+    "monitorStopped": "--- 监视已停止 ---",
+    "loadedFirmware": "已加载固件：{name} ({size} KB)",
+    "requestingPort": "正在请求串口...",
+    "connectingEsp": "正在连接 ESP 设备...",
+    "connectedChip": "已连接：{chip}",
+    "connectionFailed": "连接失败：{message}",
+    "disconnected": "已断开。",
+    "invalidFlashAddress": "无效的烧录地址。",
+    "flashingFile": "正在烧录 {name} 到 {address}...",
+    "flashCompleteResetting": "烧录完成。正在复位设备...",
+    "deviceResetReady": "设备已复位。可以开始配置。",
+    "flashFailed": "烧录失败：{message}",
+    "bootDetected": "已检测到设备启动。",
+    "preparingConfig": "正在准备发送配置...",
+    "togglingReset": "正在切换 DTR/RTS 以复位设备...",
+    "waitingBoot": "等待设备启动（最长 15 秒）...",
+    "bootNotDetected": "警告：未检测到启动信息，仍将发送配置...",
+    "commandSent": "> {cmd}",
+    "ackReceived": "已收到 ACK。",
+    "configSentResetting": "配置已发送。正在复位设备以生效...",
+    "resetAckMissing": "未看到复位 ACK；继续挂接监视。",
+    "configCompleteRestarting": "配置完成。设备正在使用新设置重启。",
+    "configFailed": "配置失败：{message}",
+    "noPortConnectFirst": "没有可用串口。请先点击连接。",
+    "noPort": "没有可用串口。",
+    "resettingDevice": "正在复位设备...",
+    "deviceReset": "设备已复位。",
+    "resetFailed": "复位失败：{message}"
+  },
+  "errors": {
+    "noPort": "没有可用串口。",
+    "noPortConnectFirst": "没有可用串口。请先点击连接。",
+    "streamsUnavailable": "串口流不可用。",
+    "serialStreamsUnavailable": "串口流不可用。",
+    "acquireMonitorReader": "无法获取监视读取器。",
+    "openStreams": "无法打开串口流。",
+    "streamEndedWaitingAck": "等待 ACK 时流已结束：{expected}",
+    "timeoutWaitingAck": "等待 ACK 超时：{expected}"
+  },
+  "locale": {
+    "en": "EN",
+    "zh": "中文"
+  }
+}

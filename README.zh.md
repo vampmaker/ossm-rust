@@ -113,6 +113,8 @@ cargo b-s3 --release    # 为 ESP32-S3 平台编译固件
 
 表单内容会保存在浏览器本地（`localStorage` 键 `ossm-flasher-device-config-v1`），下次打开可复用。**Reset to defaults** 可将表单恢复为默认引脚 / 时序。
 
+语言：嵌入式控制界面、`flasher.html` 与 `motor-control.html` 均支持 **English** / **中文**（页头切换）。偏好保存在 `localStorage` 键 `ossm_locale`（`en` | `zh`）。未设置时按浏览器语言（`zh*` → 中文，否则英文）。
+
 ### 烧录步骤
 
 1.  从 **Releases** 下载并解压最新发布包（`.zip`）。

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import type { MotorControllerConfig, MotorState } from '../types'
 
 const props = defineProps<{
@@ -7,6 +8,8 @@ const props = defineProps<{
   state?: MotorState | null
   connected: boolean
 }>()
+
+const { t } = useI18n()
 
 // Calculate Left Limit and Right Limit percentages (0 to 100)
 const leftLimitPct = computed(() => {
@@ -67,9 +70,9 @@ const physicalPos = computed(() => {
     <!-- Header -->
     <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
       <div>
-        <h2 class="text-xl font-bold text-gray-800">Motor Position Diagram</h2>
+        <h2 class="text-xl font-bold text-gray-800">{{ t('diagram.title') }}</h2>
         <p class="text-xs text-gray-500">
-          Full range stroke visualizer with active limits and real-time position
+          {{ t('diagram.subtitle') }}
         </p>
       </div>
       <div class="flex items-center space-x-2">
@@ -77,13 +80,13 @@ const physicalPos = computed(() => {
           class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold"
           :class="connected ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-600'"
         >
-          {{ config.depth_top ? 'Depth from Top' : 'Depth from Bottom' }}
+          {{ config.depth_top ? t('diagram.depthFromTop') : t('diagram.depthFromBottom') }}
         </span>
         <span
           v-if="config.reversed"
           class="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-800"
         >
-          Reversed
+          {{ t('diagram.reversed') }}
         </span>
       </div>
     </div>
@@ -129,7 +132,7 @@ const physicalPos = computed(() => {
         >
           <div class="h-full w-0.5 bg-blue-700 shadow" />
           <span class="absolute -bottom-6 whitespace-nowrap rounded bg-blue-700 px-1.5 py-0.5 text-[10px] font-bold text-white shadow">
-            Left: {{ leftLimitPct.toFixed(0) }}%
+            {{ t('diagram.left', { pct: leftLimitPct.toFixed(0) }) }}
           </span>
         </div>
 
@@ -140,7 +143,7 @@ const physicalPos = computed(() => {
         >
           <div class="h-full w-0.5 bg-indigo-700 shadow" />
           <span class="absolute -bottom-6 whitespace-nowrap rounded bg-indigo-700 px-1.5 py-0.5 text-[10px] font-bold text-white shadow">
-            Right: {{ rightLimitPct.toFixed(0) }}%
+            {{ t('diagram.right', { pct: rightLimitPct.toFixed(0) }) }}
           </span>
         </div>
 
@@ -164,15 +167,15 @@ const physicalPos = computed(() => {
       <!-- Rail bottom end labels -->
       <div class="mt-8 flex justify-between text-xs font-semibold text-gray-500">
         <div>
-          <span>Full Retraction (Top Limit)</span>
+          <span>{{ t('diagram.fullRetraction') }}</span>
           <span v-if="hasPhysicalRange" class="block font-mono text-[11px] text-gray-400">
-            {{ posMin?.toFixed(1) }} units
+            {{ t('diagram.units', { value: posMin?.toFixed(1) }) }}
           </span>
         </div>
         <div class="text-right">
-          <span>Full Extension (Bottom Limit)</span>
+          <span>{{ t('diagram.fullExtension') }}</span>
           <span v-if="hasPhysicalRange" class="block font-mono text-[11px] text-gray-400">
-            {{ posMax?.toFixed(1) }} units
+            {{ t('diagram.units', { value: posMax?.toFixed(1) }) }}
           </span>
         </div>
       </div>
@@ -181,32 +184,32 @@ const physicalPos = computed(() => {
     <!-- Summary Statistics Grid -->
     <div class="mt-4 grid grid-cols-2 gap-3 border-t border-gray-100 pt-4 md:grid-cols-4">
       <div class="rounded-lg bg-gray-50 p-2.5 text-center">
-        <div class="text-xs font-medium text-gray-500">Full Range</div>
-        <div class="mt-0.5 font-mono text-base font-bold text-gray-800">0% – 100%</div>
+        <div class="text-xs font-medium text-gray-500">{{ t('diagram.fullRange') }}</div>
+        <div class="mt-0.5 font-mono text-base font-bold text-gray-800">{{ t('diagram.fullRangeValue') }}</div>
         <div v-if="hasPhysicalRange" class="text-[11px] font-mono text-gray-400">
           {{ posMin?.toFixed(1) }} to {{ posMax?.toFixed(1) }}
         </div>
       </div>
 
       <div class="rounded-lg bg-blue-50/70 p-2.5 text-center">
-        <div class="text-xs font-medium text-blue-700">Left Limit</div>
+        <div class="text-xs font-medium text-blue-700">{{ t('diagram.leftLimit') }}</div>
         <div class="mt-0.5 font-mono text-base font-bold text-blue-900">{{ leftLimitPct.toFixed(1) }}%</div>
-        <div class="text-[11px] text-blue-600/80">Stroke Start</div>
+        <div class="text-[11px] text-blue-600/80">{{ t('diagram.strokeStart') }}</div>
       </div>
 
       <div class="rounded-lg bg-indigo-50/70 p-2.5 text-center">
-        <div class="text-xs font-medium text-indigo-700">Right Limit</div>
+        <div class="text-xs font-medium text-indigo-700">{{ t('diagram.rightLimit') }}</div>
         <div class="mt-0.5 font-mono text-base font-bold text-indigo-900">{{ rightLimitPct.toFixed(1) }}%</div>
-        <div class="text-[11px] text-indigo-600/80">Stroke End</div>
+        <div class="text-[11px] text-indigo-600/80">{{ t('diagram.strokeEnd') }}</div>
       </div>
 
       <div class="rounded-lg bg-cyan-50/70 p-2.5 text-center">
-        <div class="text-xs font-medium text-cyan-700">Current Position</div>
+        <div class="text-xs font-medium text-cyan-700">{{ t('diagram.currentPosition') }}</div>
         <div class="mt-0.5 font-mono text-base font-bold text-cyan-900">{{ currentPosPct.toFixed(1) }}%</div>
         <div v-if="physicalPos !== null" class="text-[11px] font-mono text-cyan-600/80">
-          {{ physicalPos.toFixed(1) }} units
+          {{ t('diagram.units', { value: physicalPos.toFixed(1) }) }}
         </div>
-        <div v-else class="text-[11px] text-cyan-600/80">Live Position</div>
+        <div v-else class="text-[11px] text-cyan-600/80">{{ t('diagram.livePosition') }}</div>
       </div>
     </div>
   </div>

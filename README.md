@@ -123,6 +123,8 @@ You don't need to build from source. Pre-compiled **merged** flash images (`ossm
 
 Settings you enter are remembered in the browser (`localStorage` key `ossm-flasher-device-config-v1`) so the next visit can reuse them. **Reset to defaults** clears the form back to factory pin / timing defaults.
 
+Language: the embedded controller UI, `flasher.html`, and `motor-control.html` support **English** and **中文** via a header toggle. The choice is stored as `localStorage` key `ossm_locale` (`en` | `zh`). If unset, the apps follow the browser language (`zh*` → Chinese, otherwise English).
+
 ### Step-by-step: flash
 
 1.  Download and extract the latest release package (`.zip`) from **Releases**.

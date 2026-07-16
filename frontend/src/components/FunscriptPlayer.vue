@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { setConfig, sendWaypoints, subscribeState, unsubscribeState } from '../api'
 import type { FunscriptDocument, FunscriptAction, StreamWaypoint, MotorState } from '../types'
+
+const { t } = useI18n()
 
 const scriptName = ref<string>('')
 const actions = ref<FunscriptAction[]>([])
@@ -13,7 +16,7 @@ const maxDepth = ref(1.0) // 100% default on load
 const lastSentIndex = ref(0)
 const bufferedCount = ref(0)
 const streamTime = ref(0)
-const statusMessage = ref('Load a .funscript file to get started')
+const statusMessage = ref(t('funscript.loadPrompt'))
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 let streamTimer: number | null = null
@@ -43,16 +46,16 @@ function handleFileUpload(e: Event) {
       const text = ev.target?.result as string
       const doc = JSON.parse(text) as FunscriptDocument
       if (!doc.actions || !Array.isArray(doc.actions)) {
-        statusMessage.value = 'Invalid .funscript format: missing actions array'
+        statusMessage.value = t('funscript.invalidFormat')
         return
       }
       actions.value = doc.actions.slice().sort((a, b) => a.at - b.at)
       currentTime.value = 0
       lastSentIndex.value = 0
-      statusMessage.value = `Loaded ${actions.value.length} actions (${formatTime(totalDuration.value)})`
+      statusMessage.value = `${actions.value.length} · ${formatTime(totalDuration.value)}`
       drawTimeline()
     } catch (err) {
-      statusMessage.value = 'Failed to parse .funscript file'
+      statusMessage.value = t('funscript.parseFailed')
       console.error(err)
     }
   }
@@ -162,7 +165,7 @@ function handleCanvasClick(e: MouseEvent) {
 async function startPlayback() {
   if (actions.value.length === 0) return
   isPlaying.value = true
-  statusMessage.value = 'Starting streaming mode...'
+  statusMessage.value = t('funscript.starting')
 
   try {
     await setConfig({
@@ -200,10 +203,10 @@ async function startPlayback() {
       feedWaypoints()
     }, 200)
 
-    statusMessage.value = 'Playing script...'
+    statusMessage.value = t('funscript.playing')
   } catch (err) {
     console.error(err)
-    statusMessage.value = 'Error starting streaming playback'
+    statusMessage.value = t('funscript.playError')
     isPlaying.value = false
   }
 }
@@ -234,7 +237,7 @@ async function stopPlayback() {
   } catch (e) {
     console.warn('Error stopping playback:', e)
   }
-  statusMessage.value = 'Stopped'
+  statusMessage.value = t('funscript.stopped')
   drawTimeline()
 }
 
@@ -309,11 +312,11 @@ onBeforeUnmount(() => {
     <!-- Header & Uploader -->
     <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-gray-900/60 p-5 rounded-2xl border border-gray-800 backdrop-blur-xl">
       <div>
-        <h2 class="text-xl font-bold text-white tracking-wide">Funscript Player</h2>
-        <p class="text-sm text-gray-400 mt-0.5">{{ scriptName || 'No script selected' }}</p>
+        <h2 class="text-xl font-bold text-white tracking-wide">{{ t('funscript.title') }}</h2>
+        <p class="text-sm text-gray-400 mt-0.5">{{ scriptName || t('funscript.noScript') }}</p>
       </div>
       <label class="cursor-pointer bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-sm font-medium px-4 py-2.5 rounded-xl shadow-lg shadow-emerald-900/20 transition-all active:scale-95 inline-flex items-center gap-2">
-        <span>Load .funscript</span>
+        <span>{{ t('funscript.load') }}</span>
         <input type="file" accept=".funscript,.json" class="hidden" @change="handleFileUpload" />
       </label>
     </div>
@@ -321,8 +324,8 @@ onBeforeUnmount(() => {
     <!-- Timeline Canvas -->
     <div class="bg-gray-900/80 p-4 rounded-2xl border border-gray-800 shadow-xl relative overflow-hidden">
       <div class="flex items-center justify-between text-xs font-semibold text-gray-400 mb-2 px-1">
-        <span>Current: {{ formatTime(currentTime) }}</span>
-        <span>Duration: {{ formatTime(totalDuration) }}</span>
+        <span>{{ t('funscript.current', { time: formatTime(currentTime) }) }}</span>
+        <span>{{ t('funscript.duration', { time: formatTime(totalDuration) }) }}</span>
       </div>
       <canvas
         ref="canvasRef"
@@ -340,26 +343,26 @@ onBeforeUnmount(() => {
           :disabled="actions.length === 0"
           class="bg-emerald-500 hover:bg-emerald-400 disabled:bg-gray-800 disabled:text-gray-500 text-gray-950 font-bold px-6 py-2.5 rounded-xl transition-all shadow-lg active:scale-95"
         >
-          Play
+          {{ t('funscript.play') }}
         </button>
         <button
           v-else
           @click="stopPlayback"
           class="bg-amber-500 hover:bg-amber-400 text-gray-950 font-bold px-6 py-2.5 rounded-xl transition-all shadow-lg active:scale-95"
         >
-          Pause
+          {{ t('funscript.pause') }}
         </button>
         <button
           @click="stopPlayback"
           class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium px-4 py-2.5 rounded-xl transition-all"
         >
-          Stop
+          {{ t('funscript.stop') }}
         </button>
       </div>
 
       <!-- Speed Multiplier -->
       <div class="flex items-center gap-2">
-        <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Speed:</span>
+        <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider">{{ t('funscript.speed') }}</span>
         <select
           v-model.number="speedMultiplier"
           class="bg-gray-950 border border-gray-800 text-white text-sm rounded-xl px-3 py-1.5 focus:outline-none focus:border-emerald-500"
@@ -375,11 +378,11 @@ onBeforeUnmount(() => {
 
     <!-- Stroke Range Limits -->
     <div class="bg-gray-900/60 p-5 rounded-2xl border border-gray-800 space-y-4">
-      <h3 class="text-sm font-semibold text-gray-300 tracking-wide uppercase">Stroke Range Limits</h3>
+      <h3 class="text-sm font-semibold text-gray-300 tracking-wide uppercase">{{ t('funscript.strokeLimits') }}</h3>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div>
           <div class="flex justify-between text-xs text-gray-400 mb-1 font-medium">
-            <span>Minimum Depth</span>
+            <span>{{ t('funscript.minDepth') }}</span>
             <span class="text-emerald-400 font-bold">{{ Math.round(minDepth * 100) }}%</span>
           </div>
           <input
@@ -394,7 +397,7 @@ onBeforeUnmount(() => {
 
         <div>
           <div class="flex justify-between text-xs text-gray-400 mb-1 font-medium">
-            <span>Maximum Depth</span>
+            <span>{{ t('funscript.maxDepth') }}</span>
             <span class="text-emerald-400 font-bold">{{ Math.round(maxDepth * 100) }}%</span>
           </div>
           <input
@@ -412,7 +415,7 @@ onBeforeUnmount(() => {
     <!-- Status Bar -->
     <div class="bg-gray-950/80 px-4 py-3 rounded-xl border border-gray-800/80 flex items-center justify-between text-xs">
       <span class="text-gray-400">{{ statusMessage }}</span>
-      <span v-if="isPlaying" class="text-emerald-400 font-mono">Buffered: {{ bufferedCount }}</span>
+      <span v-if="isPlaying" class="text-emerald-400 font-mono">{{ t('funscript.buffered', { count: bufferedCount }) }}</span>
     </div>
   </div>
 </template>

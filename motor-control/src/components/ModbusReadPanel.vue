@@ -1,5 +1,8 @@
 <script setup lang="ts">
+import { useI18n } from 'vue-i18n'
 import GroupBox from './GroupBox.vue'
+
+const { t } = useI18n()
 
 defineProps<{
   deviceAddress: number
@@ -25,10 +28,10 @@ const pollOptions = [
 </script>
 
 <template>
-  <GroupBox caption="modbus读取">
+  <GroupBox :caption="t('panels.modbusRead')">
     <div class="flex flex-col gap-2 text-[12px] pt-0.5">
       <div class="flex items-center gap-1.5 flex-wrap">
-        <label for="mc-device-addr" class="text-gray-900 select-none">读取设备地址:</label>
+        <label for="mc-device-addr" class="text-gray-900 select-none">{{ t('modbusRead.deviceAddress') }}</label>
         <input
           id="mc-device-addr"
           type="number"
@@ -49,7 +52,7 @@ const pollOptions = [
             :disabled="!isConnected"
             @change="$emit('update:readEnabled', ($event.target as HTMLInputElement).checked)"
           />
-          <span>开始读取</span>
+          <span>{{ t('modbusRead.startReading') }}</span>
         </label>
 
         <label class="flex items-center gap-1.5 cursor-pointer select-none">
@@ -60,12 +63,12 @@ const pollOptions = [
             :disabled="!isConnected"
             @change="$emit('update:addressScanEnabled', ($event.target as HTMLInputElement).checked)"
           />
-          <span>地址扫描</span>
+          <span>{{ t('modbusRead.addressScan') }}</span>
         </label>
       </div>
 
       <fieldset class="border border-[#999999] px-2 pb-1.5 pt-1 mt-1 shadow-[1px_1px_0px_#ffffff]">
-        <legend class="px-1 text-[11px] font-medium text-gray-800 select-none">读取周期</legend>
+        <legend class="px-1 text-[11px] font-medium text-gray-800 select-none">{{ t('modbusRead.pollInterval') }}</legend>
         <div class="grid grid-cols-2 gap-x-2 gap-y-1 mt-0.5">
           <label
             v-for="opt in pollOptions"
@@ -87,4 +90,3 @@ const pollOptions = [
     </div>
   </GroupBox>
 </template>
-

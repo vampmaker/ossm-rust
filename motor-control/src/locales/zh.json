@@ -1,0 +1,237 @@
+{
+  "meta": {
+    "title": "YZ_AIM_v2_61",
+    "subtitle": "57AIM30 PC Control",
+    "headerHint": "Local Serial / Remote Modbus WebSocket"
+  },
+  "panels": {
+    "waveform": "波形显示",
+    "paramList": "Modbus 控制参数",
+    "telemetry": "电机运行参数",
+    "driver": "驱动器设置参数",
+    "modbusRead": "Modbus 读取",
+    "status": "驱动器运行状态",
+    "send": "Modbus 发送",
+    "sendEcho": "发送数据",
+    "commLog": "通信日志"
+  },
+  "connect": {
+    "connectionType": "连接方式:",
+    "localSerial": "Local Serial",
+    "remoteWebSocket": "Remote WebSocket",
+    "baudRate": "波特率:",
+    "wsUrl": "WS URL:",
+    "wsUrlPlaceholder": "ws://ossm.lan/ws/modbus",
+    "openSerial": "打开串口",
+    "closeSerial": "关闭串口",
+    "connect": "连接",
+    "disconnect": "断开连接",
+    "webSerialUnsupported": "当前浏览器不支持 Web Serial，请改用 Remote WebSocket。"
+  },
+  "waveform": {
+    "current": "电流",
+    "pwm": "输出脉宽",
+    "speed": "转速",
+    "voltage": "电压",
+    "axisHint": "X: 0..{xMax} · Y: ±{yMax} · /32768"
+  },
+  "telemetry": {
+    "current": "电流:",
+    "pwm": "输出脉宽:",
+    "speed": "当前转速:",
+    "temperature": "温度:",
+    "voltage": "电压:",
+    "unitA": "(A)",
+    "unitPercent": "(%)",
+    "unitRmin": "(r/min)",
+    "unitC": "(℃)",
+    "unitV": "(V)"
+  },
+  "driver": {
+    "mode": "模式:",
+    "direction": "转向:",
+    "enable": "使能:",
+    "speedMode": "速度模式",
+    "positionMode": "位置模式",
+    "disabled": "禁止",
+    "enabled": "使能",
+    "forward": "正转",
+    "reverse": "反转"
+  },
+  "modbusRead": {
+    "deviceAddress": "读取设备地址:",
+    "startReading": "开始读取",
+    "addressScan": "地址扫描",
+    "pollInterval": "读取周期"
+  },
+  "paramList": {
+    "modbusEnable": "Modbus 使能：",
+    "en": "EN(使能):",
+    "pu": "PU(步数):",
+    "puTotal": "PU(总步数):",
+    "targetSpeed": "目标转速:",
+    "acceleration": "电机加速度:",
+    "weakField": "弱磁角度:",
+    "speedKp": "速度环Kp:",
+    "speedKi": "速度环Ki:",
+    "positionKp": "位置环Kp:",
+    "speedFeedforward": "速度前馈:",
+    "dirPolarity": "DIR极性:",
+    "eGearRatio": "电子齿轮比:",
+    "saveFlag": "参数保存:",
+    "staticMaxOutput": "静态最大输出:",
+    "specialFunction": "特殊功能:",
+    "hintEnable": "使能",
+    "hintDisable": "禁止",
+    "hintRmin": "( r/min )",
+    "hintAccel": "(r/min)/s",
+    "hintAngle": "(0.1°)",
+    "hintFeedforward": "V/KRPM",
+    "hintNegativeLogic": "负逻辑",
+    "hintPositiveLogic": "正逻辑",
+    "saveNotSaved": "未保存",
+    "saveSaving": "正在保存",
+    "saveSaved": "已保存",
+    "saveButton": "参数保存",
+    "saveTriggered": "已触发参数保存",
+    "saveFailed": "保存失败: {message}"
+  },
+  "send": {
+    "paramType": "参数类型:",
+    "paramData": "参数数据:",
+    "paramMeaning": "参数含义:",
+    "send": "发送",
+    "sent": "已发送 {label}",
+    "showAdvanced": "高级 (原始帧发送)",
+    "hideAdvanced": "隐藏高级",
+    "rawPlaceholder": "例: 01 03 00 00 00 1A C4 0B",
+    "appendCrc": "追加 CRC16",
+    "waitResponse": "等待响应",
+    "timeoutMs": "超时(ms):",
+    "sendRaw": "发送原始帧",
+    "sendFailed": "发送失败: {message}",
+    "rawSentWithResponse": "已发送 {bytes} 字节, 功能码=0x{code}",
+    "rawSentNoWait": "已发送 {bytes} 字节 (不等待响应)",
+    "invalidHex": "无效十六进制: {token}"
+  },
+  "sendType": {
+    "0": {
+      "label": "0 Modbus 使能",
+      "description": "Modbus 使能 1:使能，0:禁止"
+    },
+    "1": {
+      "label": "1 EN(使能)",
+      "description": "驱动器使能,0:禁止,1:使能"
+    },
+    "2": {
+      "label": "2 目标转速",
+      "description": "电机转速,单位r/min"
+    },
+    "3": {
+      "label": "3 电机加速度",
+      "description": "速度模式: 加速度 范围0~30000(r/min)/s"
+    },
+    "4": {
+      "label": "4 弱磁角度",
+      "description": "弱磁角度,范围0~200  单位 0.1°"
+    },
+    "5": {
+      "label": "5 速度环Kp",
+      "description": "速度控制KP参数,范围0~10000代表0.0到10.0倍"
+    },
+    "6": {
+      "label": "6 速度环Ki",
+      "description": "速度环KI参数,范围5~2000 代表积分时间5ms~2000ms"
+    },
+    "7": {
+      "label": "7 位置环Kp",
+      "description": "位置环KP参数,范围1~5000"
+    },
+    "8": {
+      "label": "8 速度前馈",
+      "description": "速度前馈,换算算法327=1(V/KRPM)"
+    },
+    "9": {
+      "label": "9 DIR极性",
+      "description": "脉冲模式DIR极性,0:负逻辑,1:正逻辑"
+    },
+    "10": {
+      "label": "10 电子齿轮分子",
+      "description": "电子齿轮分子"
+    },
+    "11": {
+      "label": "11 电子齿轮分母",
+      "description": "电子齿轮分母"
+    },
+    "12": {
+      "label": "12 参数保存",
+      "description": "参数保存标志,0:不保存  1:保存"
+    },
+    "13": {
+      "label": "13 PU(步数)",
+      "description": "PU 电机走的总步数"
+    },
+    "14": {
+      "label": "14 设备地址",
+      "description": "修改设备地址,写入需要改成的地址"
+    },
+    "15": {
+      "label": "15 温度补偿",
+      "description": "修改温度"
+    },
+    "16": {
+      "label": "16 静态最大输出",
+      "description": "静态最大输出，范围0~600，代表0~60.0%"
+    },
+    "17": {
+      "label": "17 特殊功能",
+      "description": "范围10~32768，对应0.1~360°，2为编码器跟随模式"
+    },
+    "18": {
+      "label": "18 PU(总步数)",
+      "description": "PU 电机走的总步数"
+    }
+  },
+  "warning": {
+    "0x00": "运行正常",
+    "0x10": "驱动器过热( >70℃ )",
+    "0x20": "写入flash失败",
+    "0x11": "驱动器过热( >90℃),驱动器停机",
+    "0x12": "驱动器过流报警",
+    "0x13": "驱动器欠压报警",
+    "0x14": "驱动器失速报警",
+    "0x15": "驱动器脉冲输入频率过高",
+    "unknown": "未知错误 (0x{code})"
+  },
+  "status": {
+    "waitingRead": "等待读取驱动器"
+  },
+  "errors": {
+    "emptyInput": "输入为空",
+    "hexOddLength": "无空格时十六进制长度须为偶数",
+    "noBytesParsed": "未解析到字节",
+    "portDisconnected": "端口已断开",
+    "noResponse": "未收到响应",
+    "notConnected": "未连接",
+    "timeout": "超时",
+    "wsConnectFailed": "WebSocket 连接失败: {url}",
+    "wsDisconnected": "WebSocket 已断开",
+    "invalidRtuResponse": "无效的 Modbus RTU 响应",
+    "unexpectedResponse": "意外的 Modbus 响应"
+  },
+  "toasts": {
+    "connectFailed": "连接失败: {message}",
+    "scanFound": "地址扫描找到设备: {address}",
+    "modbusError": "Modbus 错误: 0x{code}",
+    "pollFailed": "轮询失败: {message}"
+  },
+  "commLog": {
+    "title": "通信日志",
+    "clear": "清空",
+    "empty": "暂无通信"
+  },
+  "locale": {
+    "en": "EN",
+    "zh": "中文"
+  }
+}

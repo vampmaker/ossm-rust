@@ -1,3 +1,4 @@
+import { i18n } from '../i18n';
 import { parseResponse, type ModbusResponse } from './modbus-rtu';
 import type { CommLogEntry, LogCallback, LogDirection, ModbusTransport } from './transport';
 
@@ -93,7 +94,7 @@ export class SerialModbusClient implements ModbusTransport {
     }
     
     // Reject all pending requests
-    const err = new Error('Port disconnected');
+    const err = new Error(String(i18n.global.t('errors.portDisconnected')));
     if (this.currentReject) {
       this.currentReject(err);
       this.currentReject = null;
@@ -119,7 +120,7 @@ export class SerialModbusClient implements ModbusTransport {
   public async sendRequest(frame: Uint8Array, timeoutMs: number = 200): Promise<ModbusResponse> {
     const response = await this.sendRawFrame(frame, timeoutMs, true);
     if (!response) {
-      throw new Error('No response received');
+      throw new Error(String(i18n.global.t('errors.noResponse')));
     }
     return response;
   }
@@ -130,7 +131,7 @@ export class SerialModbusClient implements ModbusTransport {
     waitForResponse: boolean = true,
   ): Promise<ModbusResponse | null> {
     if (!this.isConnected) {
-      throw new Error('Not connected');
+      throw new Error(String(i18n.global.t('errors.notConnected')));
     }
 
     return new Promise((resolve, reject) => {
@@ -173,7 +174,7 @@ export class SerialModbusClient implements ModbusTransport {
       this.currentReject = req.reject;
       this.currentTimeout = window.setTimeout(() => {
         if (this.currentReject) {
-          this.currentReject(new Error('Timeout'));
+          this.currentReject(new Error(String(i18n.global.t('errors.timeout'))));
           this.cleanupCurrentRequest();
           this.processQueue();
         }

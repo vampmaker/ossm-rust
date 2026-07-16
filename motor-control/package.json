@@ -14,7 +14,8 @@
     "@xterm/xterm": "^6.0.0",
     "esptool-js": "^0.5.4",
     "tailwindcss": "^4.1.17",
-    "vue": "^3.5.25"
+    "vue": "^3.5.25",
+    "vue-i18n": "^11.4.6"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",

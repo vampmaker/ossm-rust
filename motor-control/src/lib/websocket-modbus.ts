@@ -1,3 +1,4 @@
+import { i18n } from '../i18n'
 import { parseResponse, type ModbusResponse } from './modbus-rtu'
 import type { CommLogEntry, LogCallback, LogDirection, ModbusTransport } from './transport'
 
@@ -53,7 +54,7 @@ export class WebSocketModbusClient implements ModbusTransport {
       ws.binaryType = 'arraybuffer'
       const onError = () => {
         cleanup()
-        reject(new Error(`WebSocket connection failed: ${url}`))
+        reject(new Error(String(i18n.global.t('errors.wsConnectFailed', { url }))))
       }
       const onOpen = () => {
         cleanup()
@@ -82,7 +83,7 @@ export class WebSocketModbusClient implements ModbusTransport {
 
   public async disconnect() {
     this.isClosing = true
-    const err = new Error('WebSocket disconnected')
+    const err = new Error(String(i18n.global.t('errors.wsDisconnected')))
     if (this.currentReject) {
       this.currentReject(err)
       this.cleanupCurrentRequest()
@@ -109,7 +110,7 @@ export class WebSocketModbusClient implements ModbusTransport {
   public async sendRequest(frame: Uint8Array, timeoutMs: number = 800): Promise<ModbusResponse> {
     const response = await this.sendRawFrame(frame, timeoutMs, true)
     if (!response) {
-      throw new Error('No response received')
+      throw new Error(String(i18n.global.t('errors.noResponse')))
     }
     return response
   }
@@ -120,7 +121,7 @@ export class WebSocketModbusClient implements ModbusTransport {
     waitForResponse: boolean = true,
   ): Promise<ModbusResponse | null> {
     if (!this.isConnected) {
-      throw new Error('Not connected')
+      throw new Error(String(i18n.global.t('errors.notConnected')))
     }
     return new Promise((resolve, reject) => {
       this.requestQueue.push({
@@ -158,7 +159,7 @@ export class WebSocketModbusClient implements ModbusTransport {
       this.currentReject = req.reject
       this.currentTimeout = window.setTimeout(() => {
         if (this.currentReject) {
-          this.currentReject(new Error('Timeout'))
+          this.currentReject(new Error(String(i18n.global.t('errors.timeout'))))
           this.cleanupCurrentRequest()
           this.processQueue()
         }
@@ -202,7 +203,7 @@ export class WebSocketModbusClient implements ModbusTransport {
     }
     const response = parseResponse(data)
     if (!response) {
-      this.currentReject?.(new Error('Invalid Modbus RTU response'))
+      this.currentReject?.(new Error(String(i18n.global.t('errors.invalidRtuResponse'))))
       this.cleanupCurrentRequest()
       setTimeout(() => this.processQueue(), 0)
       return
@@ -213,7 +214,7 @@ export class WebSocketModbusClient implements ModbusTransport {
       (this.currentExpectedFunction !== null &&
         response.functionCode !== this.currentExpectedFunction)
     ) {
-      this.currentReject?.(new Error('Unexpected Modbus response'))
+      this.currentReject?.(new Error(String(i18n.global.t('errors.unexpectedResponse'))))
       this.cleanupCurrentRequest()
       setTimeout(() => this.processQueue(), 0)
       return

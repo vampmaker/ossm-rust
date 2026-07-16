@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { Loader2 } from '@lucide/vue'
 import type { MotorControllerConfig, PauseMode, WaveFunc } from '../types'
 
@@ -16,6 +18,8 @@ const emit = defineEmits<{
   (e: 'setPauseMode', mode: PauseMode): void
 }>()
 
+const { t } = useI18n()
+
 function updateField<K extends keyof MotorControllerConfig>(
   key: K,
   value: MotorControllerConfig[K],
@@ -27,27 +31,27 @@ function setPausedPosition(position: number) {
   emit('setPausedPosition', position)
 }
 
-const waveFunctions: { name: string, value: WaveFunc }[] = [
-  { name: 'Sine', value: 'sine' },
-  { name: 'Thrust', value: 'thrust' },
-  { name: 'Spline', value: 'spline' },
-  { name: 'Funscript', value: 'funscript' },
-]
+const waveFunctions = computed(() => [
+  { name: t('mainControl.waveSine'), value: 'sine' as WaveFunc },
+  { name: t('mainControl.waveThrust'), value: 'thrust' as WaveFunc },
+  { name: t('mainControl.waveSpline'), value: 'spline' as WaveFunc },
+  { name: t('mainControl.waveFunscript'), value: 'funscript' as WaveFunc },
+])
 </script>
 
 <template>
   <div class="space-y-4 bg-white p-4 shadow-md">
     <div class="flex items-center justify-between">
       <div class="flex items-center space-x-2.5">
-        <h2 class="text-xl font-bold">Main Control</h2>
+        <h2 class="text-xl font-bold">{{ t('mainControl.title') }}</h2>
         <span
           v-if="isMutating"
           id="control-busy-indicator"
           class="flex items-center space-x-1.5 rounded-full bg-blue-50 px-2.5 py-0.5 text-xs font-semibold text-blue-600 border border-blue-200 shadow-sm"
-          title="Control request in progress"
+          :title="t('mainControl.busyTitle')"
         >
           <Loader2 class="h-3.5 w-3.5 animate-spin" />
-          <span>Updating...</span>
+          <span>{{ t('mainControl.updating') }}</span>
         </span>
       </div>
       <button
@@ -55,21 +59,21 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
         :class="modelValue.paused ? 'bg-green-500 hover:bg-green-600' : 'bg-red-500 hover:bg-red-600'"
         :disabled="!connected" @click="emit('setPaused', !modelValue.paused)"
       >
-        {{ modelValue.paused ? 'Start' : 'Stop' }}
+        {{ modelValue.paused ? t('mainControl.start') : t('mainControl.stop') }}
       </button>
     </div>
 
     <!-- Sliders -->
     <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
       <div>
-        <label :for="`speed-slider`" class="mb-1 block">Speed: {{ modelValue.bpm.toFixed(0) }} BPM</label>
+        <label :for="`speed-slider`" class="mb-1 block">{{ t('mainControl.speed', { bpm: modelValue.bpm.toFixed(0) }) }}</label>
         <input
           :id="`speed-slider`" type="range" min="10" max="300" :value="modelValue.bpm" class="w-full"
           :disabled="!connected" @input="updateField('bpm', Number.parseInt(($event.target as HTMLInputElement).value))"
         >
       </div>
       <div>
-        <label :for="`depth-slider`" class="mb-1 block">Depth: {{ (modelValue.depth * 100).toFixed(0) }}%</label>
+        <label :for="`depth-slider`" class="mb-1 block">{{ t('mainControl.depth', { depth: (modelValue.depth * 100).toFixed(0) }) }}</label>
         <input
           :id="`depth-slider`" type="range" min="0" max="1" step="0.01" :value="modelValue.depth"
           class="w-full" :disabled="!connected"
@@ -80,7 +84,7 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
 
     <!-- Paused Position Slider -->
     <div v-if="modelValue.paused">
-      <label :for="`paused-position-slider`" class="mb-1 block">Position: {{ (modelValue.paused_position * 100).toFixed(0) }}%</label>
+      <label :for="`paused-position-slider`" class="mb-1 block">{{ t('mainControl.position', { position: (modelValue.paused_position * 100).toFixed(0) }) }}</label>
       <input
         :id="`paused-position-slider`"
         type="range"
@@ -96,7 +100,7 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
 
     <!-- Wave Selection -->
     <div>
-      <label class="mb-1 block">Waveform</label>
+      <label class="mb-1 block">{{ t('mainControl.waveform') }}</label>
       <div class="flex space-x-2">
         <button
           v-for="wave in waveFunctions" :key="wave.value"
@@ -119,10 +123,10 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
           :id="`reversed-checkbox`" type="checkbox" :checked="modelValue.reversed" class="mr-2"
           :disabled="!connected" @input="updateField('reversed', ($event.target as HTMLInputElement).checked)"
         >
-        <label :for="`reversed-checkbox`">Reversed Direction</label>
+        <label :for="`reversed-checkbox`">{{ t('mainControl.reversed') }}</label>
         <span
           class="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-200 text-xs text-gray-700"
-          title="Invert movement direction so the waveform runs in reverse."
+          :title="t('mainControl.reversedHint')"
         >?</span>
       </div>
       <div class="flex items-center">
@@ -130,10 +134,10 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
           :id="`depth-top-checkbox`" type="checkbox" :checked="modelValue.depth_top" class="mr-2"
           :disabled="!connected" @input="updateField('depth_top', ($event.target as HTMLInputElement).checked)"
         >
-        <label :for="`depth-top-checkbox`">Depth From Top</label>
+        <label :for="`depth-top-checkbox`">{{ t('mainControl.depthFromTop') }}</label>
         <span
           class="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-200 text-xs text-gray-700"
-          title="Checked: stroke uses the top range. Unchecked: stroke uses the bottom range."
+          :title="t('mainControl.depthFromTopHint')"
         >?</span>
       </div>
       <div class="flex items-center">
@@ -145,10 +149,10 @@ const waveFunctions: { name: string, value: WaveFunc }[] = [
           :disabled="!connected"
           @input="emit('setPauseMode', ($event.target as HTMLInputElement).checked ? 'in-place' : 'fixed-position')"
         >
-        <label :for="`pause-mode-in-place-checkbox`">Pause in-place</label>
+        <label :for="`pause-mode-in-place-checkbox`">{{ t('mainControl.pauseInPlace') }}</label>
         <span
           class="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-200 text-xs text-gray-700"
-          title="Unchecked: Fixed position (pause slider target). Checked: In-place (capture current motor position on Stop)."
+          :title="t('mainControl.pauseInPlaceHint')"
         >?</span>
       </div>
     </div>

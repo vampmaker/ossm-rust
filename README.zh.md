@@ -385,7 +385,9 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
   "modbus_de_re": 20,
   "modbus_timeout_ms": 0,
   "modbus_scan_delay_us": 0,
-  "modbus_inter_frame_delay_us": 0
+  "modbus_inter_frame_delay_us": 0,
+  "ble_enabled": true,
+  "modbus_debug": false
 }
 ```
 
@@ -396,6 +398,8 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
 *   `modbus_rx_timeout_us`（数字）：Modbus 字节间超时时间（微秒，$t_{1.5}$），`0` 表示自动（115200 波特率默认为 **`750µs`**，符合 >19200 bps 的 Modbus RTU 规范）。
 *   `modbus_scan_delay_us`（数字）：Modbus 自动扫描时的帧间检测延迟（微秒），`0` 表示仅采用 Modbus 规范标准的 t3.5 间隙时序（最高支持 `200000`）。
 *   `modbus_inter_frame_delay_us`（数字）：Modbus 正常通信时的帧间静默延迟（微秒，$t_{3.5}$），`0` 表示自动（115200 波特率默认为 `350µs`，确保完整的往返控制时延于 <3ms 以支撑 >300Hz 的电机控制刷新率）。
+*   `ble_enabled`（布尔）：是否启用 BLE GATT 服务。
+*   `modbus_debug`（布尔）：Modbus RX 诊断模式——**5 ms** 接收截止（与生产相同的 **256 B** UHCI DMA 缓冲），对每帧分类（`empty` / `short` / `exact` / `long` / `leading_zero` / `leading_junk` / `parse_fail`），并在 USB 控制台打印 `MODBUS_DBG` TX/RX 十六进制。**需重启生效。** 会显著降低电机更新率；诊断后请关闭。也可通过 CLI `set-modbus-debug`、刷写器或 `ossm.py pins --modbus-debug` 设置。
 *   `operating_mode`（字符串）：`"servo"`（默认 OSSM 运动控制）或 `"rtu_relay"`（Modbus RTU 桥接）。**需重启生效。**
 
 #### `POST /pin-config`

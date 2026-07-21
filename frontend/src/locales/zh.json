@@ -136,6 +136,8 @@
     "scanDelayHint": "0 = 仅 Modbus t3.5",
     "wifiBleSection": "WiFi 与蓝牙 (BLE) 接口",
     "enableBle": "启用低功耗蓝牙 (BLE)",
+    "modbusDebug": "Modbus RX 调试模式",
+    "modbusDebugHint": "5 ms 接收截止，USB 控制台打印 MODBUS_DBG 分类与 TX/RX 十六进制（256 B DMA）。需重启生效。会显著降低电机更新率——诊断后请关闭。",
     "enableWifi": "启用 WiFi 网络与 Web 界面",
     "cannotDisableBle": "通过 BLE 连接时无法禁用 BLE",
     "cannotDisableWifi": "通过 WiFi 连接时无法禁用 WiFi",

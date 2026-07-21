@@ -806,39 +806,35 @@ async fn ws_session_task(ctx: AppContext) {
 async fn run_modbus_ws_session(mut socket: TcpSocket<'static>) {
     let (mut rx, mut tx) = socket.split();
     let mut buf = [0u8; HTTP_BUFFER_SIZE];
-    loop {
-        match ws_recv(&mut rx, &mut buf).await {
-            Ok((frame_type, len)) => match frame_type {
-                FrameType::Binary(_) | FrameType::Text(_) => {
-                    let req = &buf[..len];
-                    match modbus_relay::exchange_rtu(req).await {
-                        Ok(resp) => {
-                            if ws_send(&mut tx, FrameType::Binary(false), None, &resp)
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Modbus WS exchange failed: {}", e);
-                            // Close on bus errors so the client can retry/reconnect.
+    while let Ok((frame_type, len)) = ws_recv(&mut rx, &mut buf).await {
+        match frame_type {
+            FrameType::Binary(_) | FrameType::Text(_) => {
+                let req = &buf[..len];
+                match modbus_relay::exchange_rtu(req).await {
+                    Ok(resp) => {
+                        if ws_send(&mut tx, FrameType::Binary(false), None, &resp)
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
-                }
-                FrameType::Ping => {
-                    if ws_send(&mut tx, FrameType::Pong, None, &buf[..len])
-                        .await
-                        .is_err()
-                    {
+                    Err(e) => {
+                        log::warn!("Modbus WS exchange failed: {}", e);
+                        // Close on bus errors so the client can retry/reconnect.
                         break;
                     }
                 }
-                FrameType::Close => break,
-                _ => {}
-            },
-            Err(_) => break,
+            }
+            FrameType::Ping
+                if ws_send(&mut tx, FrameType::Pong, None, &buf[..len])
+                    .await
+                    .is_err() =>
+            {
+                break;
+            }
+            FrameType::Close => break,
+            _ => {}
         }
     }
     drop(socket);
@@ -878,7 +874,7 @@ async fn handle_modbus_tcp_client(mut socket: TcpSocket<'static>) {
         let proto = u16::from_be_bytes([hdr[2], hdr[3]]);
         let length = u16::from_be_bytes([hdr[4], hdr[5]]) as usize;
         let unit_id = hdr[6];
-        if proto != 0 || length < 2 || length > 253 {
+        if proto != 0 || !(2..=253).contains(&length) {
             break;
         }
         let pdu_len = length - 1;
@@ -932,7 +928,7 @@ async fn modbus_tcp_session_task() {
 async fn modbus_tcp_server_main(stack: &'static Stack<'static>) {
     let spawner = unsafe { embassy_executor::Spawner::for_current_executor().await };
     for _ in 0..MODBUS_TCP_POOL {
-        let _ = spawner.spawn(modbus_tcp_session_task().unwrap());
+        spawner.spawn(modbus_tcp_session_task().unwrap());
     }
 
     let buffers = MODBUS_TCP_BUFFERS.init(TcpBuffers::new());

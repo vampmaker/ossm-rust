@@ -347,6 +347,24 @@ const averageUpdateRate = computed(() => {
             {{ t('settings.enableBle') }}
           </label>
         </div>
+        <div class="flex flex-col gap-1">
+          <div class="flex items-center space-x-3">
+            <input
+              id="modbus-debug"
+              type="checkbox"
+              :checked="pinConfig.modbus_debug ?? false"
+              class="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
+              :disabled="!connected || saving"
+              @change="updatePinField('modbus_debug', ($event.target as HTMLInputElement).checked)"
+            >
+            <label for="modbus-debug" class="text-sm font-semibold text-gray-800">
+              {{ t('settings.modbusDebug') }}
+            </label>
+          </div>
+          <p class="pl-8 text-xs text-amber-700">
+            {{ t('settings.modbusDebugHint') }}
+          </p>
+        </div>
 
         <div class="flex items-center space-x-3">
           <input

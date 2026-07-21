@@ -230,6 +230,25 @@ const averageUpdateRate = computed(() => {
       </label>
     </div>
 
+    <div class="flex flex-col gap-1 py-2">
+      <div class="flex items-center space-x-2">
+        <input
+          id="modbus-debug"
+          type="checkbox"
+          :checked="modelValue.modbus_debug ?? false"
+          class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+          :disabled="!connected || saving"
+          @change="updateField('modbus_debug', ($event.target as HTMLInputElement).checked)"
+        >
+        <label for="modbus-debug" class="text-sm font-medium text-gray-700">
+          Modbus RX debug mode
+        </label>
+      </div>
+      <p class="pl-6 text-xs text-amber-700">
+        5&nbsp;ms RX deadline + MODBUS_DBG class/hex on USB console (256&nbsp;B DMA). Restart required. Collapses motor update rate — disable after diagnosis.
+      </p>
+    </div>
+
     <div class="grid grid-cols-1 gap-2 md:grid-cols-2">
       <button
         class="rounded bg-gray-200 px-4 py-2 font-medium text-gray-800 hover:bg-gray-300 disabled:opacity-50"

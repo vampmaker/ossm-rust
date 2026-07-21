@@ -1123,7 +1123,7 @@ impl MotorController {
         self.snapshot.pos_min = self.position_gen.pos_min;
         self.snapshot.pos_max = self.position_gen.pos_max;
         self.snapshot.motor_connected = self.motor_connected;
-        self.snapshot.modbus_stats = self.modbus_stats.clone();
+        self.snapshot.modbus_stats = self.modbus_stats;
         self.snapshot.ups = self.last_loop_stats.ups;
         self.snapshot.dt_min_ms = self.last_loop_stats.min_dt_ms;
         self.snapshot.dt_max_ms = self.last_loop_stats.max_dt_ms;

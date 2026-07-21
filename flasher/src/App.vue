@@ -37,6 +37,7 @@ const modbusInterFrameDelayUs = ref(0)
 const modbusScanDelayUs = ref(0)
 const wifiEnabled = ref(true)
 const bleEnabled = ref(true)
+const modbusDebug = ref(false)
 
 const DEVICE_CONFIG_STORAGE_KEY = 'ossm-flasher-device-config-v1'
 const DEFAULT_DEVICE_CONFIG = {
@@ -51,6 +52,7 @@ const DEFAULT_DEVICE_CONFIG = {
   modbusInterFrameDelayUs: 0,
   modbusScanDelayUs: 0,
   bleEnabled: true,
+  modbusDebug: false,
   flashAddress: '0x0',
 } as const
 
@@ -66,6 +68,7 @@ function applyDeviceConfig(config: Partial<typeof DEFAULT_DEVICE_CONFIG>) {
   modbusInterFrameDelayUs.value = config.modbusInterFrameDelayUs ?? DEFAULT_DEVICE_CONFIG.modbusInterFrameDelayUs
   modbusScanDelayUs.value = config.modbusScanDelayUs ?? DEFAULT_DEVICE_CONFIG.modbusScanDelayUs
   bleEnabled.value = config.bleEnabled ?? DEFAULT_DEVICE_CONFIG.bleEnabled
+  modbusDebug.value = config.modbusDebug ?? DEFAULT_DEVICE_CONFIG.modbusDebug
   flashAddress.value = config.flashAddress ?? DEFAULT_DEVICE_CONFIG.flashAddress
 }
 
@@ -96,6 +99,7 @@ function persistDeviceConfig() {
       modbusInterFrameDelayUs: modbusInterFrameDelayUs.value,
       modbusScanDelayUs: modbusScanDelayUs.value,
       bleEnabled: bleEnabled.value,
+      modbusDebug: modbusDebug.value,
       flashAddress: flashAddress.value,
     }
     localStorage.setItem(DEVICE_CONFIG_STORAGE_KEY, JSON.stringify(payload))
@@ -241,7 +245,7 @@ onMounted(() => {
 })
 
 watch(
-  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusRxTimeoutUs, modbusInterFrameDelayUs, modbusScanDelayUs, bleEnabled, flashAddress],
+  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusRxTimeoutUs, modbusInterFrameDelayUs, modbusScanDelayUs, bleEnabled, modbusDebug, flashAddress],
   () => {
     persistDeviceConfig()
   },
@@ -700,6 +704,10 @@ async function sendConfig() {
       cmd: `set-ble-enabled ${bleEnabled.value}`,
       ack: ['ble_enabled set to'],
     })
+    commands.push({
+      cmd: `set-modbus-debug ${modbusDebug.value}`,
+      ack: ['modbus_debug set to'],
+    })
 
     const encoder = new TextEncoder()
     for (const item of commands) {
@@ -1103,16 +1111,34 @@ function switchLocale(next: AppLocale) {
                 />
               </div>
             </div>
-            <div class="mt-3 flex items-center space-x-2 pt-2 border-t border-gray-100">
-              <input
-                id="flasher-ble-enabled"
-                type="checkbox"
-                v-model="bleEnabled"
-                class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-              />
-              <label for="flasher-ble-enabled" class="text-xs font-medium text-gray-700">
-                {{ t('config.ble.enable') }}
-              </label>
+            <div class="mt-3 flex flex-col gap-2 pt-2 border-t border-gray-100">
+              <div class="flex items-center space-x-2">
+                <input
+                  id="flasher-ble-enabled"
+                  type="checkbox"
+                  v-model="bleEnabled"
+                  class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <label for="flasher-ble-enabled" class="text-xs font-medium text-gray-700">
+                  {{ t('config.ble.enable') }}
+                </label>
+              </div>
+              <div class="flex flex-col gap-1">
+                <div class="flex items-center space-x-2">
+                  <input
+                    id="flasher-modbus-debug"
+                    type="checkbox"
+                    v-model="modbusDebug"
+                    class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                  <label for="flasher-modbus-debug" class="text-xs font-medium text-gray-700">
+                    {{ t('config.modbus.debug') }}
+                  </label>
+                </div>
+                <p class="pl-6 text-[11px] text-amber-700">
+                  {{ t('config.modbus.debugHint') }}
+                </p>
+              </div>
             </div>
           </fieldset>
         </div>

@@ -94,6 +94,8 @@ export interface PinConfiguration {
   modbus_scan_delay_us: number
   modbus_inter_frame_delay_us: number
   ble_enabled: boolean
+  /** Diagnostic Modbus RX capture; requires reboot. Collapses UPS while on. */
+  modbus_debug?: boolean
   operating_mode?: 'servo' | 'rtu_relay'
 }
 

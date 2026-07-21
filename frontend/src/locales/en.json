@@ -136,6 +136,8 @@
     "scanDelayHint": "0 = Modbus t3.5 only",
     "wifiBleSection": "WiFi & Bluetooth (BLE) Interfaces",
     "enableBle": "Enable Bluetooth Low Energy (BLE)",
+    "modbusDebug": "Modbus RX debug mode",
+    "modbusDebugHint": "5 ms RX deadline + MODBUS_DBG class/hex on USB console (256 B DMA). Restart required. Collapses motor update rate — disable after diagnosis.",
     "enableWifi": "Enable WiFi Network & Web Interface",
     "cannotDisableBle": "Cannot disable BLE while connected via BLE",
     "cannotDisableWifi": "Cannot disable WiFi while connected via WiFi",

@@ -102,6 +102,7 @@ async fn main(spawner: Spawner) -> ! {
                     .unwrap(),
                 );
             // Keep the unused motion consumer alive for AppContext lifetime.
+            #[allow(clippy::forget_non_drop)]
             core::mem::forget(motion_consumer);
         } else {
             motor_spawner.spawn(

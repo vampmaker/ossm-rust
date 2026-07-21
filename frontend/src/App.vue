@@ -35,6 +35,7 @@ const defaultPinConfig: PinConfiguration = {
   modbus_scan_delay_us: 0,
   modbus_inter_frame_delay_us: 0,
   ble_enabled: true,
+  modbus_debug: false,
   operating_mode: 'servo',
 }
 

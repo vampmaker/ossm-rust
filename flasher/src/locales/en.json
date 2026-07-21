@@ -69,7 +69,9 @@
       "interFrameQuiet": "Inter-frame quiet (µs)",
       "interFrameQuietHint": "0 = Auto (350µs {'@'} 115200)",
       "scanDelay": "Scan delay (µs)",
-      "scanDelayHint": "0 = t3.5"
+      "scanDelayHint": "0 = t3.5",
+      "debug": "Modbus RX debug mode",
+      "debugHint": "5 ms RX deadline + MODBUS_DBG class/hex on USB (256 B DMA). Restart required. Collapses UPS."
     },
     "ble": {
       "enable": "Enable Bluetooth Low Energy (BLE)"

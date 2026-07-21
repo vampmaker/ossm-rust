@@ -402,7 +402,9 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
   "modbus_de_re": 20,
   "modbus_timeout_ms": 0,
   "modbus_scan_delay_us": 0,
-  "modbus_inter_frame_delay_us": 0
+  "modbus_inter_frame_delay_us": 0,
+  "ble_enabled": true,
+  "modbus_debug": false
 }
 ```
 
@@ -413,6 +415,8 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 *   `modbus_rx_timeout_us` (number): Modbus RX inter-byte timeout ($t_{1.5}$) in microseconds (`0` = auto: **750µs** @ 115200 baud per Modbus RTU for >19200 bps).
 *   `modbus_scan_delay_us` (number): Modbus scan inter-probe delay in microseconds (`0` = use Modbus t3.5 timing only, up to `200000`).
 *   `modbus_inter_frame_delay_us` (number): Modbus inter-frame quiet interval ($t_{3.5}$) in microseconds (`0` = auto based on baud rate: 350µs @ 115200 baud, enabling <3ms total end-to-end request-response cycle time for >300 Hz position updates).
+*   `ble_enabled` (boolean): Enable Bluetooth Low Energy GATT server.
+*   `modbus_debug` (boolean): Diagnostic Modbus RX mode — **5 ms** RX deadline (same **256 B** UHCI DMA buffers as production), classifies each reply (`empty` / `short` / `exact` / `long` / `leading_zero` / `leading_junk` / `parse_fail`), and prints `MODBUS_DBG` TX/RX hex lines on the USB console. **Restart required.** Collapses motor UPS; disable after diagnosis. Also via CLI `set-modbus-debug`, flasher, or `ossm.py pins --modbus-debug`.
 *   `operating_mode` (string): `"servo"` (default OSSM motion controller) or `"rtu_relay"` (Modbus RTU bridge). **Restart required.**
 
 #### `POST /pin-config`

@@ -46,6 +46,8 @@ enum CliCommand {
     GetModbusInterFrameDelayUs,
     SetBleEnabled(bool),
     GetBleEnabled,
+    SetModbusDebug(bool),
+    GetModbusDebug,
     SetOperatingMode(String),
     GetOperatingMode,
     SetWifiEnabled(bool),
@@ -95,6 +97,8 @@ enum BaseCommand<'a> {
     GetModbusInterFrameDelayUs,
     SetBleEnabled { value: bool },
     GetBleEnabled,
+    SetModbusDebug { value: bool },
+    GetModbusDebug,
     SetOperatingMode { mode: &'a str },
     GetOperatingMode,
     SetWifiEnabled { value: bool },
@@ -201,6 +205,8 @@ fn base_to_cli(command: BaseCommand<'_>) -> Option<CliCommand> {
         BaseCommand::GetModbusInterFrameDelayUs => CliCommand::GetModbusInterFrameDelayUs,
         BaseCommand::SetBleEnabled { value } => CliCommand::SetBleEnabled(value),
         BaseCommand::GetBleEnabled => CliCommand::GetBleEnabled,
+        BaseCommand::SetModbusDebug { value } => CliCommand::SetModbusDebug(value),
+        BaseCommand::GetModbusDebug => CliCommand::GetModbusDebug,
         BaseCommand::SetOperatingMode { mode }
             if matches!(mode, "servo" | "rtu_relay") =>
         {
@@ -334,6 +340,7 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
             let mut config = app_context.storage.pin();
             config.modbus_timeout_ms = value;
             app_context.storage.set_pin(config);
+            log::info!("modbus_timeout_ms set to {}", value);
         }
         CliCommand::GetModbusTimeoutMs => {
             let config = app_context.storage.pin();
@@ -343,6 +350,7 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
             let mut config = app_context.storage.pin();
             config.modbus_rx_timeout_us = value;
             app_context.storage.set_pin(config);
+            log::info!("modbus_rx_timeout_us set to {}", value);
         }
         CliCommand::GetModbusRxTimeoutUs => {
             let config = app_context.storage.pin();
@@ -352,6 +360,7 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
             let mut config = app_context.storage.pin();
             config.modbus_scan_delay_us = value;
             app_context.storage.set_pin(config);
+            log::info!("modbus_scan_delay_us set to {}", value);
         }
         CliCommand::GetModbusScanDelayUs => {
             let config = app_context.storage.pin();
@@ -361,6 +370,7 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
             let mut config = app_context.storage.pin();
             config.modbus_inter_frame_delay_us = value;
             app_context.storage.set_pin(config);
+            log::info!("modbus_inter_frame_delay_us set to {}", value);
         }
         CliCommand::GetModbusInterFrameDelayUs => {
             let config = app_context.storage.pin();
@@ -373,10 +383,21 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
             let mut config = app_context.storage.pin();
             config.ble_enabled = value;
             app_context.storage.set_pin(config);
+            log::info!("ble_enabled set to {}", value);
         }
         CliCommand::GetBleEnabled => {
             let config = app_context.storage.pin();
             log::info!("ble_enabled: {}", config.ble_enabled);
+        }
+        CliCommand::SetModbusDebug(value) => {
+            let mut config = app_context.storage.pin();
+            config.modbus_debug = value;
+            app_context.storage.set_pin(config);
+            log::info!("modbus_debug set to {}, restart to apply", value);
+        }
+        CliCommand::GetModbusDebug => {
+            let config = app_context.storage.pin();
+            log::info!("modbus_debug: {}", config.modbus_debug);
         }
         CliCommand::SetOperatingMode(mode) => {
             let mut config = app_context.storage.pin();

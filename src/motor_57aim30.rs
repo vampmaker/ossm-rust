@@ -42,6 +42,7 @@ pub struct ModbusRTUMaster<'d> {
     inter_frame_delay_override_us: u32,
     baudrate: u32,
     timeout_symbols: u8,
+    debug: bool,
 
     last_stats_window: Instant,
     current_successes: u32,
@@ -102,8 +103,13 @@ impl<'d> ModbusRTUMaster<'d> {
         inter_frame_delay_override_us: u32,
         baudrate: u32,
         timeout_symbols: u8,
+        debug: bool,
     ) -> Self {
-        let timeout = Self::compute_timeout(baudrate, timeout_override_ms).unwrap();
+        let timeout = if debug {
+            Duration::from_millis(5)
+        } else {
+            Self::compute_timeout(baudrate, timeout_override_ms).unwrap()
+        };
         let rx_inter_byte_timeout =
             Self::compute_rx_inter_byte_timeout(baudrate, rx_timeout_override_us).unwrap();
         let inter_frame_delay =
@@ -124,6 +130,7 @@ impl<'d> ModbusRTUMaster<'d> {
             inter_frame_delay_override_us,
             baudrate,
             timeout_symbols,
+            debug,
             last_stats_window: Instant::now(),
             current_successes: 0,
             current_failures: 0,
@@ -261,7 +268,7 @@ impl<'d> ModbusRTUMaster<'d> {
 
     pub fn get_stats(&mut self) -> ModbusStats {
         self.maybe_flush_stats();
-        self.latest_stats.clone()
+        self.latest_stats
     }
 
     async fn dma_write_all(&mut self, req: &[u8]) -> Result<()> {
@@ -316,6 +323,12 @@ impl<'d> ModbusRTUMaster<'d> {
         let cap = dma_rx.capacity();
         dma_rx.set_length(cap);
         let expected_len = expected_modbus_response_len(req);
+        // UHCI finalizes DMA descriptors on length-EOF (pkt_thres) and/or UART idle-EOF.
+        // Using pkt_thres=1024 meant an 8-byte Modbus reply never hit length-EOF; if idle-EOF
+        // did not fire in time, software cancel left descriptors un-finalized and
+        // read_received_data() returned 0 (false "empty" with a live motor).
+        // Debug mode keeps the large capture buffer and 5ms deadline, but must complete the
+        // transfer the same way as production so RX bytes are visible.
         configure_uhci0_pkt_thres(expected_len);
 
         let mut rx_transfer = uhci_rx.read(dma_rx).map_err(|(_, rx, buf)| {
@@ -327,30 +340,81 @@ impl<'d> ModbusRTUMaster<'d> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let wait_res = with_timeout(remaining, rx_transfer.wait_for_done()).await;
         let _t3 = Instant::now();
-        if wait_res.is_err() {
+
+        let mut capture = [0u8; 256];
+        let timed_out = wait_res.is_err();
+        let to_copy = if timed_out {
             let (uhci_rx, dma_rx) = rx_transfer.cancel();
             self.uhci_rx = Some(uhci_rx);
+            if !self.debug {
+                self.dma_rx = Some(dma_rx);
+                return Err(FirmwareError::Uart("read timeout"));
+            }
+            // Best-effort: may still be 0 if descriptors were never EOF-finalized.
+            let n = dma_rx.read_received_data(&mut capture);
             self.dma_rx = Some(dma_rx);
-            return Err(FirmwareError::Uart("read timeout"));
-        }
-
-        let (rx_res, uhci_rx, dma_rx) = rx_transfer.wait();
-        self.uhci_rx = Some(uhci_rx);
-        if rx_res.is_err() {
+            n
+        } else {
+            let (rx_res, uhci_rx, dma_rx) = rx_transfer.wait();
+            self.uhci_rx = Some(uhci_rx);
+            if rx_res.is_err() {
+                self.dma_rx = Some(dma_rx);
+                if self.debug {
+                    self.log_modbus_dbg(req, &[], expected_len as usize, false, "dma_err");
+                }
+                return Err(FirmwareError::Uart("dma rx err"));
+            }
+            let n = if self.debug {
+                dma_rx.read_received_data(&mut capture)
+            } else {
+                dma_rx.read_received_data(resp)
+            };
             self.dma_rx = Some(dma_rx);
-            return Err(FirmwareError::Uart("dma rx err"));
+            n
+        };
+
+        if self.debug && timed_out {
+            log::info!(
+                "MODBUS_DBG note=rx_wait_timeout_ms={} bytes_after_cancel={}",
+                self.read_timeout.as_millis(),
+                to_copy
+            );
         }
 
-        let to_copy = dma_rx.read_received_data(resp);
-        self.dma_rx = Some(dma_rx);
+        let (rx_bytes, rx_len) = if self.debug {
+            let len = to_copy.min(capture.len());
+            let class = classify_modbus_rx(&capture[..len], req, expected_len as usize);
+            let parse_slice = skip_leading_zeros(&capture[..len]);
+            let accept = try_parse_modbus_frame(parse_slice, expected_len as usize);
+            self.log_modbus_dbg(
+                req,
+                &capture[..len],
+                expected_len as usize,
+                accept,
+                class,
+            );
+            if !accept {
+                return Err(FirmwareError::Modbus(match class {
+                    "empty" => "empty frame",
+                    "short" => "incomplete frame",
+                    "leading_zero" | "leading_junk" => "bad frame",
+                    "long" => "long frame",
+                    _ => "parse fail",
+                }));
+            }
+            let copy_len = parse_slice.len().min(resp.len());
+            resp[..copy_len].copy_from_slice(&parse_slice[..copy_len]);
+            (copy_len, parse_slice.len())
+        } else {
+            if to_copy < 4 {
+                return Err(FirmwareError::Modbus("bad frame"));
+            }
+            (to_copy, to_copy)
+        };
 
-        if to_copy < 4 {
-            return Err(FirmwareError::Modbus("bad frame"));
-        }
-
-        let len = guess_response_frame_len(&resp[..to_copy.min(3)], ModbusProto::Rtu)
+        let len = guess_response_frame_len(&resp[..rx_bytes.min(3)], ModbusProto::Rtu)
             .map_err(|_| FirmwareError::Modbus("bad frame"))? as usize;
-        if to_copy < len {
+        if rx_len < len {
             return Err(FirmwareError::Modbus("incomplete frame"));
         }
 
@@ -393,7 +457,7 @@ impl<'d> ModbusRTUMaster<'d> {
         #[cfg(feature = "byte-timing-diag")]
         log::info!(
             "GDMA_RX_DIAG: bytes_received={} round_trip_us={} slave_latency_us={}",
-            to_copy,
+            rx_len,
             round_trip_us,
             slave_latency_us,
         );
@@ -405,6 +469,27 @@ impl<'d> ModbusRTUMaster<'d> {
         };
 
         Ok((len, timing))
+    }
+
+    fn log_modbus_dbg(
+        &self,
+        tx: &[u8],
+        rx: &[u8],
+        expected: usize,
+        ok: bool,
+        class: &str,
+    ) {
+        let tx_hex = bytes_to_hex(tx, 64);
+        let rx_hex = bytes_to_hex(rx, 64);
+        log::info!(
+            "MODBUS_DBG ok={} class={} expected={} tx={} rx_len={} rx={}",
+            ok,
+            class,
+            expected,
+            tx_hex,
+            rx.len(),
+            rx_hex
+        );
     }
 
     pub async fn modbus_request(&mut self, req: &[u8], resp: &mut [u8]) -> Result<usize> {
@@ -510,7 +595,11 @@ impl<'d> ModbusRTUMaster<'d> {
             );
         }
         self.baudrate = baudrate;
-        let timeout = Self::compute_timeout(baudrate, self.timeout_override_ms)?;
+        let timeout = if self.debug {
+            Duration::from_millis(5)
+        } else {
+            Self::compute_timeout(baudrate, self.timeout_override_ms)?
+        };
         self.read_timeout = timeout;
         self.write_timeout = timeout;
         self.inter_frame_delay =
@@ -746,6 +835,8 @@ pub(crate) fn init_uart_and_modbus(
         .with_tx(tx_pin)
         .with_rx(rx_pin);
 
+    // Keep RX DMA at 256 B: larger UHCI RX buffers have been observed to prevent
+    // descriptor EOF finalization on this path (all reads look empty / timeout).
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = esp_hal::dma_buffers!(256, 256);
     let dma_rx = DmaRxBuf::new(rx_descriptors, rx_buffer)
         .map_err(|_| FirmwareError::Uart("dma rx buf"))?;
@@ -762,6 +853,12 @@ pub(crate) fn init_uart_and_modbus(
 
     configure_uart1_rx_idle_threshold(timeout_symbols);
 
+    if pin_config.modbus_debug {
+        log::info!(
+            "Modbus debug mode ON: 5ms RX deadline, hex dumps on console (DMA RX 256 B)"
+        );
+    }
+
     Ok(ModbusRTUMaster::new(
         uhci_rx,
         uhci_tx,
@@ -774,6 +871,7 @@ pub(crate) fn init_uart_and_modbus(
         pin_config.modbus_inter_frame_delay_us,
         TARGET_BAUD_RATE,
         timeout_symbols,
+        pin_config.modbus_debug,
     ))
 }
 
@@ -808,6 +906,74 @@ fn expected_modbus_response_len(req: &[u8]) -> u16 {
         }
     } else {
         128
+    }
+}
+
+fn bytes_to_hex(data: &[u8], max_bytes: usize) -> alloc::string::String {
+    let n = data.len().min(max_bytes);
+    let mut s = alloc::string::String::with_capacity(n * 3);
+    for (i, b) in data.iter().take(n).enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        let hi = b >> 4;
+        let lo = b & 0x0f;
+        s.push(core::char::from_digit(hi as u32, 16).unwrap_or('?'));
+        s.push(core::char::from_digit(lo as u32, 16).unwrap_or('?'));
+    }
+    if data.len() > max_bytes {
+        s.push_str(" …");
+    }
+    s
+}
+
+fn skip_leading_zeros(data: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i < data.len() && data[i] == 0 {
+        i += 1;
+    }
+    &data[i..]
+}
+
+fn try_parse_modbus_frame(data: &[u8], expected: usize) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+    match guess_response_frame_len(&data[..data.len().min(3)], ModbusProto::Rtu) {
+        Ok(len) => {
+            let len = len as usize;
+            data.len() >= len && (expected == 0 || len == expected || data.len() >= expected)
+        }
+        Err(_) => false,
+    }
+}
+
+fn classify_modbus_rx(rx: &[u8], req: &[u8], expected: usize) -> &'static str {
+    if rx.is_empty() {
+        return "empty";
+    }
+    let leading_zeros = rx.iter().take_while(|&&b| b == 0).count();
+    if leading_zeros > 0 {
+        return "leading_zero";
+    }
+    let slave = req.first().copied().unwrap_or(1);
+    if rx[0] != slave {
+        return "leading_junk";
+    }
+    if rx.len() < expected {
+        return "short";
+    }
+    if rx.len() > expected {
+        // valid frame may be followed by noise
+        if try_parse_modbus_frame(&rx[..expected], expected) {
+            return "long";
+        }
+        return "leading_junk";
+    }
+    if try_parse_modbus_frame(rx, expected) {
+        "exact"
+    } else {
+        "parse_fail"
     }
 }
 

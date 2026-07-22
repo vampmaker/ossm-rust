@@ -3,10 +3,16 @@
 //! Other tasks talk via bounded channels. USB uses interrupt-driven async I/O with
 //! select timeouts (no hang without a host). UART0/RTT use nb + 100 µs yields.
 //! Per-sink TX rings drain without busy-wait or O(n) buffer shifts.
+//! The main loop batches TX (`TX_BATCH_MAX` chunks, `LOOP_TX_BUDGET_MS` cap).
+//! When OUT queues are idle it blocks on USB RX with a short timeout; when logs
+//! are pending it polls RX non-blocking only so motor/WiFi keep CPU. `IN_CH` uses
+//! `try_send` (512 B) so the console task never awaits on input backpressure.
+//! CLI and log USB bytes use separate TX rings so replies are not queued behind
+//! log backlog on the wire.
 
 use core::fmt::Write as FmtWrite;
 
-use embassy_futures::select::{select, select3, Either, Either3};
+use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
@@ -20,7 +26,9 @@ use rtt_target::{rtt_init, ChannelMode, UpChannel};
 
 const OUT_CAP: usize = 192;
 const OUT_QUEUE: usize = 32;
-const IN_QUEUE: usize = 128;
+/// Priority OUT for CLI echo/replies (processed before log OUT).
+const CLI_OUT_QUEUE: usize = 8;
+const IN_QUEUE: usize = 512;
 const SINK_TX_CAP: usize = 256;
 const USB_EP_SIZE: usize = 64;
 const MAX_YIELDS: u32 = 10;
@@ -30,13 +38,26 @@ const YIELD_US: u64 = 100;
 const USB_WAIT_US: u64 = 500;
 /// No-host abandon budget for a single drain pass.
 const TOTAL_TIMEOUT_MS: u64 = 10;
-/// UART0 RX poll while blocked on USB/OUT (USB RX is interrupt-driven).
-const UART_POLL_US: u64 = 500;
+/// UART0 RX poll when idle (no pending OUT work).
+const UART_POLL_US: u64 = 2000;
+/// OUT chunks drained per main-loop iteration.
+const TX_BATCH_MAX: usize = 3;
+/// Max TX work per main-loop iteration before an RX turn.
+const LOOP_TX_BUDGET_MS: u64 = 8;
+/// Max time spent pushing one OUT chunk through sink rings during accept_out.
+const ACCEPT_OUT_BUDGET_MS: u64 = 10;
+/// USB EP writes per capped log drain; 4 × 64 B.
+const USB_DRAIN_MAX_PACKETS: u32 = 4;
+/// CLI OUT chunks per main-loop iteration (priority path).
+const CLI_BATCH_MAX: usize = 4;
+/// Extra yield when no OUT/CLI work pending (saves CPU for motor/WiFi).
+const IDLE_YIELD_US: u64 = 500;
 const LOG_LINE_CAP: usize = 256;
 
 pub type OutChunk = HVec<u8, OUT_CAP>;
 
 static OUT_CH: Channel<CriticalSectionRawMutex, OutChunk, OUT_QUEUE> = Channel::new();
+static CLI_OUT_CH: Channel<CriticalSectionRawMutex, OutChunk, CLI_OUT_QUEUE> = Channel::new();
 static IN_CH: Channel<CriticalSectionRawMutex, u8, IN_QUEUE> = Channel::new();
 
 /// Fixed ring buffer: O(1) push/pop (no memmove on consume).
@@ -137,15 +158,26 @@ pub fn enqueue_bytes(data: &[u8]) {
     }
 }
 
-/// Enqueue raw bytes for CLI (no forced newline).
-pub fn write_bytes(data: &[u8]) {
-    enqueue_bytes(data);
+fn enqueue_cli_bytes(data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    for piece in data.chunks(OUT_CAP) {
+        let mut chunk = OutChunk::new();
+        let _ = chunk.extend_from_slice(piece);
+        let _ = CLI_OUT_CH.try_send(chunk);
+    }
 }
 
-/// Enqueue a line for CLI replies (appends `\r\n`). Streams large JSON via `enqueue_bytes`.
+/// Enqueue raw bytes for CLI (no forced newline). Priority over log OUT.
+pub fn write_bytes(data: &[u8]) {
+    enqueue_cli_bytes(data);
+}
+
+/// Enqueue a line for CLI replies (appends `\r\n`). Priority over log OUT.
 pub fn write_line(s: &str) {
-    enqueue_bytes(s.as_bytes());
-    enqueue_bytes(b"\r\n");
+    enqueue_cli_bytes(s.as_bytes());
+    enqueue_cli_bytes(b"\r\n");
 }
 
 /// Blocking recv one input byte from console (USB or UART0).
@@ -154,7 +186,30 @@ pub async fn read_byte() -> u8 {
 }
 
 fn try_push_in(b: u8) {
-    let _ = IN_CH.try_send(b);
+    let _ = IN_CH.try_send(map_del(b));
+}
+
+fn push_in_slice(data: &[u8]) {
+    for &b in data {
+        try_push_in(b);
+    }
+}
+
+fn poll_rx_nb(usb: &mut UsbSerialJtag<'_, Async>, uart: &mut Uart<'_, Blocking>) {
+    while let Ok(b) = usb.read_byte() {
+        try_push_in(b);
+    }
+    while uart.read_ready() {
+        let mut byte = [0u8; 1];
+        match uart.read(&mut byte) {
+            Ok(1) => try_push_in(byte[0]),
+            _ => break,
+        }
+    }
+}
+
+fn out_pending() -> bool {
+    !OUT_CH.is_empty() || !CLI_OUT_CH.is_empty()
 }
 
 fn map_del(b: u8) -> u8 {
@@ -179,11 +234,21 @@ fn push_into(ring: &mut Ring, data: &[u8], offset: &mut usize) -> bool {
 }
 
 /// Interrupt USB TX: write ≤64 B then await IN_EMPTY with timeout (no hang).
-async fn drain_usb(usb: &mut UsbSerialJtag<'_, Async>, ring: &mut Ring) {
+async fn drain_usb(
+    usb: &mut UsbSerialJtag<'_, Async>,
+    ring: &mut Ring,
+    max_packets: Option<u32>,
+) {
     let deadline = Instant::now() + Duration::from_millis(TOTAL_TIMEOUT_MS);
+    let mut packets = 0u32;
     while !ring.is_empty() {
         if Instant::now() >= deadline {
             return;
+        }
+        if let Some(limit) = max_packets {
+            if packets >= limit {
+                return;
+            }
         }
         let cont = ring.peek_contiguous();
         let n = cont.len().min(USB_EP_SIZE);
@@ -201,6 +266,7 @@ async fn drain_usb(usb: &mut UsbSerialJtag<'_, Async>, ring: &mut Ring) {
         {
             Either::First(Ok(written)) => {
                 ring.consume(written.min(n));
+                packets += 1;
             }
             Either::First(Err(_)) | Either::Second(()) => {
                 // No host / still full: leave remainder for a later pass.
@@ -267,40 +333,93 @@ async fn drain_rtt(rtt: &mut UpChannel, ring: &mut Ring) {
     }
 }
 
-async fn drain_sinks(
+async fn drain_sinks_progress(
     usb: &mut UsbSerialJtag<'_, Async>,
     uart: &mut Uart<'_, Blocking>,
     rtt: &mut UpChannel,
-    usb_tx: &mut Ring,
+    usb_tx_cli: &mut Ring,
+    usb_tx_log: &mut Ring,
     uart_tx: &mut Ring,
     rtt_tx: &mut Ring,
 ) {
-    // USB first — do not serialize behind UART/RTT stalls.
-    drain_usb(usb, usb_tx).await;
+    drain_usb(usb, usb_tx_cli, None).await;
+    drain_usb(usb, usb_tx_log, Some(USB_DRAIN_MAX_PACKETS)).await;
     drain_uart(uart, uart_tx).await;
     drain_rtt(rtt, rtt_tx).await;
 }
 
-fn push_into_in_from_slice(data: &[u8]) {
-    for &b in data {
-        try_push_in(map_del(b));
+async fn drain_cli_out_batch(
+    usb: &mut UsbSerialJtag<'_, Async>,
+    uart: &mut Uart<'_, Blocking>,
+    rtt: &mut UpChannel,
+    usb_tx_cli: &mut Ring,
+    uart_tx: &mut Ring,
+    rtt_tx: &mut Ring,
+) -> bool {
+    let mut progressed = false;
+    for _ in 0..CLI_BATCH_MAX {
+        let Ok(chunk) = CLI_OUT_CH.try_receive() else {
+            break;
+        };
+        progressed = true;
+        accept_out(
+            usb,
+            uart,
+            rtt,
+            usb_tx_cli,
+            uart_tx,
+            rtt_tx,
+            false,
+            chunk.as_slice(),
+        )
+        .await;
     }
+    if !usb_tx_cli.is_empty() {
+        drain_usb(usb, usb_tx_cli, None).await;
+        progressed = true;
+    }
+    progressed
 }
 
-fn poll_usb_rx_nb(usb: &mut UsbSerialJtag<'_, Async>) {
-    while let Ok(b) = usb.read_byte() {
-        try_push_in(map_del(b));
-    }
-}
-
-fn poll_uart_rx(uart: &mut Uart<'_, Blocking>) {
-    while uart.read_ready() {
-        let mut byte = [0u8; 1];
-        match uart.read(&mut byte) {
-            Ok(1) => try_push_in(map_del(byte[0])),
-            _ => break,
+async fn drain_out_batch(
+    usb: &mut UsbSerialJtag<'_, Async>,
+    uart: &mut Uart<'_, Blocking>,
+    rtt: &mut UpChannel,
+    usb_tx_cli: &mut Ring,
+    usb_tx_log: &mut Ring,
+    uart_tx: &mut Ring,
+    rtt_tx: &mut Ring,
+    tx_deadline: Instant,
+) -> bool {
+    let mut progressed = false;
+    for _ in 0..TX_BATCH_MAX {
+        if Instant::now() >= tx_deadline {
+            break;
         }
+        let Ok(chunk) = OUT_CH.try_receive() else {
+            break;
+        };
+        progressed = true;
+        accept_out(
+            usb,
+            uart,
+            rtt,
+            usb_tx_log,
+            uart_tx,
+            rtt_tx,
+            true,
+            chunk.as_slice(),
+        )
+        .await;
     }
+    if !usb_tx_cli.is_empty()
+        || !usb_tx_log.is_empty()
+        || !uart_tx.is_empty()
+        || !rtt_tx.is_empty()
+    {
+        drain_sinks_progress(usb, uart, rtt, usb_tx_cli, usb_tx_log, uart_tx, rtt_tx).await;
+    }
+    progressed
 }
 
 /// Stream `data` into sink rings. USB is the primary console path: once all
@@ -310,9 +429,10 @@ async fn accept_out(
     usb: &mut UsbSerialJtag<'_, Async>,
     uart: &mut Uart<'_, Blocking>,
     rtt: &mut UpChannel,
-    usb_tx: &mut Ring,
+    usb_ring: &mut Ring,
     uart_tx: &mut Ring,
     rtt_tx: &mut Ring,
+    cap_usb_drain: bool,
     data: &[u8],
 ) {
     if data.is_empty() {
@@ -322,16 +442,23 @@ async fn accept_out(
     let mut uart_off = 0usize;
     let mut rtt_off = 0usize;
     let mut yields = 0u32;
-    let deadline = Instant::now() + Duration::from_millis(TOTAL_TIMEOUT_MS.saturating_mul(20));
+    let deadline = Instant::now() + Duration::from_millis(ACCEPT_OUT_BUDGET_MS);
+    let usb_cap = if cap_usb_drain {
+        Some(USB_DRAIN_MAX_PACKETS)
+    } else {
+        None
+    };
 
     loop {
-        let p0 = push_into(usb_tx, data, &mut usb_off);
+        let p0 = push_into(usb_ring, data, &mut usb_off);
         // Best-effort side sinks — never gate completion on them.
         let _ = push_into(uart_tx, data, &mut uart_off);
         let _ = push_into(rtt_tx, data, &mut rtt_off);
 
-        if !usb_tx.is_empty() || !uart_tx.is_empty() || !rtt_tx.is_empty() {
-            drain_sinks(usb, uart, rtt, usb_tx, uart_tx, rtt_tx).await;
+        if !usb_ring.is_empty() || !uart_tx.is_empty() || !rtt_tx.is_empty() {
+            drain_usb(usb, usb_ring, usb_cap).await;
+            drain_uart(uart, uart_tx).await;
+            drain_rtt(rtt, rtt_tx).await;
         }
 
         // Primary path done: all bytes fed into the USB ring.
@@ -339,8 +466,8 @@ async fn accept_out(
             // Opportunistic last push into UART/RTT with remaining free space.
             let _ = push_into(uart_tx, data, &mut uart_off);
             let _ = push_into(rtt_tx, data, &mut rtt_off);
-            if !usb_tx.is_empty() {
-                drain_usb(usb, usb_tx).await;
+            if !usb_ring.is_empty() {
+                drain_usb(usb, usb_ring, usb_cap).await;
             }
             if !uart_tx.is_empty() || !rtt_tx.is_empty() {
                 drain_uart(uart, uart_tx).await;
@@ -436,7 +563,8 @@ pub async fn run(
         .with_tx(tx_pin)
         .with_rx(rx_pin);
 
-    let mut usb_tx = Ring::new();
+    let mut usb_tx_cli = Ring::new();
+    let mut usb_tx_log = Ring::new();
     let mut uart_tx = Ring::new();
     let mut rtt_tx = Ring::new();
     let mut rx_tmp = [0u8; USB_EP_SIZE];
@@ -445,82 +573,58 @@ pub async fn run(
         &mut usb,
         &mut uart,
         &mut rtt,
-        &mut usb_tx,
+        &mut usb_tx_log,
         &mut uart_tx,
         &mut rtt_tx,
+        true,
         b"\r\n[console] ready\r\n",
     )
     .await;
 
     loop {
-        while let Ok(chunk) = OUT_CH.try_receive() {
-            accept_out(
-                &mut usb,
-                &mut uart,
-                &mut rtt,
-                &mut usb_tx,
-                &mut uart_tx,
-                &mut rtt_tx,
-                chunk.as_slice(),
+        if out_pending() {
+            poll_rx_nb(&mut usb, &mut uart);
+        } else {
+            match select(
+                AsyncRead::read(&mut usb, &mut rx_tmp),
+                Timer::after(Duration::from_micros(UART_POLL_US)),
             )
-            .await;
+            .await
+            {
+                Either::First(Ok(n)) => push_in_slice(&rx_tmp[..n]),
+                Either::First(Err(_)) => {}
+                Either::Second(()) => {}
+            }
+            poll_rx_nb(&mut usb, &mut uart);
         }
-        drain_sinks(
+
+        let cli_work = drain_cli_out_batch(
             &mut usb,
             &mut uart,
             &mut rtt,
-            &mut usb_tx,
+            &mut usb_tx_cli,
             &mut uart_tx,
             &mut rtt_tx,
         )
         .await;
-        poll_usb_rx_nb(&mut usb);
-        poll_uart_rx(&mut uart);
 
-        match select3(
-            OUT_CH.receive(),
-            AsyncRead::read(&mut usb, &mut rx_tmp),
-            Timer::after(Duration::from_micros(UART_POLL_US)),
+        let tx_deadline = Instant::now() + Duration::from_millis(LOOP_TX_BUDGET_MS);
+        let log_work = drain_out_batch(
+            &mut usb,
+            &mut uart,
+            &mut rtt,
+            &mut usb_tx_cli,
+            &mut usb_tx_log,
+            &mut uart_tx,
+            &mut rtt_tx,
+            tx_deadline,
         )
-        .await
-        {
-            Either3::First(chunk) => {
-                accept_out(
-                    &mut usb,
-                    &mut uart,
-                    &mut rtt,
-                    &mut usb_tx,
-                    &mut uart_tx,
-                    &mut rtt_tx,
-                    chunk.as_slice(),
-                )
-                .await;
-                poll_usb_rx_nb(&mut usb);
-                poll_uart_rx(&mut uart);
-            }
-            Either3::Second(Ok(n)) => {
-                push_into_in_from_slice(&rx_tmp[..n]);
-                poll_usb_rx_nb(&mut usb);
-                poll_uart_rx(&mut uart);
-            }
-            Either3::Second(Err(_)) => {
-                poll_uart_rx(&mut uart);
-            }
-            Either3::Third(()) => {
-                if !usb_tx.is_empty() || !uart_tx.is_empty() || !rtt_tx.is_empty() {
-                    drain_sinks(
-                        &mut usb,
-                        &mut uart,
-                        &mut rtt,
-                        &mut usb_tx,
-                        &mut uart_tx,
-                        &mut rtt_tx,
-                    )
-                    .await;
-                }
-                poll_usb_rx_nb(&mut usb);
-                poll_uart_rx(&mut uart);
-            }
+        .await;
+
+        if cli_work || log_work || out_pending() {
+            Timer::after(Duration::from_micros(YIELD_US)).await;
+        } else {
+            Timer::after(Duration::from_micros(IDLE_YIELD_US)).await;
         }
     }
 }

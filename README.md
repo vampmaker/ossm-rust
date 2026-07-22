@@ -188,6 +188,8 @@ Key interface features include:
 
 You can also drive the device over USB serial (115200 baud, `\r\n`). In `flasher.html`, use the **Serial** panel (or **Monitor**) for interactive CLI; the **Console** panel is for flash/config tool messages only. The same commands work in any serial terminal.
 
+The firmware `console` task owns USB Serial/JTAG and UART0. Log output (`log::*` / `MODBUS_DBG`) and CLI echo/replies share the wire but use **separate paths**: a priority **`CLI_OUT_CH`** queue and dedicated USB TX ring for CLI bytes, **RX-first** polling, and batched log drain so host serial stays responsive under diagnostic log floods. Non-debug motor `ups` remains ~320 Hz on ESP32-C6; `modbus_debug` adds USB log volume but steady-state `ups` is typically only a few percent lower once homing settles.
+
 ```
 help                           - Show this help message
 reset                          - Soft reset the MCU
@@ -212,7 +214,22 @@ set-modbus-timeout-ms <val>    - Set Modbus per-read timeout in ms (0 = use defa
 get-modbus-timeout-ms          - Get Modbus per-read timeout in ms
 set-modbus-scan-delay-us <val> - Set Modbus scan inter-probe delay in us (0 = use Modbus t3.5 only)
 get-modbus-scan-delay-us       - Get Modbus scan inter-probe delay in us
+set-modbus-debug <true|false>  - Enable Modbus RX diagnostics (reboot required)
+get-modbus-debug               - Get modbus_debug flag
+set-modbus-inject-junk <mode> <nbytes> - RAM-only capture fault injection (modbus_debug only)
+get-modbus-inject-junk         - Get inject mode/nbytes
 ```
+
+### Automated Device Tests (Developers)
+
+Live-hardware scripts in `scripts/` (run with `uv run`); set `DEVICE_IP` in `.env`:
+
+| Script | Purpose |
+| --- | --- |
+| `./scripts/test_console_fairness.py` | Serial CLI ACK under `modbus_debug` + `MODBUS_DBG` TX flood (`POST /modbus-inject`, motor running) |
+| `./scripts/test_modbus_debug_device.py` | Modbus CRC resync / inject via **probe-rs RTT** (avoids USB ACM stalls) |
+| `./scripts/test_modbus_resync.py` | Host-only CRC/resync mirror (no hardware) |
+| `./scripts/stress_dt_max.py` | HTTP+WebSocket load; asserts `dt_max_ms` < 4.5 ms |
 
 ### Multi-Mode Control CLI (`ossm.py`)
 
@@ -446,7 +463,7 @@ A **macro** is a shareable JSON sequence of timestamped control instructions (`s
 *   `modbus_scan_delay_us` (number): Modbus scan inter-probe delay in microseconds (`0` = use Modbus t3.5 timing only, up to `200000`).
 *   `modbus_inter_frame_delay_us` (number): Modbus inter-frame quiet interval ($t_{3.5}$) in microseconds (`0` = auto based on baud rate: 350µs @ 115200 baud, enabling <3ms total end-to-end request-response cycle time for >300 Hz position updates).
 *   `ble_enabled` (boolean): Enable Bluetooth Low Energy GATT server.
-*   `modbus_debug` (boolean): Diagnostic Modbus RX mode — **5 ms** RX deadline (same **256 B** UHCI DMA buffers as production), classifies each reply (`empty` / `short` / `exact` / `long` / `leading_zero` / `leading_junk` / `parse_fail`), and prints `MODBUS_DBG` TX/RX hex lines on the USB console. **Restart required.** Collapses motor UPS; disable after diagnosis. Also via CLI `set-modbus-debug`, flasher, or `ossm.py pins --modbus-debug`.
+*   `modbus_debug` (boolean): Diagnostic Modbus RX mode — **5 ms** RX deadline (same **256 B** UHCI DMA buffers as production), classifies each reply (`empty` / `short` / `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`), and prints `MODBUS_DBG` TX/RX hex lines on the USB console. **Restart required.** Increases USB log volume; steady-state motor `ups` is typically only a few percent below non-debug (~310 vs ~320 Hz on ESP32-C6). Serial CLI stays responsive under the flood via console **TX/RX fairness** (`CLI_OUT_CH`, separate CLI/log USB rings). Verify with `./scripts/test_console_fairness.py`; disable after diagnosis. Also via CLI `set-modbus-debug`, flasher, or `ossm.py pins --modbus-debug`.
 *   `operating_mode` (string): `"servo"` (default OSSM motion controller) or `"rtu_relay"` (Modbus RTU bridge). **Restart required.**
 
 #### `POST /pin-config`

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use heapless::spsc::{Producer, Consumer};
 
-pub const COMMAND_QUEUE_SIZE: usize = 64;
+pub const COMMAND_QUEUE_SIZE: usize = 3;
 pub type CommandProducer = Producer<'static, MotionCommand>;
 pub type CommandConsumer = Consumer<'static, MotionCommand>;
 
@@ -1202,9 +1202,14 @@ impl MotorController {
 
     /// Sole post-init assignment for `self.config` — always bumps the version so
     /// `refresh_snapshot` publishes the change.
-    fn commit_config(&mut self, config: MotorControllerConfig) {
+    fn commit_config(&mut self, mut config: MotorControllerConfig) {
+        if config.version > self.config_version {
+            self.config_version = config.version;
+        } else {
+            self.config_version = self.config_version.wrapping_add(1);
+            config.version = self.config_version;
+        }
         self.config = config;
-        self.config_version = self.config_version.wrapping_add(1);
     }
 
     pub fn set_config(&mut self, config: MotorControllerConfig) -> Result<()> {
@@ -1369,6 +1374,8 @@ impl MotorController {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct MotorControllerConfig {
+    #[serde(default)]
+    pub version: u32,
     pub bpm: f32,
     pub depth: f32,
     pub depth_top: bool,     // true = top [0, depth], false = bottom [1-depth, 1]
@@ -1483,6 +1490,7 @@ impl Default for StateResponse {
 impl MotorControllerConfig {
     /// Copy fields from `src`, reusing heap capacity where possible.
     pub fn copy_from(&mut self, src: &MotorControllerConfig) {
+        self.version = src.version;
         self.bpm = src.bpm;
         self.depth = src.depth;
         self.depth_top = src.depth_top;
@@ -1497,6 +1505,7 @@ impl MotorControllerConfig {
 
     pub fn default() -> Self {
         Self {
+            version: 0,
             bpm: 36.0,
             depth: 1.0,
             depth_top: false,

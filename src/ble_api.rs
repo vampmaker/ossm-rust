@@ -400,12 +400,9 @@ async fn handle_gatt_events<C: Controller>(
                         } else if let Ok(config) =
                             serde_json::from_slice::<MotorControllerConfig>(&data)
                         {
-                            let applied = app_context
-                                .enqueue_motion(crate::motion::MotionCommand::SetConfig(config.clone()))
-                                .await;
-                            if applied {
+                            if let Ok(applied) = app_context.try_enqueue_config(config).await {
                                 let _ = crate::buffers::try_with_scratchpad(|buf| {
-                                    if let Ok(len) = serde_json_core::to_slice(&config, buf) {
+                                    if let Ok(len) = serde_json_core::to_slice(&applied, buf) {
                                         let _ = server
                                             .set(&server.ossm.config, &to_vec::<512>(&buf[..len]));
                                     }
@@ -430,12 +427,9 @@ async fn handle_gatt_events<C: Controller>(
                                 config.paused_position =
                                     (config.paused_position + adjust).clamp(0.0, 1.0);
                             }
-                            if app_context
-                                .enqueue_motion(crate::motion::MotionCommand::SetConfig(config.clone()))
-                                .await
-                            {
+                            if let Ok(applied) = app_context.try_enqueue_config(config).await {
                                 let _ = crate::buffers::try_with_scratchpad(|buf| {
-                                    if let Ok(len) = serde_json_core::to_slice(&config, buf) {
+                                    if let Ok(len) = serde_json_core::to_slice(&applied, buf) {
                                         let _ = server
                                             .set(&server.ossm.config, &to_vec::<512>(&buf[..len]));
                                     }

@@ -48,6 +48,8 @@ enum CliCommand {
     GetBleEnabled,
     SetModbusDebug(bool),
     GetModbusDebug,
+    SetModbusInjectJunk(crate::modbus_rtu::InjectJunkMode, u8),
+    GetModbusInjectJunk,
     SetOperatingMode(String),
     GetOperatingMode,
     SetWifiEnabled(bool),
@@ -99,6 +101,8 @@ enum BaseCommand<'a> {
     GetBleEnabled,
     SetModbusDebug { value: bool },
     GetModbusDebug,
+    SetModbusInjectJunk { mode: &'a str, nbytes: u32 },
+    GetModbusInjectJunk,
     SetOperatingMode { mode: &'a str },
     GetOperatingMode,
     SetWifiEnabled { value: bool },
@@ -207,6 +211,18 @@ fn base_to_cli(command: BaseCommand<'_>) -> Option<CliCommand> {
         BaseCommand::GetBleEnabled => CliCommand::GetBleEnabled,
         BaseCommand::SetModbusDebug { value } => CliCommand::SetModbusDebug(value),
         BaseCommand::GetModbusDebug => CliCommand::GetModbusDebug,
+        BaseCommand::SetModbusInjectJunk { mode, nbytes } if nbytes <= 64 => {
+            use crate::modbus_rtu::InjectJunkMode;
+            let m = match mode {
+                "off" => InjectJunkMode::Off,
+                "leading" => InjectJunkMode::Leading,
+                "trailing" => InjectJunkMode::Trailing,
+                "both" => InjectJunkMode::Both,
+                _ => return None,
+            };
+            CliCommand::SetModbusInjectJunk(m, nbytes as u8)
+        }
+        BaseCommand::GetModbusInjectJunk => CliCommand::GetModbusInjectJunk,
         BaseCommand::SetOperatingMode { mode }
             if matches!(mode, "servo" | "rtu_relay") =>
         {
@@ -304,10 +320,9 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
         }
         CliCommand::SetMotorConfig(json) => {
             if let Ok(config) = serde_json::from_str::<MotorControllerConfig>(&json) {
-                let _ = app_context
-                    .enqueue_motion(MotionCommand::SetConfig(config))
-                    .await;
-                log::info!("Motor config updated");
+                if app_context.try_enqueue_config(config).await.is_ok() {
+                    log::info!("Motor config updated");
+                }
             }
         }
         CliCommand::GetMotorConfig => {
@@ -399,6 +414,28 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
             let config = app_context.storage.pin();
             log::info!("modbus_debug: {}", config.modbus_debug);
         }
+        CliCommand::SetModbusInjectJunk(mode, nbytes) => {
+            crate::modbus_rtu::set_inject_junk(mode, nbytes);
+            log::info!(
+                "modbus_inject_junk set to {} {} (RAM only; honored when modbus_debug)",
+                mode.as_str(),
+                nbytes
+            );
+            console::write_line(&alloc::format!(
+                "modbus_inject_junk: {} {}",
+                mode.as_str(),
+                nbytes
+            ));
+        }
+        CliCommand::GetModbusInjectJunk => {
+            let (mode, nbytes) = crate::modbus_rtu::get_inject_junk();
+            log::info!("modbus_inject_junk: {} {}", mode.as_str(), nbytes);
+            console::write_line(&alloc::format!(
+                "modbus_inject_junk: {} {}",
+                mode.as_str(),
+                nbytes
+            ));
+        }
         CliCommand::SetOperatingMode(mode) => {
             let mut config = app_context.storage.pin();
             config.operating_mode = mode.clone();
@@ -483,9 +520,7 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
 async fn update_config(app_context: AppContext, f: impl FnOnce(&mut MotorControllerConfig)) {
     let mut config = app_context.load_snapshot().config.clone();
     f(&mut config);
-    let _ = app_context
-        .enqueue_motion(MotionCommand::SetConfig(config))
-        .await;
+    let _ = app_context.try_enqueue_config(config).await;
 }
 
 async fn set_net_field(app_context: AppContext, f: impl FnOnce(&mut crate::storage::NetworkConfiguration)) {

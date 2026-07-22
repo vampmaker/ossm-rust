@@ -24,6 +24,7 @@ use static_cell::StaticCell;
 
 use crate::context::AppContext;
 use crate::modbus_relay;
+use crate::modbus_rtu::{self, InjectJunkMode};
 use crate::motion::MotorControllerConfig;
 use crate::rpc::{self, RpcAction};
 use crate::storage::{NetworkConfiguration, PinConfiguration};
@@ -57,14 +58,17 @@ impl WsMessage {
 }
 
 #[derive(Deserialize)]
+pub struct WaypointsObject {
+    pub waypoints: Vec<crate::motion::StreamWaypoint>,
+    #[serde(default, rename = "reset-timestamp", alias = "reset_timestamp", alias = "reset")]
+    pub reset_timestamp: Option<bool>,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 pub enum WaypointsInput {
     List(Vec<crate::motion::StreamWaypoint>),
-    Object {
-        waypoints: Vec<crate::motion::StreamWaypoint>,
-        #[serde(default, alias = "reset-timestamp", alias = "reset")]
-        reset_timestamp: Option<bool>,
-    },
+    Object(WaypointsObject),
     Single(crate::motion::StreamWaypoint),
 }
 
@@ -72,10 +76,7 @@ impl WaypointsInput {
     pub fn into_parts(self) -> (Vec<crate::motion::StreamWaypoint>, bool) {
         match self {
             WaypointsInput::List(list) => (list, false),
-            WaypointsInput::Object {
-                waypoints,
-                reset_timestamp,
-            } => (waypoints, reset_timestamp.unwrap_or(false)),
+            WaypointsInput::Object(obj) => (obj.waypoints, obj.reset_timestamp.unwrap_or(false)),
             WaypointsInput::Single(wp) => (alloc::vec![wp], false),
         }
     }
@@ -336,13 +337,12 @@ async fn post_config(
 
     match config_res {
         Ok(config) => {
-            if ctx
-                .enqueue_motion(crate::motion::MotionCommand::SetConfig(config.clone()))
-                .await
-            {
-                send_json_obj(conn, 200, "OK", &config).await
-            } else {
-                send_json(conn, 503, "Service Unavailable", "Command queue full").await
+            match ctx.try_enqueue_config(config).await {
+                Ok(applied) => send_json_obj(conn, 200, "OK", &applied).await,
+                Err("Stale causal version") => {
+                    send_json(conn, 409, "Conflict", "Stale causal version").await
+                }
+                Err(msg) => send_json(conn, 503, "Service Unavailable", msg).await,
             }
         }
         Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
@@ -380,13 +380,12 @@ async fn post_paused(
             if let Some(adjust) = control.adjust {
                 config.paused_position = (config.paused_position + adjust).clamp(0.0, 1.0);
             }
-            if ctx
-                .enqueue_motion(crate::motion::MotionCommand::SetConfig(config.clone()))
-                .await
-            {
-                send_json_obj(conn, 200, "OK", &config).await
-            } else {
-                send_json(conn, 503, "Service Unavailable", "Command queue full").await
+            match ctx.try_enqueue_config(config).await {
+                Ok(applied) => send_json_obj(conn, 200, "OK", &applied).await,
+                Err("Stale causal version") => {
+                    send_json(conn, 409, "Conflict", "Stale causal version").await
+                }
+                Err(msg) => send_json(conn, 503, "Service Unavailable", msg).await,
             }
         }
         Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
@@ -455,6 +454,78 @@ async fn post_restart(conn: &mut HttpConn<'_>) -> Result<(), HttpError<edge_nal_
     send_json(conn, 200, "OK", "{\"ok\":true}").await
 }
 
+#[derive(Deserialize)]
+struct ModbusInjectBody {
+    mode: alloc::string::String,
+    #[serde(default)]
+    nbytes: u8,
+}
+
+#[derive(Serialize)]
+struct ModbusInjectResponse {
+    mode: &'static str,
+    nbytes: u8,
+}
+
+async fn get_modbus_inject(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    if !ctx.storage.pin().modbus_debug {
+        return send_json(conn, 409, "Conflict", "modbus_debug disabled").await;
+    }
+    let (mode, nbytes) = modbus_rtu::get_inject_junk();
+    send_json_obj(
+        conn,
+        200,
+        "OK",
+        &ModbusInjectResponse {
+            mode: mode.as_str(),
+            nbytes,
+        },
+    )
+    .await
+}
+
+async fn post_modbus_inject(
+    conn: &mut HttpConn<'_>,
+    ctx: AppContext,
+    body: Vec<u8>,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    if !ctx.storage.pin().modbus_debug {
+        return send_json(conn, 409, "Conflict", "modbus_debug disabled").await;
+    }
+    if body.len() > MAX_BODY_LEN {
+        return send_json(conn, 400, "Bad Request", "Request too large").await;
+    }
+    match serde_json::from_slice::<ModbusInjectBody>(&body) {
+        Ok(req) => {
+            let mode = match req.mode.as_str() {
+                "off" => InjectJunkMode::Off,
+                "leading" => InjectJunkMode::Leading,
+                "trailing" => InjectJunkMode::Trailing,
+                "both" => InjectJunkMode::Both,
+                _ => return send_json(conn, 400, "Bad Request", "bad mode").await,
+            };
+            if req.nbytes > 64 {
+                return send_json(conn, 400, "Bad Request", "nbytes too large").await;
+            }
+            modbus_rtu::set_inject_junk(mode, req.nbytes);
+            send_json_obj(
+                conn,
+                200,
+                "OK",
+                &ModbusInjectResponse {
+                    mode: mode.as_str(),
+                    nbytes: req.nbytes,
+                },
+            )
+            .await
+        }
+        Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
+    }
+}
+
 #[embassy_executor::task]
 async fn delayed_reset_task() {
     Timer::after(Duration::from_millis(100)).await;
@@ -507,6 +578,13 @@ async fn handle_rest(
         (Method::Options, "/network-config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
         (Method::Post, "/restart") => post_restart(conn).await,
         (Method::Options, "/restart") => cors_preflight(conn, "POST, OPTIONS").await,
+        (Method::Get, "/modbus-inject") => get_modbus_inject(conn, ctx).await,
+        (Method::Post, "/modbus-inject") => {
+            let (_, body) = conn.split();
+            let payload = read_body_limited(body, MAX_BODY_LEN).await?;
+            post_modbus_inject(conn, ctx, payload).await
+        }
+        (Method::Options, "/modbus-inject") => cors_preflight(conn, "GET, POST, OPTIONS").await,
         _ => {
             conn.initiate_response(
                 404,

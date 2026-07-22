@@ -180,8 +180,9 @@ Example: `http://192.168.1.123` or `http://ossm.local`
 
 Key interface features include:
 - **Toggleable Real-Time Motor Position Diagram**: Visualizes the full stroke range (`0% – 100%`), physical hardware limits (`pos_min` / `pos_max`), active stroke window with distinct **Left Limit** and **Right Limit** boundaries, and an animated puck showing live motor position at 30 FPS. Can be toggled on or off using the Activity icon in the header, with toggle state persisted across browser sessions.
-- **Resilient High-Frequency Live Telemetry (`WsDataManager`)**: Uses a single-owner WebSocket client (`client.ts`) to stream real-time motor updates and loop statistics (`ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, `dt_mdev_ms`) at up to **30 FPS (`33ms`)** over WiFi WebSocket (`/ws/command`). BLE live telemetry uses a separate path (`ble.ts` / GATT `CHAR_STATE` notifications), not this WebSocket manager. On the firmware side, WebSocket sessions use **split asynchronous RX/TX tasks** (`edge_nal::TcpSplit`) and heap-allocated string payloads backed by a **4-buffer shared pool (`NET_BUFFER_POOL`)**, preventing buffer starvation when concurrent HTTP REST requests arrive during active streaming.
-- **Interactive Motion Control & Spline Editor**: Adjust BPM (speed), stroke depth, top/bottom depth anchoring, stroke reversal, pause/resume modes, or design custom periodic trajectories with interactive spline control points.
+- **Resilient High-Frequency Live Telemetry (`WsDataManager`)**: Uses a single-owner WebSocket client (`client.ts`) to stream real-time motor updates and loop statistics (`ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, `dt_mdev_ms`) at up to **30 FPS (`33ms`)** over WiFi WebSocket (`/ws/command`) when the diagram or settings panel is open. When those panels are closed, the UI falls back to **1 Hz** REST `/state` polling to save WebSocket slots. BLE live telemetry uses a separate path (`ble.ts` / GATT `CHAR_STATE` notifications), not this WebSocket manager. On the firmware side, WebSocket sessions use **split asynchronous RX/TX tasks** (`edge_nal::TcpSplit`) and heap-allocated string payloads backed by a **4-buffer shared pool (`NET_BUFFER_POOL`)**, preventing buffer starvation when concurrent HTTP REST requests arrive during active streaming.
+- **Causal config versioning**: Every motor config mutation bumps a monotonic `version` field. The UI tracks `authoritativeVersion` and ignores stale background snapshots so slider edits do not self-revert under concurrent `/state` pushes.
+- **Interactive Motion Control, Spline Editor & Macro Player**: Adjust BPM (speed), stroke depth, top/bottom depth anchoring, stroke reversal, pause/resume modes, design custom periodic trajectories with interactive spline control points, or compose timestamped **control macros** (waveform button **Macro**) with import/export, gap seeking, and loop playback. **Funscript** mode is also client-driven.
 
 ### Serial Commands
 
@@ -247,6 +248,10 @@ It supports controlling and monitoring your OSSM device across three communicati
 
 # Launch real-time telemetry monitoring TUI dashboard
 ./scripts/ossm.py monitor -m ble
+
+# Write an example control macro JSON, then play it
+./scripts/ossm.py macro --init /tmp/warmup.json
+./scripts/ossm.py macro /tmp/warmup.json --loop --speed 1.0 -m wifi
 ```
 
 When imported as a Python library, `ossm.py` also exports validated Pydantic v2 schemas (`MotorControllerConfig`, `StateResponse`, `PinConfiguration`, `NetworkConfiguration`, etc.) and the `DeviceBackend` class for custom Python automation scripts.
@@ -287,6 +292,7 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 
 ```json
 {
+  "version": 42,
   "bpm": 60.0,
   "depth": 1.0,
   "depth_top": true,
@@ -300,25 +306,48 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 }
 ```
 
+*   `version` (number): Monotonically increasing causal timestamp for the configuration. Incremented on every successful config write; clients should reject stale snapshots where `version` regresses. Omit or send `0` to let the firmware assign the next version.
 *   `bpm` (number): Beats per minute. Controls the speed of the motion cycle.
 *   `depth` (number): The stroke depth, from 0.0 (no movement) to 1.0 (full range).
 *   `depth_top` (boolean): Determines the direction of the stroke.
     *   `true`: The stroke moves from the fully retracted position (0.0) to the specified `depth`. For example, a depth of 0.8 would move in the range [0.0, 0.8].
     *   `false`: The stroke moves from `1.0 - depth` to the fully extended position (1.0). For example, a depth of 0.8 would move in the range [0.2, 1.0].
 *   `reversed` (boolean): When `true`, reverses the direction of the waveform.
-*   `wave_func` (string): The motion pattern. Can be `"sine"`, `"thrust"`, or `"spline"`.
+*   `wave_func` (string): The motion pattern. Firmware generators support `"sine"`, `"thrust"`, and `"spline"`. The web UI also offers `"funscript"` and `"macro"` modes; those are client-driven (the UI or `ossm.py` issues timed `set-config` / pause commands) and the firmware falls back to sine if those labels are posted as `wave_func`.
 *   `sharpness` (number): Only affects the `"thrust"` waveform. Controls the duration of the thrust, from 0.01 (sharpest) to 0.99 (smoothest).
 *   `spline_points` (array of numbers): An array of points (0.0 to 1.0) that define the custom motion path for the `"spline"` waveform.
 *   `paused` (boolean): `true` to pause the motor, `false` to run it.
 *   `paused_position` (number): The position (0.0 to 1.0) the motor will hold when paused.
 *   `streaming` (boolean): When `true`, the motor controller accepts real-time streaming motion commands over WebSocket (`/ws/command`).
 
+##### Control macros (web UI + `ossm.py macro`)
+
+A **macro** is a shareable JSON sequence of timestamped control instructions (`start` / `stop` / `set`). Playback is entirely client-side: the browser Macro Player (waveform button **Macro**) or `./scripts/ossm.py macro <file.json>` waits until each `at` (milliseconds from start) and issues the matching REST/BLE/serial command.
+
+```json
+{
+  "version": 1,
+  "name": "Warm up",
+  "loop": false,
+  "instructions": [
+    { "at": 0, "action": "set", "params": { "bpm": 40, "depth": 0.6, "wave_func": "sine" } },
+    { "at": 0, "action": "start" },
+    { "at": 15000, "action": "set", "params": { "bpm": 90, "wave_func": "thrust", "sharpness": 0.2 } },
+    { "at": 60000, "action": "stop", "params": { "position": 0.0 } }
+  ]
+}
+```
+
+*   `set` params may include any of: `bpm`, `depth`, `depth_top`, `reversed`, `wave_func` (`sine`|`thrust`|`spline`), `sharpness`, `spline_points`.
+*   `stop` may optionally park with `params.position` (0.0–1.0).
+*   Export/import from the web UI, or generate a starter file with `./scripts/ossm.py macro --init example.json`.
+
 #### `POST /config`
 
 *   **Method:** `POST`
-*   **Description:** Updates the motor configuration. You must send a full configuration object, as partial updates are not supported.
+*   **Description:** Updates the motor configuration. You must send a full configuration object, as partial updates are not supported. If you include `version` and it is older than the device's current config, the server responds with **409 Conflict** (`Stale causal version`).
 *   **Request Body:** A JSON object with the same structure as the `GET /config` response.
-*   **Response Body:** The updated configuration as a JSON object.
+*   **Response Body:** The applied configuration as a JSON object, including the newly incremented `version`.
 
 #### `POST /paused`
 
@@ -347,6 +376,7 @@ The firmware also provides an HTTP API for programmatic control. All endpoints s
 ```json
 {
   "config": {
+    "version": 42,
     "bpm": 60.0,
     "depth": 1.0,
     "depth_top": true,
@@ -509,7 +539,7 @@ When `operating_mode` is `"rtu_relay"` (Settings UI, `POST /pin-config`, or CLI 
   "id": 5
 }
 ```
-    *   **Set Config**: Dynamically updates the motor controller configuration (`MotorControllerConfig`).
+    *   **Set Config**: Dynamically updates the motor controller configuration (`MotorControllerConfig`). Returns the applied config including the incremented `version`. Rejects stale `params.version` with JSON-RPC error `-32001` (`Stale causal version`).
 ```json
 {
   "jsonrpc": "2.0",

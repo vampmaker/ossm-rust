@@ -291,6 +291,16 @@ class DeviceBackend:
         self.ble_addr = ble_addr
         self._ble_client = None
         self._http_client: Optional[httpx2.AsyncClient] = None
+        self._config_version: int = 0
+
+    def _track_version(self, config: dict):
+        if isinstance(config, dict) and "version" in config:
+            try:
+                val = int(config["version"])
+                if val > self._config_version:
+                    self._config_version = val
+            except (ValueError, TypeError):
+                pass
 
     async def _get_http_client(self) -> httpx2.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
@@ -475,6 +485,7 @@ class DeviceBackend:
                 if not config:
                     res_cfg = await client.get(f"http://{self.ip}/config")
                     config = res_cfg.json()
+                self._track_version(config)
                 return {"state": state, "config": config}
             except Exception as e:
                 console.print(
@@ -485,16 +496,20 @@ class DeviceBackend:
             client = await self._get_ble_client()
             state_raw = await client.read_gatt_char(BleUUID.CHAR_STATE)
             config_raw = await client.read_gatt_char(BleUUID.CHAR_CONFIG)
+            config = json.loads(config_raw.decode("utf-8"))
+            self._track_version(config)
             return {
                 "state": json.loads(state_raw.decode("utf-8")),
-                "config": json.loads(config_raw.decode("utf-8")),
+                "config": config,
             }
         elif self.mode == "serial":
             lines = await self._serial_command("get-status")
             text = "\n".join(lines)
             if "{" in text and "}" in text:
                 try:
-                    return json.loads(text[text.find("{") : text.rfind("}") + 1])
+                    res = json.loads(text[text.find("{") : text.rfind("}") + 1])
+                    self._track_version(res.get("config"))
+                    return res
                 except Exception:
                     pass
             lines = await self._serial_command("get-motor-config")
@@ -505,6 +520,7 @@ class DeviceBackend:
                     config = json.loads(text[text.find("{") : text.rfind("}") + 1])
                 except Exception:
                     pass
+            self._track_version(config)
             return {
                 "config": config,
                 "state": {"position": 0.0, "speed": 0.0, "config": config},
@@ -519,11 +535,29 @@ class DeviceBackend:
         except Exception:
             full_config = {}
         full_config.update(config_dict)
+        return await self.post_full_config(full_config)
+
+    async def post_full_config(self, full_config: dict) -> dict:
+        """Post a complete motor config without a prior get_status round-trip."""
+        if isinstance(full_config, dict):
+            try:
+                curr_ver = int(full_config.get("version", 0))
+            except (ValueError, TypeError):
+                curr_ver = 0
+            if curr_ver <= self._config_version:
+                if self._config_version > 0 or "version" in full_config:
+                    self._config_version += 1
+                    full_config["version"] = self._config_version
+            else:
+                self._config_version = curr_ver
+
         if self.mode == "wifi":
             try:
                 client = await self._get_http_client()
                 res = await client.post(f"http://{self.ip}/config", json=full_config)
-                return res.json()
+                ret = res.json()
+                self._track_version(ret)
+                return ret
             except Exception as e:
                 console.print(
                     f"[bold red]WiFi Error:[/bold red] Failed to post config to http://{self.ip}: {e}"
@@ -534,12 +568,15 @@ class DeviceBackend:
             payload = json.dumps(full_config).encode("utf-8")
             await client.write_gatt_char(BleUUID.CHAR_CONFIG, payload, response=True)
             res_raw = await client.read_gatt_char(BleUUID.CHAR_CONFIG)
-            return json.loads(res_raw.decode("utf-8"))
+            ret = json.loads(res_raw.decode("utf-8"))
+            self._track_version(ret)
+            return ret
         elif self.mode == "serial":
             payload = json.dumps(full_config, separators=(",", ":"))
             await self._serial_command(
                 f"set-motor-config {payload}", wait_response=False
             )
+            self._track_version(full_config)
             return full_config
         return {}
 
@@ -1521,6 +1558,270 @@ def play(
             await backend.set_config({"streaming": False, "paused": True})
 
     asyncio.run(_run_play())
+
+
+EXAMPLE_MACRO_JSON = {
+    "version": 1,
+    "name": "Warm up",
+    "loop": False,
+    "instructions": [
+        {
+            "at": 0,
+            "action": "set",
+            "params": {"bpm": 40, "depth": 0.6, "wave_func": "sine"},
+        },
+        {"at": 0, "action": "start"},
+        {
+            "at": 15000,
+            "action": "set",
+            "params": {"bpm": 90, "sharpness": 0.2, "wave_func": "thrust"},
+        },
+        {
+            "at": 30000,
+            "action": "set",
+            "params": {
+                "wave_func": "spline",
+                "spline_points": [0, 1, 0.3, 0.8],
+            },
+        },
+        {"at": 60000, "action": "stop", "params": {"position": 0.0}},
+    ],
+}
+
+
+def _normalize_macro(doc: dict) -> tuple[dict, list[str]]:
+    """Validate and normalize a macro document. Returns (doc, errors)."""
+    errors: list[str] = []
+    if not isinstance(doc, dict):
+        return {}, ["Root must be an object"]
+    name = doc.get("name") if isinstance(doc.get("name"), str) and doc["name"].strip() else "Untitled"
+    loop = bool(doc.get("loop", False))
+    version = int(doc.get("version", 1)) if isinstance(doc.get("version"), (int, float)) else 1
+    raw_inst = doc.get("instructions")
+    if not isinstance(raw_inst, list):
+        return {}, ["Missing instructions array"]
+
+    valid_actions = {"start", "stop", "set"}
+    valid_waves = {"sine", "thrust", "spline"}
+    instructions: list[dict] = []
+    for idx, item in enumerate(raw_inst):
+        if not isinstance(item, dict):
+            errors.append(f"instructions[{idx}] must be an object")
+            continue
+        at = item.get("at")
+        if not isinstance(at, (int, float)) or at < 0:
+            errors.append(f"instructions[{idx}].at must be a non-negative number")
+            continue
+        action = str(item.get("action", ""))
+        if action not in valid_actions:
+            errors.append(f"instructions[{idx}].action must be start|stop|set")
+            continue
+        params = item.get("params") if isinstance(item.get("params"), dict) else {}
+        inst: dict[str, Any] = {"at": int(round(at)), "action": action}
+        if action == "set":
+            out: dict[str, Any] = {}
+            if "bpm" in params:
+                out["bpm"] = max(10.0, min(300.0, float(params["bpm"])))
+            if "depth" in params:
+                out["depth"] = max(0.0, min(1.0, float(params["depth"])))
+            if "depth_top" in params:
+                out["depth_top"] = bool(params["depth_top"])
+            if "reversed" in params:
+                out["reversed"] = bool(params["reversed"])
+            if "wave_func" in params:
+                w = str(params["wave_func"])
+                if w in valid_waves:
+                    out["wave_func"] = w
+                else:
+                    errors.append(
+                        f"instructions[{idx}].params.wave_func must be sine|thrust|spline"
+                    )
+            if "sharpness" in params:
+                out["sharpness"] = max(0.0, min(1.0, float(params["sharpness"])))
+            if "spline_points" in params:
+                pts = params["spline_points"]
+                if isinstance(pts, list) and len(pts) >= 2:
+                    out["spline_points"] = [
+                        max(0.0, min(1.0, float(p))) for p in pts
+                    ]
+                else:
+                    errors.append(
+                        f"instructions[{idx}].params.spline_points needs >= 2 numbers"
+                    )
+            inst["params"] = out
+        elif action == "stop" and "position" in params:
+            inst["params"] = {
+                "position": max(0.0, min(1.0, float(params["position"])))
+            }
+        instructions.append(inst)
+
+    instructions.sort(key=lambda i: i["at"])
+    return (
+        {"version": version, "name": name, "loop": loop, "instructions": instructions},
+        errors,
+    )
+
+
+@app.command()
+def macro(
+    ctx: typer.Context,
+    script_path: Optional[str] = typer.Argument(
+        None, help="Path to macro JSON file (omit with --init)"
+    ),
+    init: Optional[str] = typer.Option(
+        None,
+        "--init",
+        help="Write an example macro JSON to this path and exit",
+    ),
+    loop: bool = typer.Option(
+        False, "--loop", help="Loop playback after the last instruction"
+    ),
+    speed: float = typer.Option(
+        1.0, "--speed", "-s", help="Playback speed multiplier (e.g. 1.0)"
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
+    ),
+):
+    """Play a timestamped control macro (start/stop/set-config sequence)."""
+    if init:
+        out_path = init
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(EXAMPLE_MACRO_JSON, f, indent=2)
+            f.write("\n")
+        console.print(
+            f"[bold green]✓ Wrote example macro to {out_path}[/bold green]"
+        )
+        raise typer.Exit(0)
+
+    if not script_path:
+        console.print(
+            "[bold red]Error:[/bold red] Provide a macro JSON path, or use --init <file>."
+        )
+        raise typer.Exit(1)
+
+    if not os.path.exists(script_path):
+        console.print(f"[bold red]Error:[/bold red] File not found: {script_path}")
+        raise typer.Exit(1)
+
+    with open(script_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    doc, errors = _normalize_macro(raw)
+    if errors:
+        console.print("[bold red]Invalid macro:[/bold red]")
+        for e in errors:
+            console.print(f"  • {e}")
+        raise typer.Exit(1)
+
+    if loop:
+        doc["loop"] = True
+
+    instructions = doc["instructions"]
+    if not instructions:
+        console.print("[bold red]Error:[/bold red] Macro has no instructions.")
+        raise typer.Exit(1)
+
+    if speed <= 0:
+        console.print("[bold red]Error:[/bold red] --speed must be > 0")
+        raise typer.Exit(1)
+
+    backend = resolve_backend(ctx, mode)
+
+    async def _run_macro():
+        console.print(
+            f"[bold green]Starting macro “{doc['name']}” "
+            f"({len(instructions)} steps) via {backend.mode.upper()}...[/bold green]"
+        )
+        status = await backend.get_status()
+        live_config = dict(status.get("config") or {})
+        if not live_config:
+            live_config = {
+                "bpm": 60.0,
+                "depth": 1.0,
+                "depth_top": True,
+                "reversed": False,
+                "wave_func": "sine",
+                "sharpness": 0.5,
+                "spline_points": [0.0, 1.0],
+                "paused": True,
+                "paused_position": 0.5,
+            }
+        live_config["streaming"] = False
+
+        duration_ms = instructions[-1]["at"]
+        duration_sec = (duration_ms / 1000.0) / speed
+
+        try:
+            idx = 0
+            t0 = time.monotonic()
+            with Live(console=console, refresh_per_second=8) as live:
+                while True:
+                    elapsed = (time.monotonic() - t0) * speed
+                    elapsed_ms = elapsed * 1000.0
+
+                    while idx < len(instructions) and instructions[idx]["at"] <= elapsed_ms:
+                        inst = instructions[idx]
+                        action = inst["action"]
+                        params = inst.get("params") or {}
+                        if action == "start":
+                            await backend.set_paused(False)
+                            live_config["paused"] = False
+                        elif action == "stop":
+                            pos = params.get("position")
+                            await backend.set_paused(
+                                True, position=float(pos) if pos is not None else None
+                            )
+                            live_config["paused"] = True
+                            if pos is not None:
+                                live_config["paused_position"] = float(pos)
+                        elif action == "set":
+                            live_config.update(params)
+                            live_config["streaming"] = False
+                            posted = await backend.post_full_config(live_config)
+                            if isinstance(posted, dict) and posted:
+                                live_config.update(posted)
+                        idx += 1
+
+                    next_desc = "—"
+                    if idx < len(instructions):
+                        nxt = instructions[idx]
+                        next_desc = f"{nxt['action']} @ {nxt['at']}ms"
+                    elif doc.get("loop"):
+                        next_desc = "(loop)"
+
+                    table = Table(title=f"Macro Playback ({os.path.basename(script_path)})")
+                    table.add_column("Metric", style="cyan", no_wrap=True)
+                    table.add_column("Value", style="bold green")
+                    table.add_row(
+                        "Progress",
+                        f"{elapsed:.1f}s / {duration_sec:.1f}s",
+                    )
+                    table.add_row("Executed", f"{idx} / {len(instructions)}")
+                    table.add_row("Next", next_desc)
+                    table.add_row("Speed", f"{speed:.2f}x")
+                    table.add_row("Loop", "yes" if doc.get("loop") else "no")
+                    live.update(table)
+
+                    if idx >= len(instructions) and elapsed_ms >= duration_ms:
+                        if doc.get("loop") and duration_ms > 0:
+                            idx = 0
+                            t0 = time.monotonic()
+                            continue
+                        break
+
+                    await asyncio.sleep(0.025)
+
+            console.print("[bold green]✓ Macro playback completed.[/bold green]")
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]Macro interrupted by user.[/bold yellow]")
+        finally:
+            try:
+                await backend.set_paused(True)
+            except Exception:
+                pass
+
+    asyncio.run(_run_macro())
 
 
 if __name__ == "__main__":

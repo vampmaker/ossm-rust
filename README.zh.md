@@ -168,11 +168,13 @@ cargo b-s3 --release    # 为 ESP32-S3 平台编译固件
 
 访问示例：`http://192.168.1.123`
 
-在该控制面板中，您可以自由调整往复速度（BPM）、行程深度、顶/底锚定方向，利用可视化编辑器绘制复杂的样条曲线波形（Spline Wave），以及在线修改软硬件设置并实现系统平滑重启。
+在该控制面板中，您可以自由调整往复速度（BPM）、行程深度、顶/底锚定方向，利用可视化编辑器绘制复杂的样条曲线波形（Spline Wave），编排时间轴控制宏，以及在线修改软硬件设置并实现系统平滑重启。
 
 核心界面与连接特性包含：
 - **实时电机行程图表（可切换并持久化）**：可视化展现全行程区间（`0% – 100%`）、物理极限位置（`pos_min` / `pos_max`）、当前运动区间（左右极限点标记），以及以 30 FPS 实时展示电机运动位置的动画组件。顶部活动图标可一键切换显示/隐藏，并在浏览器中自动记忆切换状态。
-- **高韧性实时数据遥测 (`WsDataManager`)**：前端采用单所有者 WebSocket 专职通信管理器 (`client.ts`)，以高达 **30 FPS (`33ms`)** 速率经 WiFi WebSocket（`/ws/command`）实时推送状态数据与底层控制循环统计指标 (`ups`、`dt_min_ms`、`dt_max_ms`、`dt_avg_ms`、`dt_mdev_ms`)。BLE 实时遥测走独立路径（`ble.ts` / GATT `CHAR_STATE` 通知），不经过该 WebSocket 管理器。固件端采用**收发分离异步任务架构** (`edge_nal::TcpSplit`) 结合堆分配字符串与 **4 缓冲区共享缓冲池 (`NET_BUFFER_POOL`)**，即使在高并发 HTTP REST 请求与持续 WebSocket 遥测并存时也不会发生缓冲区阻塞或掉线。
+- **高韧性实时数据遥测 (`WsDataManager`)**：前端采用单所有者 WebSocket 专职通信管理器 (`client.ts`)，在行程图或设置面板打开时以高达 **30 FPS (`33ms`)** 速率经 WiFi WebSocket（`/ws/command`）实时推送状态数据与底层控制循环统计指标 (`ups`、`dt_min_ms`、`dt_max_ms`、`dt_avg_ms`、`dt_mdev_ms`)。面板关闭时，UI 会回退为 **1 Hz** 的 REST `/state` 轮询以节省 WebSocket 会话槽位。BLE 实时遥测走独立路径（`ble.ts` / GATT `CHAR_STATE` 通知），不经过该 WebSocket 管理器。固件端采用**收发分离异步任务架构** (`edge_nal::TcpSplit`) 结合堆分配字符串与 **4 缓冲区共享缓冲池 (`NET_BUFFER_POOL`)**，即使在高并发 HTTP REST 请求与持续 WebSocket 遥测并存时也不会发生缓冲区阻塞或掉线。
+- **因果配置版本号**：每次电机配置变更都会递增单调的 `version` 字段。UI 跟踪 `authoritativeVersion`，并忽略过期的后台快照，避免滑块编辑在并发 `/state` 推送下被回滚。
+- **交互式运动控制、样条编辑器与宏播放器**：调整 BPM（速度）、行程深度、顶/底锚定、行程反转、暂停/恢复模式，用交互式样条控制点设计自定义周期轨迹，或编排带导入/导出、间隙定位与循环播放的**控制宏**（波形按钮 **宏**）。**Funscript** 模式同样由客户端按时间轴驱动。
 
 ### 串口命令与调试
 
@@ -238,6 +240,10 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
 
 # 启动终端交互式面板（TUI Dashboard），实时监控电机坐标与速度数据流
 ./scripts/ossm.py monitor -m ble
+
+# 写入示例控制宏 JSON，然后播放
+./scripts/ossm.py macro --init /tmp/warmup.json
+./scripts/ossm.py macro /tmp/warmup.json --loop --speed 1.0 -m wifi
 ```
 
 当作为 Python 第三方库在代码中导入时，`ossm.py` 还导出了经过 Pydantic v2 严格校验的数据模型（如 `MotorControllerConfig`、`StateResponse`、`PinConfiguration`、`NetworkConfiguration` 等）和 `DeviceBackend` 核心类，极大地简化了开发者编写自动化测试用例或高级集成应用的代码工作。
@@ -278,6 +284,7 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
 
 ```json
 {
+  "version": 42,
   "bpm": 60.0,
   "depth": 1.0,
   "depth_top": true,
@@ -291,25 +298,48 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
 }
 ```
 
+*   `version`（数字）：配置的单调递增因果时间戳。每次成功写入配置时递增；客户端应拒绝 `version` 回退的过期快照。可省略或传 `0`，由固件分配下一个版本号。
 *   `bpm`（数字）：每分钟往复次数（Beats Per Minute）。直接控制运动周期的快慢。
 *   `depth`（数字）：单次行程深度，范围从 `0.0`（完全静止不过推）至 `1.0`（全行程极限最大深度）。
 *   `depth_top`（布尔值）：设定行程缩放的锚定方向。
     *   `true`：行程从完全收缩的最底层（`0.0`）起步，向顶端推至指定的 `depth`。例如，深度为 `0.8` 时，运动范围为 `[0.0, 0.8]`。
     *   `false`：行程从 `1.0 - depth` 起步，向完全伸展的最顶端（`1.0`）推出。例如，深度为 `0.8` 时，运动范围为 `[0.2, 1.0]`。
 *   `reversed`（布尔值）：当设为 `true` 时，反转当前波形的往复方向。
-*   `wave_func`（字符串）：选定的波形算法模式。支持 `"sine"`（正弦波）、`"thrust"`（推力波）或 `"spline"`（自定义样条曲线波形）。
+*   `wave_func`（字符串）：选定的波形算法模式。固件生成器支持 `"sine"`（正弦波）、`"thrust"`（推力波）或 `"spline"`（自定义样条曲线波形）。网页端另有 `"funscript"` 与 `"macro"`（宏）模式：由客户端按时间轴下发 `set-config` / 暂停命令驱动；若把这些标签直接作为 `wave_func` 提交，固件会回退为正弦波。
 *   `sharpness`（数字）：仅针对 `"thrust"` 推力波生效。用于控制冲刺推力的时间锐度，范围从 `0.01`（极速爆发最锐利）至 `0.99`（平顺缓慢最柔和）。
 *   `spline_points`（浮点数数组）：当启用 `"spline"` 波形时，该数组用于定义自定义运动轨迹的归一化控制点坐标系列（范围均在 `0.0` 至 `1.0` 之间）。
 *   `paused`（布尔值）：设为 `true` 时暂停电机运行，设为 `false` 时启动往复循环。
 *   `paused_position`（数字）：指定电机处于暂停状态时安全停靠的归一化绝对坐标位置（范围 `0.0` 至 `1.0`）。
 *   `streaming`（布尔值）：当设为 `true` 时，代表电机当前已开启实时流式控制模式，可通过 WebSocket (`/ws/command`) 接收上位机动态下发的连续轨迹点。
 
+##### 控制宏（网页 UI + `ossm.py macro`）
+
+**宏**是可分享的 JSON 时间轴控制序列（`start` / `stop` / `set`）。播放完全在客户端完成：网页「波形」中的 **宏** 面板，或 `./scripts/ossm.py macro <file.json>`，在每个 `at`（相对开始的毫秒）到达时下发对应 REST/BLE/串口命令。
+
+```json
+{
+  "version": 1,
+  "name": "Warm up",
+  "loop": false,
+  "instructions": [
+    { "at": 0, "action": "set", "params": { "bpm": 40, "depth": 0.6, "wave_func": "sine" } },
+    { "at": 0, "action": "start" },
+    { "at": 15000, "action": "set", "params": { "bpm": 90, "wave_func": "thrust", "sharpness": 0.2 } },
+    { "at": 60000, "action": "stop", "params": { "position": 0.0 } }
+  ]
+}
+```
+
+*   `set` 的 `params` 可含：`bpm`、`depth`、`depth_top`、`reversed`、`wave_func`（`sine`|`thrust`|`spline`）、`sharpness`、`spline_points`。
+*   `stop` 可通过 `params.position`（0.0–1.0）可选停靠。
+*   可在网页导入/导出，或用 `./scripts/ossm.py macro --init example.json` 生成示例文件。
+
 #### `POST /config`
 
 *   **请求方法：** `POST`
-*   **接口描述：** 整体更新电机的控制配置。请注意，请求时务必发送完整的配置对象，目前系统不支持局部字段增量更新。
+*   **接口描述：** 整体更新电机的控制配置。请注意，请求时务必发送完整的配置对象，目前系统不支持局部字段增量更新。若请求中的 `version` 早于设备当前配置，服务器返回 **409 Conflict**（`Stale causal version`）。
 *   **请求消息体：** 数据结构与 `GET /config` 返回的 JSON 对象保持完全一致。
-*   **响应消息体：** 成功应用后，返回最新的配置 JSON 对象。
+*   **响应消息体：** 成功应用后，返回已生效的配置 JSON 对象，包含递增后的 `version`。
 
 #### `POST /paused`
 
@@ -338,6 +368,7 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
 ```json
 {
   "config": {
+    "version": 42,
     "bpm": 60.0,
     "depth": 1.0,
     "depth_top": true,
@@ -492,7 +523,7 @@ get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
   "id": 5
 }
 ```
-    *   **Set Config（动态更新配置）**：实时修改电机控制器的各项运行参数（`MotorControllerConfig`）。
+    *   **Set Config（动态更新配置）**：实时修改电机控制器的各项运行参数（`MotorControllerConfig`）。返回已生效的配置，包含递增后的 `version`。若 `params.version` 过期，返回 JSON-RPC 错误 `-32001`（`Stale causal version`）。
 ```json
 {
   "jsonrpc": "2.0",

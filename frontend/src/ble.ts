@@ -283,85 +283,115 @@ export async function connectBle(onDisconnect?: () => void): Promise<boolean> {
     }
 
     deviceDisconnectHandler = () => {
-      const cb = disconnectCallback
-      clearBleSession(false)
-      if (cb) {
-        cb()
+      if (connectInProgress) {
+        return
       }
+      setTimeout(() => {
+        if (!connectInProgress && (!gattServer || !gattServer.connected)) {
+          const cb = disconnectCallback
+          clearBleSession(false)
+          if (cb) {
+            cb()
+          }
+        }
+      }, 350)
     }
     device.addEventListener('gattserverdisconnected', deviceDisconnectHandler)
 
-    gattServer = await withTimeout(
-      device.gatt.connect(),
-      BLE_CONNECT_TIMEOUT_MS,
-      'GATT connect',
-    )
-    service = await withTimeout(
-      gattServer.getPrimaryService(SERVICE_UUID),
-      BLE_GATT_OP_TIMEOUT_MS,
-      'service discovery',
-    )
+    let lastConnectError: unknown
+    for (let attempt = 1; attempt <= BLE_IO_RETRIES; attempt++) {
+      try {
+        if (attempt > 1) {
+          clearBleSession(false)
+        }
+        gattServer = await withTimeout(
+          device.gatt.connect(),
+          BLE_CONNECT_TIMEOUT_MS,
+          'GATT connect',
+        )
+        await delay(200)
 
-    configChar = await withTimeout(
-      service.getCharacteristic(CONFIG_UUID),
-      BLE_GATT_OP_TIMEOUT_MS,
-      'config characteristic discovery',
-    )
-    stateChar = await withTimeout(
-      service.getCharacteristic(STATE_UUID),
-      BLE_GATT_OP_TIMEOUT_MS,
-      'state characteristic discovery',
-    )
-    pausedChar = await withTimeout(
-      service.getCharacteristic(PAUSED_UUID),
-      BLE_GATT_OP_TIMEOUT_MS,
-      'paused characteristic discovery',
-    )
-    pinConfigChar = await withTimeout(
-      service.getCharacteristic(PIN_UUID),
-      BLE_GATT_OP_TIMEOUT_MS,
-      'pin characteristic discovery',
-    )
-    rpcChar = await withTimeout(
-      service.getCharacteristic(RPC_UUID),
-      BLE_GATT_OP_TIMEOUT_MS,
-      'rpc characteristic discovery',
-    )
-    netConfigChar = await withTimeout(
-      service.getCharacteristic(NET_UUID),
-      BLE_GATT_OP_TIMEOUT_MS,
-      'network characteristic discovery',
-    )
+        service = await withTimeout(
+          gattServer.getPrimaryService(SERVICE_UUID),
+          BLE_GATT_OP_TIMEOUT_MS,
+          'service discovery',
+        )
 
-    if (rpcChar) {
-      if (!rpcNotificationHandler) {
-        rpcNotificationHandler = (event: Event) => {
-          const target = event.target as BluetoothRemoteGATTCharacteristic
-          if (target && target.value) {
-            try {
-              const reassembled = rpcReassembler.feed(target.value)
-              if (reassembled) {
-                console.log('BLE RPC response:', JSON.parse(reassembled))
+        configChar = await withTimeout(
+          service.getCharacteristic(CONFIG_UUID),
+          BLE_GATT_OP_TIMEOUT_MS,
+          'config characteristic discovery',
+        )
+        stateChar = await withTimeout(
+          service.getCharacteristic(STATE_UUID),
+          BLE_GATT_OP_TIMEOUT_MS,
+          'state characteristic discovery',
+        )
+        pausedChar = await withTimeout(
+          service.getCharacteristic(PAUSED_UUID),
+          BLE_GATT_OP_TIMEOUT_MS,
+          'paused characteristic discovery',
+        )
+        pinConfigChar = await withTimeout(
+          service.getCharacteristic(PIN_UUID),
+          BLE_GATT_OP_TIMEOUT_MS,
+          'pin characteristic discovery',
+        )
+        rpcChar = await withTimeout(
+          service.getCharacteristic(RPC_UUID),
+          BLE_GATT_OP_TIMEOUT_MS,
+          'rpc characteristic discovery',
+        )
+        netConfigChar = await withTimeout(
+          service.getCharacteristic(NET_UUID),
+          BLE_GATT_OP_TIMEOUT_MS,
+          'network characteristic discovery',
+        )
+
+        if (rpcChar) {
+          if (!rpcNotificationHandler) {
+            rpcNotificationHandler = (event: Event) => {
+              const target = event.target as BluetoothRemoteGATTCharacteristic
+              if (target && target.value) {
+                try {
+                  const reassembled = rpcReassembler.feed(target.value)
+                  if (reassembled) {
+                    console.log('BLE RPC response:', JSON.parse(reassembled))
+                  }
+                } catch (e) {
+                  console.error('BLE RPC notification parse error:', e)
+                }
               }
-            } catch (e) {
-              console.error('BLE RPC notification parse error:', e)
             }
+            rpcChar.addEventListener('characteristicvaluechanged', rpcNotificationHandler)
+          }
+          try {
+            await withTimeout(
+              rpcChar.startNotifications(),
+              BLE_NOTIFICATION_OP_TIMEOUT_MS,
+              'start rpc notifications',
+            )
+          } catch (e) {
+            console.warn('Could not start initial RPC notifications during connect:', e)
           }
         }
-        rpcChar.addEventListener('characteristicvaluechanged', rpcNotificationHandler)
-      }
-      try {
-        await withTimeout(
-          rpcChar.startNotifications(),
-          BLE_NOTIFICATION_OP_TIMEOUT_MS,
-          'start rpc notifications',
-        )
-      } catch (e) {
-        console.warn('Could not start initial RPC notifications during connect:', e)
+
+        await delay(150)
+        return true
+      } catch (err) {
+        lastConnectError = err
+        if (attempt < BLE_IO_RETRIES) {
+          console.warn(`BLE connect attempt ${attempt} failed, retrying in ${attempt * 500}ms...`, err)
+          try {
+            if (gattServer && gattServer.connected) {
+              gattServer.disconnect()
+            }
+          } catch (e) {}
+          await delay(attempt * 500)
+        }
       }
     }
-
-    return true
+    throw normalizeBleError(lastConnectError)
   } catch (error) {
     disconnectCallback = null
     disconnectBle()
@@ -404,7 +434,17 @@ async function readJson<T>(char: BluetoothRemoteGATTCharacteristic | null): Prom
       } catch (e) {
         lastErr = e
         if (attempt < BLE_IO_RETRIES) {
-          await delay(100 * attempt)
+          if (!gattServer || !gattServer.connected) {
+            if (device && device.gatt) {
+              try {
+                gattServer = await withTimeout(device.gatt.connect(), BLE_CONNECT_TIMEOUT_MS, 'GATT reconnect')
+                await delay(150)
+              } catch (reconnErr) {
+                console.warn('BLE reconnect during read retry failed:', reconnErr)
+              }
+            }
+          }
+          await delay(150 * attempt)
         }
       }
     }
@@ -437,7 +477,17 @@ async function writeJson(char: BluetoothRemoteGATTCharacteristic | null, data: u
       } catch (e) {
         lastErr = e
         if (attempt < BLE_IO_RETRIES) {
-          await delay(100 * attempt)
+          if (!gattServer || !gattServer.connected) {
+            if (device && device.gatt) {
+              try {
+                gattServer = await withTimeout(device.gatt.connect(), BLE_CONNECT_TIMEOUT_MS, 'GATT reconnect')
+                await delay(150)
+              } catch (reconnErr) {
+                console.warn('BLE reconnect during write retry failed:', reconnErr)
+              }
+            }
+          }
+          await delay(150 * attempt)
         }
       }
     }

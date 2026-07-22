@@ -6,12 +6,12 @@
   },
   "panels": {
     "waveform": "波形显示",
-    "paramList": "Modbus 控制参数",
+    "paramList": "modbus控制参数",
     "telemetry": "电机运行参数",
     "driver": "驱动器设置参数",
-    "modbusRead": "Modbus 读取",
+    "modbusRead": "modbus读取",
     "status": "驱动器运行状态",
-    "send": "Modbus 发送",
+    "send": "modbus发送",
     "sendEcho": "发送数据",
     "commLog": "通信日志"
   },

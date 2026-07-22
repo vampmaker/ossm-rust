@@ -5,6 +5,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
+use embassy_time::{Duration, Timer};
 
 use crate::motion::{
     CommandProducer, MotionCommand, MotorControllerConfig, StateResponse, COMMAND_QUEUE_SIZE,
@@ -85,6 +86,35 @@ impl AppContext {
 
     pub async fn enqueue_motion(&self, cmd: MotionCommand) -> bool {
         self.motion_cmd.lock().await.enqueue(cmd).is_ok()
+    }
+
+    pub async fn try_enqueue_config(
+        &self,
+        mut config: MotorControllerConfig,
+    ) -> core::result::Result<MotorControllerConfig, &'static str> {
+        let current_version = self.load_snapshot().config.version;
+        if config.version > 0 && config.version < current_version {
+            return Err("Stale causal version");
+        }
+        if config.version == 0 || config.version == current_version {
+            config.version = current_version.wrapping_add(1);
+        }
+        if self
+            .enqueue_motion(MotionCommand::SetConfig(config.clone()))
+            .await
+        {
+            return Ok(config);
+        }
+        for _ in 0..50 {
+            Timer::after(Duration::from_millis(5)).await;
+            if self
+                .enqueue_motion(MotionCommand::SetConfig(config.clone()))
+                .await
+            {
+                return Ok(config);
+            }
+        }
+        Err("Command queue full")
     }
 }
 

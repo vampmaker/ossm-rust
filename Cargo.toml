@@ -9,6 +9,10 @@ resolver = "2"
 name = "ossm-rust"
 harness = false
 
+[lib]
+name = "ossm_rust"
+path = "src/lib.rs"
+
 [profile.release]
 opt-level = 2
 debug = true

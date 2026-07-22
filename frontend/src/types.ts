@@ -1,7 +1,8 @@
-export type WaveFunc = 'sine' | 'thrust' | 'spline' | 'funscript'
+export type WaveFunc = 'sine' | 'thrust' | 'spline' | 'funscript' | 'macro'
 export type PauseMode = 'fixed-position' | 'in-place'
 
 export interface MotorControllerConfig {
+  version?: number
   bpm: number
   depth: number
   depth_top: boolean
@@ -12,6 +13,39 @@ export interface MotorControllerConfig {
   paused: boolean
   paused_position: number
   streaming?: boolean
+}
+
+/** Wave funcs that may appear inside a macro `set` instruction (not funscript/macro). */
+export type MacroWaveFunc = 'sine' | 'thrust' | 'spline'
+
+export type MacroAction = 'start' | 'stop' | 'set'
+
+export interface MacroSetParams {
+  bpm?: number
+  depth?: number
+  depth_top?: boolean
+  reversed?: boolean
+  wave_func?: MacroWaveFunc
+  sharpness?: number
+  spline_points?: number[]
+}
+
+export interface MacroStopParams {
+  position?: number
+}
+
+export interface MacroInstruction {
+  _id?: string
+  at: number
+  action: MacroAction
+  params?: MacroSetParams & MacroStopParams
+}
+
+export interface MacroDocument {
+  version: number
+  name: string
+  loop: boolean
+  instructions: MacroInstruction[]
 }
 
 export interface PausedControlPayload {

@@ -92,6 +92,7 @@ async def run_tests(backend: DeviceBackend):
             res = json.loads(await ws.recv())
             print("Recv:", json.dumps(res, indent=2))
             assert res.get("id") == 4, "Set-config failed!"
+            await asyncio.sleep(0.05)
 
             # 4b. Test set-config with spline mode
             req_spline = {
@@ -117,6 +118,7 @@ async def run_tests(backend: DeviceBackend):
             res = json.loads(await ws.recv())
             print("Recv:", json.dumps(res, indent=2))
             assert res.get("id") == 401, "Set-config spline failed!"
+            await asyncio.sleep(0.05)
 
             # Verify state reflects spline mode
             req_check = {"jsonrpc": "2.0", "method": "get-state", "id": 402}

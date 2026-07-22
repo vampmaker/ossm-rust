@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { setConfig, sendWaypoints, subscribeState, unsubscribeState } from '../api'
+import { stateMachine } from '../connectionStateMachine'
 import type { FunscriptDocument, FunscriptAction, StreamWaypoint, MotorState } from '../types'
 
 const { t } = useI18n()
@@ -165,21 +166,27 @@ function handleCanvasClick(e: MouseEvent) {
 async function startPlayback() {
   if (actions.value.length === 0) return
   isPlaying.value = true
+  stateMachine.beginEnginePlayback('FUNSCRIPT')
   statusMessage.value = t('funscript.starting')
 
   try {
-    await setConfig({
-      bpm: 30,
-      depth: 1.0,
-      depth_top: false,
-      reversed: false,
-      wave_func: 'sine',
-      sharpness: 0.3,
-      spline_points: [0.0, 1.0],
-      paused: false,
-      paused_position: 0.0,
-      streaming: true
-    })
+    stateMachine.beginLocalEdit()
+    try {
+      await setConfig({
+        bpm: 30,
+        depth: 1.0,
+        depth_top: false,
+        reversed: false,
+        wave_func: 'sine',
+        sharpness: 0.3,
+        spline_points: [0.0, 1.0],
+        paused: false,
+        paused_position: 0.0,
+        streaming: true
+      })
+    } finally {
+      stateMachine.endLocalEdit()
+    }
 
     const onStreamState = (st: MotorState) => {
       if (st.stream) {
@@ -213,6 +220,7 @@ async function startPlayback() {
 
 async function stopPlayback() {
   isPlaying.value = false
+  stateMachine.endEnginePlayback()
   if (streamTimer) {
     clearInterval(streamTimer)
     streamTimer = null
@@ -222,18 +230,23 @@ async function stopPlayback() {
       await unsubscribeState(streamStateListener)
       streamStateListener = null
     }
-    await setConfig({
-      bpm: 30,
-      depth: 1.0,
-      depth_top: false,
-      reversed: false,
-      wave_func: 'sine',
-      sharpness: 0.3,
-      spline_points: [0.0, 1.0],
-      paused: true,
-      paused_position: 0.0,
-      streaming: false
-    })
+    stateMachine.beginLocalEdit()
+    try {
+      await setConfig({
+        bpm: 30,
+        depth: 1.0,
+        depth_top: false,
+        reversed: false,
+        wave_func: 'sine',
+        sharpness: 0.3,
+        spline_points: [0.0, 1.0],
+        paused: true,
+        paused_position: 0.0,
+        streaming: false
+      })
+    } finally {
+      stateMachine.endLocalEdit()
+    }
   } catch (e) {
     console.warn('Error stopping playback:', e)
   }
@@ -310,62 +323,62 @@ onBeforeUnmount(() => {
 <template>
   <div class="space-y-6">
     <!-- Header & Uploader -->
-    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-gray-900/60 p-5 rounded-2xl border border-gray-800 backdrop-blur-xl">
+    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-white p-6 rounded-2xl border border-gray-200 shadow-md transition-all">
       <div>
-        <h2 class="text-xl font-bold text-white tracking-wide">{{ t('funscript.title') }}</h2>
-        <p class="text-sm text-gray-400 mt-0.5">{{ scriptName || t('funscript.noScript') }}</p>
+        <h2 class="text-xl font-extrabold text-gray-900 tracking-tight">{{ t('funscript.title') }}</h2>
+        <p class="text-sm font-medium text-gray-500 mt-0.5">{{ scriptName || t('funscript.noScript') }}</p>
       </div>
-      <label class="cursor-pointer bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-sm font-medium px-4 py-2.5 rounded-xl shadow-lg shadow-emerald-900/20 transition-all active:scale-95 inline-flex items-center gap-2">
+      <label class="cursor-pointer bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white text-sm font-bold px-5 py-2.5 rounded-xl shadow-sm hover:shadow transition-all active:scale-95 inline-flex items-center gap-2">
         <span>{{ t('funscript.load') }}</span>
         <input type="file" accept=".funscript,.json" class="hidden" @change="handleFileUpload" />
       </label>
     </div>
 
     <!-- Timeline Canvas -->
-    <div class="bg-gray-900/80 p-4 rounded-2xl border border-gray-800 shadow-xl relative overflow-hidden">
-      <div class="flex items-center justify-between text-xs font-semibold text-gray-400 mb-2 px-1">
+    <div class="bg-white p-6 rounded-2xl border border-gray-200 shadow-md relative overflow-hidden transition-all">
+      <div class="flex items-center justify-between text-xs font-bold text-gray-600 mb-2 px-1">
         <span>{{ t('funscript.current', { time: formatTime(currentTime) }) }}</span>
         <span>{{ t('funscript.duration', { time: formatTime(totalDuration) }) }}</span>
       </div>
       <canvas
         ref="canvasRef"
-        class="w-full h-44 cursor-pointer rounded-xl bg-gray-950 border border-gray-800/80"
+        class="w-full h-44 cursor-pointer rounded-xl bg-gray-50 border border-gray-300 shadow-inner"
         @click="handleCanvasClick"
       ></canvas>
     </div>
 
     <!-- Playback Controls -->
-    <div class="bg-gray-900/60 p-5 rounded-2xl border border-gray-800 flex flex-wrap items-center justify-between gap-4">
+    <div class="bg-white p-6 rounded-2xl border border-gray-200 shadow-md flex flex-wrap items-center justify-between gap-4 transition-all">
       <div class="flex items-center gap-3">
         <button
           v-if="!isPlaying"
           @click="startPlayback"
           :disabled="actions.length === 0"
-          class="bg-emerald-500 hover:bg-emerald-400 disabled:bg-gray-800 disabled:text-gray-500 text-gray-950 font-bold px-6 py-2.5 rounded-xl transition-all shadow-lg active:scale-95"
+          class="bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 disabled:from-gray-300 disabled:to-gray-300 disabled:text-gray-500 text-white font-extrabold text-sm px-6 py-3 rounded-xl transition-all shadow-md hover:shadow-lg active:scale-95 cursor-pointer"
         >
           {{ t('funscript.play') }}
         </button>
         <button
           v-else
           @click="stopPlayback"
-          class="bg-amber-500 hover:bg-amber-400 text-gray-950 font-bold px-6 py-2.5 rounded-xl transition-all shadow-lg active:scale-95"
+          class="bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 text-white font-extrabold text-sm px-6 py-3 rounded-xl transition-all shadow-md hover:shadow-lg active:scale-95 cursor-pointer"
         >
           {{ t('funscript.pause') }}
         </button>
         <button
           @click="stopPlayback"
-          class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium px-4 py-2.5 rounded-xl transition-all"
+          class="inline-flex items-center justify-center gap-2 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-sm px-4 py-3 rounded-xl transition-all border border-gray-300 shadow-2xs active:scale-95 cursor-pointer"
         >
           {{ t('funscript.stop') }}
         </button>
       </div>
 
       <!-- Speed Multiplier -->
-      <div class="flex items-center gap-2">
-        <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider">{{ t('funscript.speed') }}</span>
+      <div class="flex items-center gap-2.5">
+        <span class="text-xs font-bold text-gray-600 uppercase tracking-wider">{{ t('funscript.speed') }}</span>
         <select
           v-model.number="speedMultiplier"
-          class="bg-gray-950 border border-gray-800 text-white text-sm rounded-xl px-3 py-1.5 focus:outline-none focus:border-emerald-500"
+          class="bg-gray-50 border border-gray-300 text-gray-900 font-bold text-sm rounded-xl px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all cursor-pointer"
         >
           <option :value="0.5">0.5x</option>
           <option :value="1.0">1.0x</option>
@@ -377,13 +390,13 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- Stroke Range Limits -->
-    <div class="bg-gray-900/60 p-5 rounded-2xl border border-gray-800 space-y-4">
-      <h3 class="text-sm font-semibold text-gray-300 tracking-wide uppercase">{{ t('funscript.strokeLimits') }}</h3>
+    <div class="bg-white p-6 rounded-2xl border border-gray-200 shadow-md space-y-4 transition-all">
+      <h3 class="text-sm font-extrabold text-gray-800 tracking-wide uppercase">{{ t('funscript.strokeLimits') }}</h3>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div>
-          <div class="flex justify-between text-xs text-gray-400 mb-1 font-medium">
+          <div class="flex justify-between text-xs text-gray-600 mb-1 font-bold">
             <span>{{ t('funscript.minDepth') }}</span>
-            <span class="text-emerald-400 font-bold">{{ Math.round(minDepth * 100) }}%</span>
+            <span class="text-emerald-600 font-extrabold">{{ Math.round(minDepth * 100) }}%</span>
           </div>
           <input
             type="range"
@@ -391,14 +404,14 @@ onBeforeUnmount(() => {
             max="1"
             step="0.05"
             v-model.number="minDepth"
-            class="w-full accent-emerald-500 bg-gray-800 rounded-lg h-2 cursor-pointer"
+            class="w-full accent-emerald-600 bg-gray-200 rounded-lg h-2 cursor-pointer"
           />
         </div>
 
         <div>
-          <div class="flex justify-between text-xs text-gray-400 mb-1 font-medium">
+          <div class="flex justify-between text-xs text-gray-600 mb-1 font-bold">
             <span>{{ t('funscript.maxDepth') }}</span>
-            <span class="text-emerald-400 font-bold">{{ Math.round(maxDepth * 100) }}%</span>
+            <span class="text-emerald-600 font-extrabold">{{ Math.round(maxDepth * 100) }}%</span>
           </div>
           <input
             type="range"
@@ -406,16 +419,16 @@ onBeforeUnmount(() => {
             max="1"
             step="0.05"
             v-model.number="maxDepth"
-            class="w-full accent-emerald-500 bg-gray-800 rounded-lg h-2 cursor-pointer"
+            class="w-full accent-emerald-600 bg-gray-200 rounded-lg h-2 cursor-pointer"
           />
         </div>
       </div>
     </div>
 
     <!-- Status Bar -->
-    <div class="bg-gray-950/80 px-4 py-3 rounded-xl border border-gray-800/80 flex items-center justify-between text-xs">
-      <span class="text-gray-400">{{ statusMessage }}</span>
-      <span v-if="isPlaying" class="text-emerald-400 font-mono">{{ t('funscript.buffered', { count: bufferedCount }) }}</span>
+    <div class="bg-gray-50 px-4 py-3 rounded-xl border border-gray-200 flex items-center justify-between text-xs font-semibold">
+      <span class="text-gray-600">{{ statusMessage }}</span>
+      <span v-if="isPlaying" class="text-emerald-600 font-mono font-bold">{{ t('funscript.buffered', { count: bufferedCount }) }}</span>
     </div>
   </div>
 </template>

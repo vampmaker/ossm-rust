@@ -7,8 +7,10 @@ import MainControl from './components/MainControl.vue'
 import SplineEditor from './components/SplineEditor.vue'
 import UnifiedSettings from './components/UnifiedSettings.vue'
 import FunscriptPlayer from './components/FunscriptPlayer.vue'
+import MacroPlayer from './components/MacroPlayer.vue'
 import * as api from './api'
 import { stateMachine } from './connectionStateMachine'
+import { isConfigEqual, wireToDomainConfig, domainToWireConfig, sanitizeMotorState } from './mapper'
 import { setLocale, type AppLocale } from './i18n'
 import type { MotorControllerConfig, PauseMode, PinConfiguration, NetworkConfiguration, MotorState } from './types'
 
@@ -83,26 +85,91 @@ const isBleModeAvailable = computed(() => {
 })
 
 const motorState = ref<MotorState | null>(null)
+const CONTROL_REFRESH_INTERVAL_MS = 1000
+
+let controlPollTimer: ReturnType<typeof setInterval> | undefined
+
+function isBenignFetchFailure(e: unknown): boolean {
+  if (e instanceof DOMException && e.name === 'AbortError') return true
+  if (e instanceof Error && e.name === 'AbortError') return true
+  if (e instanceof TypeError && /Failed to fetch/i.test(e.message)) return true
+  return false
+}
+
+function applyRemoteState(state: MotorState) {
+  const cleanState = sanitizeMotorState(state)
+  motorState.value = cleanState
+  if (cleanState.config) {
+    stateMachine.trackAuthoritativeVersion(cleanState.config.version)
+  }
+  if (stateMachine.shouldAcceptRemoteConfig(cleanState.config)) {
+    const normalized = wireToDomainConfig(cleanState.config, config.value)
+    if (!isConfigEqual(config.value, normalized)) {
+      config.value = normalized
+    }
+  }
+}
 
 function onMotorStateUpdate(state: MotorState) {
-  motorState.value = state
+  applyRemoteState(state)
+}
+
+function stopControlPoll() {
+  if (controlPollTimer !== undefined) {
+    clearInterval(controlPollTimer)
+    controlPollTimer = undefined
+  }
+}
+
+function startControlPoll() {
+  if (controlPollTimer !== undefined) return
+  controlPollTimer = setInterval(() => {
+    void pollControlState()
+  }, CONTROL_REFRESH_INTERVAL_MS)
+  // Immediate refresh so UI does not wait a full interval after closing panels.
+  void pollControlState()
+}
+
+async function pollControlState() {
+  if (!isInitialized.value || !connected.value) return
+  if (showDiagram.value || showSettings.value) return
+  try {
+    const state = await api.getState()
+    applyRemoteState(state)
+  } catch (e) {
+    if (!isBenignFetchFailure(e)) {
+      console.warn('Control-state poll failed:', e)
+    }
+  }
 }
 
 async function syncLiveStateSubscription() {
-  if (!isInitialized.value) return
-  if (showDiagram.value || showSettings.value) {
+  if (!isInitialized.value) {
+    stopControlPoll()
+    return
+  }
+
+  const wantLive = showDiagram.value || showSettings.value
+  if (wantLive) {
+    stopControlPoll()
     try {
       const intervalMs = mode.value === 'bluetooth' ? BLE_STATE_INTERVAL_MS : 33
       await api.subscribeState(onMotorStateUpdate, intervalMs)
     } catch (e) {
       console.warn('Could not subscribe to live motor state:', e)
     }
-  } else {
-    void api.unsubscribeState(onMotorStateUpdate)
+    return
   }
+
+  try {
+    await api.unsubscribeState(onMotorStateUpdate)
+  } catch (e) {
+    console.warn('Failed to unsubscribe live motor state:', e)
+  }
+  startControlPoll()
 }
 
-watch([showDiagram, showSettings], () => {
+watch([showDiagram, showSettings, mode], () => {
   void syncLiveStateSubscription()
 })
 
@@ -116,6 +183,7 @@ async function switchMode(newMode: api.ConnectionMode) {
   } catch (e) {
     console.warn('Failed to clean previous state subscription during mode switch:', e)
   }
+  stopControlPoll()
   api.disconnectBle()
 
   mode.value = newMode
@@ -137,6 +205,7 @@ async function connectToBle() {
   try {
     const ok = await api.connectBle(() => {
       void api.unsubscribeState(onMotorStateUpdate)
+      stopControlPoll()
       isInitialized.value = false
       connected.value = false
       motorReady.value = false
@@ -156,32 +225,47 @@ async function connectToBle() {
   }
 }
 
-let debounceTimer: ReturnType<typeof setTimeout> | undefined
-let pausedPositionDebounceTimer: ReturnType<typeof setTimeout> | undefined
+function clearConfigDebounce() {
+  stateMachine.clearOptimisticMutation('config')
+}
+
+function clearPausedPositionDebounce() {
+  stateMachine.clearOptimisticMutation('pausedPosition')
+}
 
 function setConfig(newConfig: MotorControllerConfig) {
+  if (stateMachine.authoritativeVersion.value > 0 || newConfig.version !== undefined) {
+    newConfig.version = stateMachine.getNextVersion()
+  }
   config.value = newConfig
   error.value = null
 
-  clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(async () => {
-    try {
-      await stateMachine.executeControl(() => api.setConfig(config.value))
-    }
-    catch (e) {
-      console.error(e)
+  stateMachine.scheduleOptimisticMutation(
+    'config',
+    200,
+    () => api.setConfig(domainToWireConfig(config.value)),
+    (posted) => {
+      if (posted) {
+        stateMachine.trackAuthoritativeVersion(posted.version)
+      }
+      config.value = wireToDomainConfig(posted, config.value)
+    },
+    (err) => {
+      console.error(err)
       error.value = t('errors.setConfigFailed')
       motorReady.value = false
-    }
-  }, 200)
+    },
+  )
 }
 
 async function setPaused(paused: boolean) {
+  clearConfigDebounce()
+  clearPausedPositionDebounce()
   const newConfig = { ...config.value, paused }
   config.value = newConfig // update UI immediately
   error.value = null
 
-  clearTimeout(debounceTimer)
+  stateMachine.beginLocalEdit()
   try {
     let updatedConfig
     if (paused && pauseMode.value === 'in-place') {
@@ -199,12 +283,18 @@ async function setPaused(paused: boolean) {
     else {
       updatedConfig = await stateMachine.executeControl(() => api.setPaused({ paused }))
     }
-    config.value = updatedConfig
+    if (updatedConfig) {
+      stateMachine.trackAuthoritativeVersion(updatedConfig.version)
+    }
+    config.value = wireToDomainConfig(updatedConfig, config.value)
   }
   catch (e) {
     console.error(e)
     error.value = t('errors.setPausedFailed')
     motorReady.value = false
+  }
+  finally {
+    stateMachine.endLocalEdit()
   }
 }
 
@@ -214,18 +304,27 @@ function setPausedPosition(position: number) {
   }
   error.value = null
 
-  clearTimeout(pausedPositionDebounceTimer)
-  pausedPositionDebounceTimer = setTimeout(async () => {
-    try {
-      // we don't need the returned config as it might be out of date if the user is still sliding
-      await api.setPaused({ position })
-    }
-    catch (e) {
-      console.error(e)
+  stateMachine.scheduleOptimisticMutation(
+    'pausedPosition',
+    100,
+    () => api.setPaused({ position }),
+    (updated) => {
+      if (updated) {
+        stateMachine.trackAuthoritativeVersion(updated.version)
+      }
+      config.value = wireToDomainConfig(updated, config.value)
+    },
+    (err) => {
+      console.error(err)
       error.value = t('errors.setPausedPositionFailed')
       motorReady.value = false
-    }
-  }, 100)
+    },
+  )
+}
+
+/** Macro player posts configs itself; only sync local UI state (no debounced POST). */
+function onMacroConfigUpdate(newConfig: MotorControllerConfig) {
+  config.value = newConfig
 }
 
 async function fetchConfig() {
@@ -241,16 +340,29 @@ async function fetchConfig() {
   }
 
   try {
-    pinConfig.value = await api.getPinConfig()
+    try {
+      pinConfig.value = await api.getPinConfig()
+    } catch (firstErr) {
+      if (mode.value === 'bluetooth') {
+        await new Promise(r => setTimeout(r, 350))
+        pinConfig.value = await api.getPinConfig()
+      } else {
+        throw firstErr
+      }
+    }
     try {
       netConfig.value = await api.getNetworkConfig()
     } catch (e) {
-      console.warn('Failed to fetch network config:', e)
+      if (!isBenignFetchFailure(e)) {
+        console.warn('Failed to fetch network config:', e)
+      }
     }
     connected.value = true
   }
   catch (e) {
-    console.error(e)
+    if (!isBenignFetchFailure(e)) {
+      console.error(e)
+    }
     connected.value = false
     motorReady.value = false
     isInitialized.value = false
@@ -260,18 +372,39 @@ async function fetchConfig() {
   }
 
   try {
-    config.value = await api.getConfig()
+    let deviceConfig: MotorControllerConfig
+    try {
+      deviceConfig = await api.getConfig()
+    } catch (firstErr) {
+      if (mode.value === 'bluetooth') {
+        await new Promise(r => setTimeout(r, 350))
+        deviceConfig = await api.getConfig()
+      } else {
+        throw firstErr
+      }
+    }
+    if (deviceConfig) {
+      stateMachine.trackAuthoritativeVersion(deviceConfig.version)
+    }
+    // Avoid wiping in-progress UI edits (slider debounce / pause) on reconnect/retry.
+    if (stateMachine.shouldAcceptRemoteConfig(deviceConfig)) {
+      config.value = deviceConfig
+    }
     try {
       motorState.value = await api.getState()
     } catch (e) {
-      console.warn('Failed to fetch initial state:', e)
+      if (!isBenignFetchFailure(e)) {
+        console.warn('Failed to fetch initial state:', e)
+      }
     }
     motorReady.value = true
     isInitialized.value = true
     await syncLiveStateSubscription()
   }
   catch (e) {
-    console.error(e)
+    if (!isBenignFetchFailure(e)) {
+      console.error(e)
+    }
     motorReady.value = false
     isInitialized.value = false
     error.value = t('errors.motorNotInitialized')
@@ -373,6 +506,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  stopControlPoll()
   void api.unsubscribeState(onMotorStateUpdate)
   api.disconnectBle()
 })
@@ -558,6 +692,12 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
         />
         <FunscriptPlayer
           v-if="!isRelayMode && config.wave_func === 'funscript'"
+        />
+        <MacroPlayer
+          v-if="!isRelayMode && config.wave_func === 'macro'"
+          v-model="config"
+          :connected="motorReady"
+          @update:model-value="onMacroConfigUpdate"
         />
         <UnifiedSettings
           v-if="showSettings"

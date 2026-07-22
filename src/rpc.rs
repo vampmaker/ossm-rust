@@ -112,13 +112,13 @@ pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAc
                 return err_response(&id, -32001, "rtu_relay mode").await;
             }
             if let Ok(config) = request.parse_params::<MotorControllerConfig>() {
-                if app_context
-                    .enqueue_motion(MotionCommand::SetConfig(config.clone()))
-                    .await
-                {
-                    return respond(&id, &config).await;
+                match app_context.try_enqueue_config(config).await {
+                    Ok(applied) => return respond(&id, &applied).await,
+                    Err("Stale causal version") => {
+                        return err_response(&id, -32001, "Stale causal version").await
+                    }
+                    Err(msg) => return err_response(&id, -32603, msg).await,
                 }
-                return err_response(&id, -32603, "Failed to apply config").await;
             }
             err_response(&id, -32602, "Invalid params").await
         }
@@ -152,11 +152,6 @@ pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAc
             }
             if let Ok(input) = request.parse_params::<WaypointsInput>() {
                 let (waypoints, reset_timestamp) = input.into_parts();
-                if reset_timestamp {
-                    let _ = app_context
-                        .enqueue_motion(MotionCommand::ResetTimestamp)
-                        .await;
-                }
                 if app_context
                     .enqueue_motion(MotionCommand::SetWaypoints {
                         waypoints,

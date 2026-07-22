@@ -36,6 +36,7 @@ const waveFunctions = computed(() => [
   { name: t('mainControl.waveThrust'), value: 'thrust' as WaveFunc },
   { name: t('mainControl.waveSpline'), value: 'spline' as WaveFunc },
   { name: t('mainControl.waveFunscript'), value: 'funscript' as WaveFunc },
+  { name: t('mainControl.waveMacro'), value: 'macro' as WaveFunc },
 ])
 </script>
 
@@ -101,7 +102,7 @@ const waveFunctions = computed(() => [
     <!-- Wave Selection -->
     <div>
       <label class="mb-1 block">{{ t('mainControl.waveform') }}</label>
-      <div class="flex space-x-2">
+      <div class="flex flex-wrap gap-2">
         <button
           v-for="wave in waveFunctions" :key="wave.value"
           class="px-3 py-1"

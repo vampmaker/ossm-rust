@@ -1,8 +1,10 @@
 
 use core::f32::consts::PI;
+use core::sync::atomic::Ordering;
 
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_hal::delay::Delay;
+use portable_atomic::AtomicU16;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::gpio::{AnyPin, Level, Output, OutputConfig};
 use esp_hal::uart::uhci::{Uhci, UhciRx, UhciTx};
@@ -12,11 +14,17 @@ use rmodbus::{client::ModbusRequest, guess_response_frame_len, ModbusProto};
 
 use crate::context::AppContext;
 use crate::error::{FirmwareError, Result};
+use crate::modbus_rtu::{
+    apply_capture_inject, classify_modbus_rx_miss, classify_recovered, find_modbus_response,
+    get_inject_junk, InjectJunkMode,
+};
 use crate::motion::{LoopStats, ModbusStats, MotorController, TimingWindowStats};
 use crate::motor::Motor;
 use crate::storage::PinConfiguration;
 
 pub const TARGET_BAUD_RATE: u32 = 115200;
+
+static LAST_INJECT_NOTE: AtomicU16 = AtomicU16::new(u16::MAX);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameTiming {
@@ -360,7 +368,7 @@ impl<'d> ModbusRTUMaster<'d> {
             if rx_res.is_err() {
                 self.dma_rx = Some(dma_rx);
                 if self.debug {
-                    self.log_modbus_dbg(req, &[], expected_len as usize, false, "dma_err");
+                    self.log_modbus_dbg(req, &[], expected_len as usize, false, "dma_err", 0, 0);
                 }
                 return Err(FirmwareError::Uart("dma rx err"));
             }
@@ -382,29 +390,52 @@ impl<'d> ModbusRTUMaster<'d> {
         }
 
         let (rx_bytes, rx_len) = if self.debug {
-            let len = to_copy.min(capture.len());
-            let class = classify_modbus_rx(&capture[..len], req, expected_len as usize);
-            let parse_slice = skip_leading_zeros(&capture[..len]);
-            let accept = try_parse_modbus_frame(parse_slice, expected_len as usize);
-            self.log_modbus_dbg(
-                req,
-                &capture[..len],
-                expected_len as usize,
-                accept,
-                class,
-            );
-            if !accept {
+            let mut len = to_copy.min(capture.len());
+            let (inject_mode, inject_n) = get_inject_junk();
+            if inject_mode != InjectJunkMode::Off && inject_n > 0 {
+                let key = ((inject_mode as u16) << 8) | u16::from(inject_n);
+                if LAST_INJECT_NOTE.swap(key, Ordering::Relaxed) != key {
+                    log::info!(
+                        "MODBUS_DBG note=inject mode={} n={}",
+                        inject_mode.as_str(),
+                        inject_n
+                    );
+                }
+                len = apply_capture_inject(&mut capture, len);
+            }
+            let slave = req.first().copied().unwrap_or(1);
+            let expected = expected_len as usize;
+            if let Some((offset, frame_len)) =
+                find_modbus_response(&capture[..len], slave, expected)
+            {
+                let class = classify_recovered(len, offset, frame_len);
+                let log_dbg = inject_mode != InjectJunkMode::Off
+                    || class != "exact"
+                    || offset > 0
+                    || len > frame_len;
+                if log_dbg {
+                    self.log_modbus_dbg(
+                        req,
+                        &capture[..len],
+                        expected,
+                        true,
+                        class,
+                        offset,
+                        frame_len,
+                    );
+                }
+                resp[..frame_len].copy_from_slice(&capture[offset..offset + frame_len]);
+                (frame_len.min(3), frame_len)
+            } else {
+                let class = classify_modbus_rx_miss(&capture[..len], req, expected);
+                self.log_modbus_dbg(req, &capture[..len], expected, false, class, 0, 0);
                 return Err(FirmwareError::Modbus(match class {
                     "empty" => "empty frame",
                     "short" => "incomplete frame",
                     "leading_zero" | "leading_junk" => "bad frame",
-                    "long" => "long frame",
                     _ => "parse fail",
                 }));
             }
-            let copy_len = parse_slice.len().min(resp.len());
-            resp[..copy_len].copy_from_slice(&parse_slice[..copy_len]);
-            (copy_len, parse_slice.len())
         } else {
             if to_copy < 4 {
                 return Err(FirmwareError::Modbus("bad frame"));
@@ -478,14 +509,20 @@ impl<'d> ModbusRTUMaster<'d> {
         expected: usize,
         ok: bool,
         class: &str,
+        skip: usize,
+        frame_len: usize,
     ) {
         let tx_hex = bytes_to_hex(tx, 64);
         let rx_hex = bytes_to_hex(rx, 64);
+        let trim = rx.len().saturating_sub(skip + frame_len);
         log::info!(
-            "MODBUS_DBG ok={} class={} expected={} tx={} rx_len={} rx={}",
+            "MODBUS_DBG ok={} class={} expected={} skip={} frame_len={} trim={} tx={} rx_len={} rx={}",
             ok,
             class,
             expected,
+            skip,
+            frame_len,
+            trim,
             tx_hex,
             rx.len(),
             rx_hex
@@ -927,56 +964,6 @@ fn bytes_to_hex(data: &[u8], max_bytes: usize) -> alloc::string::String {
     s
 }
 
-fn skip_leading_zeros(data: &[u8]) -> &[u8] {
-    let mut i = 0;
-    while i < data.len() && data[i] == 0 {
-        i += 1;
-    }
-    &data[i..]
-}
-
-fn try_parse_modbus_frame(data: &[u8], expected: usize) -> bool {
-    if data.len() < 4 {
-        return false;
-    }
-    match guess_response_frame_len(&data[..data.len().min(3)], ModbusProto::Rtu) {
-        Ok(len) => {
-            let len = len as usize;
-            data.len() >= len && (expected == 0 || len == expected || data.len() >= expected)
-        }
-        Err(_) => false,
-    }
-}
-
-fn classify_modbus_rx(rx: &[u8], req: &[u8], expected: usize) -> &'static str {
-    if rx.is_empty() {
-        return "empty";
-    }
-    let leading_zeros = rx.iter().take_while(|&&b| b == 0).count();
-    if leading_zeros > 0 {
-        return "leading_zero";
-    }
-    let slave = req.first().copied().unwrap_or(1);
-    if rx[0] != slave {
-        return "leading_junk";
-    }
-    if rx.len() < expected {
-        return "short";
-    }
-    if rx.len() > expected {
-        // valid frame may be followed by noise
-        if try_parse_modbus_frame(&rx[..expected], expected) {
-            return "long";
-        }
-        return "leading_junk";
-    }
-    if try_parse_modbus_frame(rx, expected) {
-        "exact"
-    } else {
-        "parse_fail"
-    }
-}
-
 pub async fn run_motor(
     app_context: AppContext,
     motion_consumer: crate::motion::CommandConsumer,
@@ -1072,7 +1059,7 @@ pub async fn run_motor(
             "Modbus motor not detected after retries, running in disconnected telemetry mode"
         );
         loop {
-            Timer::after_millis(100).await;
+            Timer::after_millis(10).await;
             mc.set_motor_connected(false);
             let _ = mc.compute_cycle();
             app_context.update_snapshot(mc.snapshot());

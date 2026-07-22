@@ -28,32 +28,12 @@ pub fn mark_active(active: bool) {
     RELAY_ACTIVE.store(active, Ordering::Relaxed);
 }
 
-fn calc_crc16(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xffff;
-    for &b in data {
-        crc ^= u16::from(b);
-        for _ in 0..8 {
-            if (crc & 0x0001) != 0 {
-                crc = (crc >> 1) ^ 0xA001;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    crc
-}
-
 pub fn verify_rtu_crc(frame: &[u8]) -> bool {
-    if frame.len() < 4 {
-        return false;
-    }
-    let n = frame.len();
-    let expected = u16::from_le_bytes([frame[n - 2], frame[n - 1]]);
-    calc_crc16(&frame[..n - 2]) == expected
+    crate::modbus_rtu::verify_rtu_crc(frame)
 }
 
 pub fn append_rtu_crc(frame: &mut HVec<u8, FRAME_CAP>) -> Result<()> {
-    let crc = calc_crc16(frame);
+    let crc = crate::modbus_rtu::calc_crc16(frame);
     frame
         .extend_from_slice(&crc.to_le_bytes())
         .map_err(|_| FirmwareError::Modbus("frame too large"))

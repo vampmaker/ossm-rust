@@ -25,6 +25,11 @@ jobs:
             flasher/package-lock.json
             motor-control/package-lock.json
 
+      - name: Setup standard Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
       - name: Install espup
         run: |
           curl -L https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu -o espup

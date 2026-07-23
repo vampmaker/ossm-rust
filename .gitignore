@@ -18,3 +18,4 @@ assets/wiring_diagram.png
 assets/wiring_diagram_zh.png
 components_*.lock
 __pycache__/
+screenshots/

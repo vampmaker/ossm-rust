@@ -1,0 +1,71 @@
+name: CI & Release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Firmware and Apps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: |
+            frontend/package-lock.json
+            flasher/package-lock.json
+            motor-control/package-lock.json
+
+      - name: Install espup
+        run: |
+          curl -L https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu -o espup
+          chmod +x espup
+          ./espup install
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install espflash
+        run: cargo binstall -y espflash
+
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-cargo-esp-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: |
+          source ~/export-esp.sh
+          cargo fmt --all -- --check --color always
+
+      - name: Run Clippy (C6 Target)
+        run: |
+          source ~/export-esp.sh
+          cargo clippy --target riscv32imac-unknown-none-elf -- -D warnings
+
+      - name: Run release script
+        run: |
+          source ~/export-esp.sh
+          ./scripts/release.sh
+
+      - name: Prepare ELF files and Zip
+        run: |
+          cp target/riscv32imac-unknown-none-elf/release/ossm-rust release/ossm-esp32c6.elf
+          cp target/xtensa-esp32s3-none-elf/release/ossm-rust release/ossm-esp32s3.elf
+          cd release
+          zip -r ../ossm-release.zip *
+
+      - name: Upload Release Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ossm-release
+          path: ossm-release.zip

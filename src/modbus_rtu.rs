@@ -147,11 +147,11 @@ pub fn find_modbus_response(rx: &[u8], slave: u8, expected: usize) -> Option<(us
         }
         let avail = rx.len() - offset;
         let hdr_len = avail.min(3);
-        let frame_len = match guess_response_frame_len(&rx[offset..offset + hdr_len], ModbusProto::Rtu)
-        {
-            Ok(n) => n as usize,
-            Err(_) => continue,
-        };
+        let frame_len =
+            match guess_response_frame_len(&rx[offset..offset + hdr_len], ModbusProto::Rtu) {
+                Ok(n) => n as usize,
+                Err(_) => continue,
+            };
         if frame_len < 4 || offset + frame_len > rx.len() {
             continue;
         }

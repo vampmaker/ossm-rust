@@ -1,9 +1,11 @@
 use alloc::string::String;
 
 use embassy_executor::Spawner;
-use embassy_net::{Config as NetConfig, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4};
+use embassy_net::{
+    Config as NetConfig, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
+};
 use embassy_time::{Duration, Instant, Timer};
-use esp_radio::wifi::{Config, Interface, WifiController, sta::StationConfig};
+use esp_radio::wifi::{sta::StationConfig, Config, Interface, WifiController};
 use static_cell::StaticCell;
 
 use crate::context::AppContext;

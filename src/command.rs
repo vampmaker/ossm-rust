@@ -1,12 +1,12 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex as BlockingMutex};
+use embassy_sync::channel::Channel;
 use embedded_cli::cli::CliBuilder;
 use embedded_cli::Command;
 use embedded_io::ErrorType;
 use embedded_io::Write as EmbeddedWrite;
-use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex as BlockingMutex};
-use embassy_sync::channel::Channel;
 
 use crate::console;
 use crate::context::AppContext;
@@ -174,21 +174,21 @@ fn base_to_cli(command: BaseCommand<'_>) -> Option<CliCommand> {
         BaseCommand::SetWave { wave } if matches!(wave, "sine" | "thrust" | "spline") => {
             CliCommand::SetWave(String::from(wave))
         }
-        BaseCommand::SetPausedPosition { position }
-            if position > 0.0 && position < 1.0 =>
-        {
+        BaseCommand::SetPausedPosition { position } if position > 0.0 && position < 1.0 => {
             CliCommand::SetPausedPosition(position)
         }
-        BaseCommand::SetDepth { depth } if depth > 0.01 && depth < 1.0 => CliCommand::SetDepth(depth),
+        BaseCommand::SetDepth { depth } if depth > 0.01 && depth < 1.0 => {
+            CliCommand::SetDepth(depth)
+        }
         BaseCommand::SetDepthTop { v } => CliCommand::SetDepthTop(v),
-        BaseCommand::SetSharpness { sharpness }
-            if (0.01..1.0).contains(&sharpness) =>
-        {
+        BaseCommand::SetSharpness { sharpness } if (0.01..1.0).contains(&sharpness) => {
             CliCommand::SetSharpness(sharpness)
         }
         BaseCommand::SetSplinePoints { points } => {
-            let parsed: Result<Vec<f32>, _> =
-                points.split_whitespace().map(|s| s.parse::<f32>()).collect();
+            let parsed: Result<Vec<f32>, _> = points
+                .split_whitespace()
+                .map(|s| s.parse::<f32>())
+                .collect();
             CliCommand::SetSplinePoints(parsed.ok()?)
         }
         BaseCommand::SetModbusTimeoutMs { value } if value <= 1000 => {
@@ -223,9 +223,7 @@ fn base_to_cli(command: BaseCommand<'_>) -> Option<CliCommand> {
             CliCommand::SetModbusInjectJunk(m, nbytes as u8)
         }
         BaseCommand::GetModbusInjectJunk => CliCommand::GetModbusInjectJunk,
-        BaseCommand::SetOperatingMode { mode }
-            if matches!(mode, "servo" | "rtu_relay") =>
-        {
+        BaseCommand::SetOperatingMode { mode } if matches!(mode, "servo" | "rtu_relay") => {
             CliCommand::SetOperatingMode(String::from(mode))
         }
         BaseCommand::GetOperatingMode => CliCommand::GetOperatingMode,
@@ -466,7 +464,9 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
             app_context.storage.set_net(config);
         }
         CliCommand::SetStaticIp(ip) => set_net_field(app_context, |c| c.static_ip = ip).await,
-        CliCommand::SetStaticMask(mask) => set_net_field(app_context, |c| c.static_mask = mask).await,
+        CliCommand::SetStaticMask(mask) => {
+            set_net_field(app_context, |c| c.static_mask = mask).await
+        }
         CliCommand::SetStaticGateway(gateway) => {
             set_net_field(app_context, |c| c.static_gateway = gateway).await;
         }
@@ -523,7 +523,10 @@ async fn update_config(app_context: AppContext, f: impl FnOnce(&mut MotorControl
     let _ = app_context.try_enqueue_config(config).await;
 }
 
-async fn set_net_field(app_context: AppContext, f: impl FnOnce(&mut crate::storage::NetworkConfiguration)) {
+async fn set_net_field(
+    app_context: AppContext,
+    f: impl FnOnce(&mut crate::storage::NetworkConfiguration),
+) {
     let mut config = app_context.storage.net();
     f(&mut config);
     app_context.storage.set_net(config);

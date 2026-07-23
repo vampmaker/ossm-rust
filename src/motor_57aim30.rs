@@ -1,15 +1,14 @@
-
 use core::f32::consts::PI;
 use core::sync::atomic::Ordering;
 
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_hal::delay::Delay;
-use portable_atomic::AtomicU16;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::gpio::{AnyPin, Level, Output, OutputConfig};
 use esp_hal::uart::uhci::{Uhci, UhciRx, UhciTx};
 use esp_hal::uart::{Config, Uart};
 use fixedvec::FixedVec;
+use portable_atomic::AtomicU16;
 use rmodbus::{client::ModbusRequest, guess_response_frame_len, ModbusProto};
 
 use crate::context::AppContext;
@@ -280,8 +279,14 @@ impl<'d> ModbusRTUMaster<'d> {
     }
 
     async fn dma_write_all(&mut self, req: &[u8]) -> Result<()> {
-        let uhci_tx = self.uhci_tx.take().ok_or(FirmwareError::Uart("uhci tx taken"))?;
-        let mut dma_tx = self.dma_tx.take().ok_or(FirmwareError::Uart("dma tx taken"))?;
+        let uhci_tx = self
+            .uhci_tx
+            .take()
+            .ok_or(FirmwareError::Uart("uhci tx taken"))?;
+        let mut dma_tx = self
+            .dma_tx
+            .take()
+            .ok_or(FirmwareError::Uart("dma tx taken"))?;
 
         if req.len() > dma_tx.as_mut_slice().len() {
             self.uhci_tx = Some(uhci_tx);
@@ -326,8 +331,14 @@ impl<'d> ModbusRTUMaster<'d> {
         }
         let t2 = Instant::now();
 
-        let uhci_rx = self.uhci_rx.take().ok_or(FirmwareError::Uart("uhci rx taken"))?;
-        let mut dma_rx = self.dma_rx.take().ok_or(FirmwareError::Uart("dma rx taken"))?;
+        let uhci_rx = self
+            .uhci_rx
+            .take()
+            .ok_or(FirmwareError::Uart("uhci rx taken"))?;
+        let mut dma_rx = self
+            .dma_rx
+            .take()
+            .ok_or(FirmwareError::Uart("dma rx taken"))?;
         let cap = dma_rx.capacity();
         dma_rx.set_length(cap);
         let expected_len = expected_modbus_response_len(req);
@@ -608,9 +619,7 @@ impl<'d> ModbusRTUMaster<'d> {
 
     pub fn set_baudrate(&mut self, baudrate: u32) -> Result<()> {
         let rx_config = esp_hal::uart::RxConfig::default().with_timeout(self.timeout_symbols);
-        let config = Config::default()
-            .with_baudrate(baudrate)
-            .with_rx(rx_config);
+        let config = Config::default().with_baudrate(baudrate).with_rx(rx_config);
         if let Some(ref mut tx) = self.uhci_tx {
             tx.uart_tx
                 .apply_config(&config)
@@ -876,10 +885,10 @@ pub(crate) fn init_uart_and_modbus(
     // Keep RX DMA at 256 B: larger UHCI RX buffers have been observed to prevent
     // descriptor EOF finalization on this path (all reads look empty / timeout).
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = esp_hal::dma_buffers!(256, 256);
-    let dma_rx = DmaRxBuf::new(rx_descriptors, rx_buffer)
-        .map_err(|_| FirmwareError::Uart("dma rx buf"))?;
-    let dma_tx = DmaTxBuf::new(tx_descriptors, tx_buffer)
-        .map_err(|_| FirmwareError::Uart("dma tx buf"))?;
+    let dma_rx =
+        DmaRxBuf::new(rx_descriptors, rx_buffer).map_err(|_| FirmwareError::Uart("dma rx buf"))?;
+    let dma_tx =
+        DmaTxBuf::new(tx_descriptors, tx_buffer).map_err(|_| FirmwareError::Uart("dma tx buf"))?;
 
     let mut uhci = Uhci::new(uart, uhci_periph, dma_channel);
     uhci.apply_rx_config(&esp_hal::uart::uhci::RxConfig::default())
@@ -892,9 +901,7 @@ pub(crate) fn init_uart_and_modbus(
     configure_uart1_rx_idle_threshold(timeout_symbols);
 
     if pin_config.modbus_debug {
-        log::info!(
-            "Modbus debug mode ON: 5ms RX deadline, hex dumps on console (DMA RX 256 B)"
-        );
+        log::info!("Modbus debug mode ON: 5ms RX deadline, hex dumps on console (DMA RX 256 B)");
     }
 
     Ok(ModbusRTUMaster::new(
@@ -917,11 +924,9 @@ fn configure_uart1_rx_idle_threshold(symbols: u8) {
     let bits = (symbols as u16).clamp(2, 1023);
     unsafe {
         let regs = &*esp_hal::peripherals::UART1::ptr();
-        regs.idle_conf()
-            .modify(|_, w| w.rx_idle_thrhd().bits(bits));
+        regs.idle_conf().modify(|_, w| w.rx_idle_thrhd().bits(bits));
         #[cfg(feature = "esp32c6")]
-        regs.tout_conf()
-            .modify(|_, w| w.rx_tout_thrhd().bits(bits));
+        regs.tout_conf().modify(|_, w| w.rx_tout_thrhd().bits(bits));
     }
 }
 
@@ -1171,8 +1176,7 @@ pub fn run_relay_on_core1(
 ) {
     let executor = core1_executor();
     executor.run(|spawner| {
-        spawner
-            .spawn(core1_relay_task(uart_periph, uhci_periph, dma_channel, pin_config).unwrap());
+        spawner.spawn(core1_relay_task(uart_periph, uhci_periph, dma_channel, pin_config).unwrap());
     });
 }
 
@@ -1214,4 +1218,3 @@ async fn core1_relay_task(
         log::error!("Modbus relay on Core 1 failed: {}", e);
     }
 }
-

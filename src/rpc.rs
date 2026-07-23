@@ -48,7 +48,9 @@ async fn err_response(id: &serde_json::Value, code: i32, message: &'static str) 
     })
     .unwrap_or(None);
     RpcAction::Respond(encoded.unwrap_or_else(|| {
-        String::from("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}")
+        String::from(
+            "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}",
+        )
     }))
 }
 
@@ -59,7 +61,7 @@ async fn respond<T: Serialize + ?Sized>(id: &serde_json::Value, result: &T) -> R
         result: Some(result),
         error: None,
     };
-    
+
     let encoded = crate::buffers::try_with_scratchpad(|buf| {
         if let Ok(len) = serde_json_core::to_slice(&resp, buf) {
             if let Ok(s) = core::str::from_utf8(&buf[..len]) {
@@ -83,7 +85,7 @@ async fn respond<T: Serialize + ?Sized>(id: &serde_json::Value, result: &T) -> R
                 None
             })
             .await;
-            
+
             if let Some(s) = encoded_async {
                 RpcAction::Respond(s)
             } else {
@@ -126,9 +128,13 @@ pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAc
             if relay {
                 return err_response(&id, -32001, "rtu_relay mode").await;
             }
-            let params = request.parse_params::<SubscribeParams>().unwrap_or_default();
+            let params = request
+                .parse_params::<SubscribeParams>()
+                .unwrap_or_default();
             let interval = params.interval_ms.unwrap_or(33).clamp(20, 60000);
-            RpcAction::Subscribe { interval_ms: interval }
+            RpcAction::Subscribe {
+                interval_ms: interval,
+            }
         }
         "unsubscribe-state" | "unsubscribe_state" => RpcAction::Unsubscribe,
         "append-waypoints" | "append_waypoints" => {
@@ -198,10 +204,7 @@ struct StateNotification<'a> {
     state: &'a crate::motion::StateResponse,
 }
 
-pub fn build_state_notification_into(
-    app_context: AppContext,
-    out: &mut [u8],
-) -> Option<usize> {
+pub fn build_state_notification_into(app_context: AppContext, out: &mut [u8]) -> Option<usize> {
     let state = app_context.load_snapshot();
 
     let notif = StateNotification {
@@ -254,7 +257,12 @@ pub fn unsubscribe_ack(id: serde_json::Value) -> String {
             .map(String::from)
             .unwrap_or_default()
     })
-    .unwrap_or_else(|| alloc::format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"unsubscribed\"}}", id))
+    .unwrap_or_else(|| {
+        alloc::format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"unsubscribed\"}}",
+            id
+        )
+    })
 }
 
 pub fn restart_ack(id: serde_json::Value) -> String {
@@ -270,5 +278,10 @@ pub fn restart_ack(id: serde_json::Value) -> String {
             .map(String::from)
             .unwrap_or_default()
     })
-    .unwrap_or_else(|| alloc::format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"restarting\"}}", id))
+    .unwrap_or_else(|| {
+        alloc::format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"restarting\"}}",
+            id
+        )
+    })
 }

@@ -234,11 +234,7 @@ fn push_into(ring: &mut Ring, data: &[u8], offset: &mut usize) -> bool {
 }
 
 /// Interrupt USB TX: write ≤64 B then await IN_EMPTY with timeout (no hang).
-async fn drain_usb(
-    usb: &mut UsbSerialJtag<'_, Async>,
-    ring: &mut Ring,
-    max_packets: Option<u32>,
-) {
+async fn drain_usb(usb: &mut UsbSerialJtag<'_, Async>, ring: &mut Ring, max_packets: Option<u32>) {
     let deadline = Instant::now() + Duration::from_millis(TOTAL_TIMEOUT_MS);
     let mut packets = 0u32;
     while !ring.is_empty() {
@@ -413,10 +409,7 @@ async fn drain_out_batch(
         )
         .await;
     }
-    if !usb_tx_cli.is_empty()
-        || !usb_tx_log.is_empty()
-        || !uart_tx.is_empty()
-        || !rtt_tx.is_empty()
+    if !usb_tx_cli.is_empty() || !usb_tx_log.is_empty() || !uart_tx.is_empty() || !rtt_tx.is_empty()
     {
         drain_sinks_progress(usb, uart, rtt, usb_tx_cli, usb_tx_log, uart_tx, rtt_tx).await;
     }
@@ -635,7 +628,10 @@ pub async fn run(
 fn panic(info: &core::panic::PanicInfo) -> ! {
     critical_section::with(|_| {
         let mut buf = heapless::String::<256>::new();
-        let _ = write!(&mut buf, "\r\n====================== PANIC ======================\r\n");
+        let _ = write!(
+            &mut buf,
+            "\r\n====================== PANIC ======================\r\n"
+        );
         let _ = write!(&mut buf, "{}\r\n\r\nBacktrace:\r\n", info);
         panic_write(buf.as_str());
 
@@ -648,9 +644,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             panic_write(line.as_str());
         }
         if !any {
-            panic_write(
-                "No backtrace available - make sure to force frame-pointers.\r\n",
-            );
+            panic_write("No backtrace available - make sure to force frame-pointers.\r\n");
         }
         panic_write("\r\n");
     });

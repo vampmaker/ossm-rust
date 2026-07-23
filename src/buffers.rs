@@ -3,8 +3,7 @@ use embassy_futures::select::{select4, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::{Mutex as AsyncMutex, MutexGuard};
 
-static SCRATCHPAD: AsyncMutex<CriticalSectionRawMutex, [u8; 4096]> =
-    AsyncMutex::new([0u8; 4096]);
+static SCRATCHPAD: AsyncMutex<CriticalSectionRawMutex, [u8; 4096]> = AsyncMutex::new([0u8; 4096]);
 
 /// Execute a synchronous compute-only operation using the 4 KB scratchpad buffer.
 /// Non-yieldable: closure `f` cannot `.await`.

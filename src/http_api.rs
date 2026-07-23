@@ -60,7 +60,12 @@ impl WsMessage {
 #[derive(Deserialize)]
 pub struct WaypointsObject {
     pub waypoints: Vec<crate::motion::StreamWaypoint>,
-    #[serde(default, rename = "reset-timestamp", alias = "reset_timestamp", alias = "reset")]
+    #[serde(
+        default,
+        rename = "reset-timestamp",
+        alias = "reset_timestamp",
+        alias = "reset"
+    )]
     pub reset_timestamp: Option<bool>,
 }
 
@@ -183,7 +188,10 @@ fn accepts_gzip<const N: usize>(headers: &edge_http::RequestHeaders<'_, N>) -> b
     header_value(headers, "accept-encoding").is_some_and(|v| v.contains("gzip"))
 }
 
-async fn write_all_conn(conn: &mut HttpConn<'_>, data: &[u8]) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+async fn write_all_conn(
+    conn: &mut HttpConn<'_>,
+    data: &[u8],
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
     let mut offset = 0;
     while offset < data.len() {
         let written = conn.write(&data[offset..]).await?;
@@ -336,15 +344,13 @@ async fn post_config(
     let config_res = serde_json::from_slice::<MotorControllerConfig>(&body);
 
     match config_res {
-        Ok(config) => {
-            match ctx.try_enqueue_config(config).await {
-                Ok(applied) => send_json_obj(conn, 200, "OK", &applied).await,
-                Err("Stale causal version") => {
-                    send_json(conn, 409, "Conflict", "Stale causal version").await
-                }
-                Err(msg) => send_json(conn, 503, "Service Unavailable", msg).await,
+        Ok(config) => match ctx.try_enqueue_config(config).await {
+            Ok(applied) => send_json_obj(conn, 200, "OK", &applied).await,
+            Err("Stale causal version") => {
+                send_json(conn, 409, "Conflict", "Stale causal version").await
             }
-        }
+            Err(msg) => send_json(conn, 503, "Service Unavailable", msg).await,
+        },
         Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
     }
 }
@@ -448,7 +454,9 @@ async fn post_network_config(
     }
 }
 
-async fn post_restart(conn: &mut HttpConn<'_>) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+async fn post_restart(
+    conn: &mut HttpConn<'_>,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
     let spawner = unsafe { embassy_executor::Spawner::for_current_executor().await };
     spawner.spawn(delayed_reset_task().unwrap());
     send_json(conn, 200, "OK", "{\"ok\":true}").await
@@ -586,12 +594,8 @@ async fn handle_rest(
         }
         (Method::Options, "/modbus-inject") => cors_preflight(conn, "GET, POST, OPTIONS").await,
         _ => {
-            conn.initiate_response(
-                404,
-                Some("Not Found"),
-                &[("Connection", "close")],
-            )
-            .await
+            conn.initiate_response(404, Some("Not Found"), &[("Connection", "close")])
+                .await
         }
     }
 }
@@ -603,21 +607,14 @@ fn extract_unbound_socket(conn: HttpConn<'_>) -> TcpSocket<'static> {
     }
 }
 
-async fn process_connection(
-    socket: TcpSocket<'static>,
-    acceptor_id: usize,
-    ctx: AppContext,
-) {
+async fn process_connection(socket: TcpSocket<'static>, acceptor_id: usize, ctx: AppContext) {
     let mut http_buf = [0u8; HTTP_BUFFER_SIZE];
     let mut conn = match Connection::new(&mut http_buf, socket).await {
         Ok(conn) => conn,
         Err(_) => return,
     };
 
-    let ws_path = conn
-        .headers()
-        .ok()
-        .map(|h| normalize_path(h.path));
+    let ws_path = conn.headers().ok().map(|h| normalize_path(h.path));
     let is_ws = conn.is_ws_upgrade_request().unwrap_or(false);
     let is_command_ws = is_ws && ws_path == Some("/ws/command");
     let is_modbus_ws = is_ws && ws_path == Some("/ws/modbus");
@@ -680,10 +677,7 @@ async fn process_connection(
                 .initiate_response(
                     503,
                     Some("Service Unavailable"),
-                    &[
-                        ("Connection", "close"),
-                        ("Content-Type", "text/plain"),
-                    ],
+                    &[("Connection", "close"), ("Content-Type", "text/plain")],
                 )
                 .await;
             finish_connection(&mut conn).await;
@@ -730,9 +724,16 @@ async fn process_connection(
 enum WsTxMsg {
     Text(String),
     Pong(String),
-    Subscribe { id: serde_json::Value, interval_ms: u64 },
-    Unsubscribe { id: serde_json::Value },
-    Restart { id: serde_json::Value },
+    Subscribe {
+        id: serde_json::Value,
+        interval_ms: u64,
+    },
+    Unsubscribe {
+        id: serde_json::Value,
+    },
+    Restart {
+        id: serde_json::Value,
+    },
     Close,
 }
 
@@ -855,7 +856,10 @@ async fn run_ws_session(mut socket: TcpSocket<'static>, ctx: AppContext) {
                     next_push += Duration::from_millis(push_interval_ms);
                     let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
                     if let Some(len) = rpc::build_state_notification_into(ctx, &mut *lease) {
-                        if ws_send(&mut tx, FrameType::Text(false), None, &lease[..len]).await.is_err() {
+                        if ws_send(&mut tx, FrameType::Text(false), None, &lease[..len])
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -1012,7 +1016,10 @@ async fn modbus_tcp_server_main(stack: &'static Stack<'static>) {
     let buffers = MODBUS_TCP_BUFFERS.init(TcpBuffers::new());
     let tcp = MODBUS_TCP_FACTORY.init(Tcp::new(*stack, buffers));
     let acceptor = loop {
-        match tcp.bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 502))).await {
+        match tcp
+            .bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 502)))
+            .await
+        {
             Ok(a) => break a,
             Err(e) => {
                 log::error!("Modbus TCP :502 bind failed: {:?}, retrying...", e);
@@ -1075,7 +1082,10 @@ async fn http_server_main(stack: &'static Stack<'static>, ctx: AppContext) {
     let buffers = TCP_BUFFERS.init(TcpBuffers::new());
     let tcp = TCP_FACTORY.init(Tcp::new(*stack, buffers));
     let acceptor: edge_nal_embassy::TcpAccept<'static> = loop {
-        match tcp.bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80))).await {
+        match tcp
+            .bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)))
+            .await
+        {
             Ok(acceptor) => {
                 #[allow(clippy::missing_transmute_annotations)]
                 break unsafe { core::mem::transmute(acceptor) };

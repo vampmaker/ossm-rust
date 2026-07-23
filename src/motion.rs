@@ -2,16 +2,16 @@ extern crate alloc;
 
 use alloc::vec;
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 
 use embassy_time::{self, Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use heapless::spsc::{Producer, Consumer};
+use heapless::spsc::{Consumer, Producer};
 
 pub const COMMAND_QUEUE_SIZE: usize = 3;
 pub type CommandProducer = Producer<'static, MotionCommand>;
@@ -22,7 +22,7 @@ pub type CommandConsumer = Consumer<'static, MotionCommand>;
 
 trait WaveformGenerator: Send {
     fn evaluate(&self, time_offset_seconds: f32, bpm: f32) -> (f32, f32);
-    
+
     // Find phase x ∈ [0, 1] that produces y ∈ [0, 1]
     fn find_x_for_y(&self, y: f32) -> f32;
 }
@@ -35,14 +35,14 @@ impl WaveformGenerator for SineWaveform {
         let freq = bpm / 60.0;
         let phase_rads = 2.0 * core::f32::consts::PI * time_offset_seconds * freq;
         let y = libm::sinf(phase_rads) / 2.0 + 0.5;
-        
+
         // speed = d/dt(y) = d/dt(sin(2π * freq * t) / 2 + 0.5)
         //       = cos(2π * freq * t) * (2π * freq) / 2
         //       = π * freq * cos(2π * freq * t)
         let speed = core::f32::consts::PI * freq * libm::cosf(phase_rads);
         (y, speed)
     }
-    
+
     fn find_x_for_y(&self, y: f32) -> f32 {
         // y = sin(2πx) / 2 + 0.5
         // sin(2πx) = (y - 0.5) * 2
@@ -76,11 +76,11 @@ impl WaveformGenerator for ThrustWaveform {
         let freq = bpm / 60.0;
         let cycles = time_offset_seconds * freq;
         let x = cycles % 1.0;
-        
+
         // Sharpness controls the rise duration [0.01, 0.99]
         // Lower values = sharper thrust (faster rise)
         let rise_duration = self.sharpness.clamp(0.01, 0.99);
-        
+
         // Smootherstep function and its derivative
         // s(t) = 6t^5 - 15t^4 + 10t^3
         // s'(t) = 30t^4 - 60t^3 + 30t^2 = 30 * t^2 * (t-1)^2
@@ -92,7 +92,7 @@ impl WaveformGenerator for ThrustWaveform {
             let t = t.clamp(0.0, 1.0);
             30.0 * t * t * (t - 1.0) * (t - 1.0)
         };
-        
+
         let (y, dy_dx) = if x < rise_duration {
             // Rise phase
             let t = x / rise_duration;
@@ -120,23 +120,24 @@ impl WaveformGenerator for ThrustWaveform {
         let mut left = 0.0;
         let mut right = 1.0;
         let target_y = y.clamp(0.0, 1.0);
-        
-        for _ in 0..20 {  // 20 iterations should be enough precision
+
+        for _ in 0..20 {
+            // 20 iterations should be enough precision
             let mid = (left + right) / 2.0;
             // Evaluate at 1 BPM means time_offset = mid * 60
             let (mid_y, _) = self.evaluate(mid * 60.0, 1.0);
-            
+
             if (mid_y - target_y).abs() < 0.001 {
                 return mid;
             }
-            
+
             if mid_y < target_y {
                 left = mid;
             } else {
                 right = mid;
             }
         }
-        
+
         (left + right) / 2.0
     }
 }
@@ -196,7 +197,11 @@ impl SplineWaveform {
         let dh11 = 3.0 * u2 - 2.0 * u;
         let dy_du = dh00 * p0 + dh10 * m0_scaled + dh01 * p1 + dh11 * m1_scaled;
 
-        let dy_dx = if segment_width > 0.0 { dy_du / segment_width } else { 0.0 };
+        let dy_dx = if segment_width > 0.0 {
+            dy_du / segment_width
+        } else {
+            0.0
+        };
         (pos, dy_dx)
     }
 
@@ -236,8 +241,12 @@ impl SplineWaveform {
         for i in 0..=num_samples {
             let x = (i as f32 / num_samples as f32).min(0.999999);
             let (pos, _) = Self::eval_raw(points, &tangents, x);
-            if pos < min_pos { min_pos = pos; }
-            if pos > max_pos { max_pos = pos; }
+            if pos < min_pos {
+                min_pos = pos;
+            }
+            if pos > max_pos {
+                max_pos = pos;
+            }
         }
 
         let range = max_pos - min_pos;
@@ -312,7 +321,10 @@ pub struct StreamWaypoint {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum MotionCommand {
     AppendWaypoints(Vec<StreamWaypoint>),
-    SetWaypoints { waypoints: Vec<StreamWaypoint>, reset_timestamp: bool },
+    SetWaypoints {
+        waypoints: Vec<StreamWaypoint>,
+        reset_timestamp: bool,
+    },
     // Drop buffered waypoints and the clock epoch; the next waypoint re-anchors
     ResetTimestamp,
     /// Apply a full motor config (sole cross-task write path into MotorController).
@@ -323,7 +335,7 @@ pub enum MotionCommand {
 pub trait MotionSource: Send {
     // Returns (pos, speed) where pos is normalized [0, 1]
     fn update(&mut self, dt: f32) -> (f32, f32);
-    
+
     // Adjust internal state to match (y, speed), used to avoid jumps when switching sources
     fn follow(&mut self, y: f32, speed: f32);
 
@@ -361,10 +373,9 @@ impl MotionSource for WaveformMotionSource {
         // position, so only the phase is matched.
         let phase = self.generator.find_x_for_y(y);
         let time_offset = phase * 60.0 / self.bpm;
-        self.t0 = Instant::now()
-            - Duration::from_micros((time_offset * 1_000_000.0) as u64);
+        self.t0 = Instant::now() - Duration::from_micros((time_offset * 1_000_000.0) as u64);
     }
-    
+
     fn get_phase_info(&self) -> (f32, f32) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.t0).as_micros() as f32 / 1_000_000.0;
@@ -381,7 +392,10 @@ struct PausedMotionSource {
 
 impl PausedMotionSource {
     fn new(current_y: f32, target_y: f32) -> Self {
-        Self { current_y, target_y }
+        Self {
+            current_y,
+            target_y,
+        }
     }
 }
 
@@ -407,7 +421,7 @@ impl MotionSource for PausedMotionSource {
     fn follow(&mut self, y: f32, _speed: f32) {
         self.current_y = y;
     }
-    
+
     fn get_phase_info(&self) -> (f32, f32) {
         (0.0, 0.0)
     }
@@ -431,49 +445,63 @@ impl Trajectory {
     fn new(start_y: f32, start_speed: f32, end_y: f32, end_speed: f32, duration: f32) -> Self {
         if duration <= 1e-6 {
             // Instant move (avoid division by zero)
-            return Self { a: 0.0, b: 0.0, c: 0.0, d: end_y, duration: 0.0, elapsed: 0.0 };
+            return Self {
+                a: 0.0,
+                b: 0.0,
+                c: 0.0,
+                d: end_y,
+                duration: 0.0,
+                elapsed: 0.0,
+            };
         }
-        
+
         // Constraints:
         // y(0) = d = start_y
         // y'(0) = c = start_speed
         // y(T) = aT^3 + bT^2 + cT + d = end_y
         // y'(T) = 3aT^2 + 2bT + c = end_speed
-        
+
         let d = start_y;
         let c = start_speed;
-        
+
         let t = duration;
         let t2 = t * t;
         let _t3 = t2 * t;
-        
+
         // a = (v0 + v1 - 2(y1 - y0)/T) / T^2
         // b = (3(y1 - y0)/T - 2v0 - v1) / T
-        
+
         let dy = end_y - start_y;
         let a = (start_speed + end_speed - 2.0 * dy / t) / t2;
         let b = (3.0 * dy / t - 2.0 * start_speed - end_speed) / t;
-        
-        Self { a, b, c, d, duration, elapsed: 0.0 }
+
+        Self {
+            a,
+            b,
+            c,
+            d,
+            duration,
+            elapsed: 0.0,
+        }
     }
-    
+
     fn update(&mut self, dt: f32) -> Option<(f32, f32)> {
         self.elapsed += dt;
         if self.elapsed >= self.duration {
             // Finished
             return None;
         }
-        
+
         let t = self.elapsed;
         let t2 = t * t;
         let t3 = t2 * t;
-        
+
         let y = self.a * t3 + self.b * t2 + self.c * t + self.d;
         let speed = 3.0 * self.a * t2 + 2.0 * self.b * t + self.c;
-        
+
         Some((y, speed))
     }
-    
+
     fn end_state(&self) -> (f32, f32) {
         let t = self.duration;
         let t2 = t * t;
@@ -500,10 +528,10 @@ pub struct StreamStatus {
 
 const MAX_WINDOW: usize = 128;
 // Speed used to size the catch-up trajectory toward a newly anchored stream
-const CATCHUP_SPEED: f32 = 0.5;      // y-units/s
+const CATCHUP_SPEED: f32 = 0.5; // y-units/s
 const CATCHUP_MIN_DURATION: f32 = 0.2;
 const CATCHUP_MAX_DURATION: f32 = 2.0;
-const UNDERRUN_DECEL: f32 = 20.0;    // y-units/s^2
+const UNDERRUN_DECEL: f32 = 20.0; // y-units/s^2
 
 enum StreamSample {
     Interpolated(f32, f32),
@@ -520,11 +548,11 @@ struct StreamingMotionSource {
     // Waypoints sorted by playback time, spanning both sides of stream_time
     // (up to 2 past entries are retained for tangent estimation).
     window: VecDeque<Waypoint>,
-    
+
     current_y: f32,
     current_speed: f32,
     underrun: bool,
-    
+
     // Blend from the current state into the stream (mode entry, underrun
     // recovery, reset) with matched position and velocity.
     catchup: Option<Trajectory>,
@@ -613,7 +641,11 @@ impl StreamingMotionSource {
             return;
         }
         // Insert sorted by playback time (commands normally arrive in order)
-        let idx = self.window.iter().rposition(|w| w.t <= t).map_or(0, |i| i + 1);
+        let idx = self
+            .window
+            .iter()
+            .rposition(|w| w.t <= t)
+            .map_or(0, |i| i + 1);
         self.window.insert(idx, Waypoint { t, pos, vel });
     }
 
@@ -644,7 +676,11 @@ impl StreamingMotionSource {
             (w[i - 1], w[i + 1])
         };
         let dt = b.t - a.t;
-        if dt > 1e-4 { (b.pos - a.pos) / dt } else { 0.0 }
+        if dt > 1e-4 {
+            (b.pos - a.pos) / dt
+        } else {
+            0.0
+        }
     }
 
     fn sample(&self, t: f32) -> StreamSample {
@@ -663,7 +699,7 @@ impl StreamingMotionSource {
         if i + 1 >= n {
             return StreamSample::Exhausted;
         }
-        
+
         let w1 = self.window[i];
         let w2 = self.window[i + 1];
         let h = (w2.t - w1.t).max(1e-4);
@@ -671,7 +707,7 @@ impl StreamingMotionSource {
         // Tangents are dy/dt; scale by segment duration for the unit-domain Hermite basis
         let m1 = self.tangent_at(i) * h;
         let m2 = self.tangent_at(i + 1) * h;
-        
+
         let u2 = u * u;
         let u3 = u2 * u;
         let h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
@@ -679,13 +715,13 @@ impl StreamingMotionSource {
         let h01 = -2.0 * u3 + 3.0 * u2;
         let h11 = u3 - u2;
         let y = h00 * w1.pos + h10 * m1 + h01 * w2.pos + h11 * m2;
-        
+
         let dh00 = 6.0 * u2 - 6.0 * u;
         let dh10 = 3.0 * u2 - 4.0 * u + 1.0;
         let dh01 = -6.0 * u2 + 6.0 * u;
         let dh11 = 3.0 * u2 - 2.0 * u;
         let dy_du = dh00 * w1.pos + dh10 * m1 + dh01 * w2.pos + dh11 * m2;
-        
+
         StreamSample::Interpolated(y, dy_du / h)
     }
 
@@ -707,7 +743,7 @@ impl StreamingMotionSource {
 impl MotionSource for StreamingMotionSource {
     fn update(&mut self, dt: f32) -> (f32, f32) {
         self.evict_old();
-        
+
         // Start a catch-up trajectory toward the first upcoming waypoint if
         // playback has not reached the stream yet (mode entry / re-anchor).
         if self.catchup.is_none() {
@@ -725,9 +761,9 @@ impl MotionSource for StreamingMotionSource {
                 }
             }
         }
-        
+
         self.stream_time += dt;
-        
+
         if let Some(traj) = &mut self.catchup {
             match traj.update(dt) {
                 Some((y, speed)) => {
@@ -744,7 +780,7 @@ impl MotionSource for StreamingMotionSource {
                 }
             }
         }
-        
+
         match self.sample(self.stream_time) {
             StreamSample::Interpolated(y, speed) => {
                 self.underrun = false;
@@ -766,7 +802,7 @@ impl MotionSource for StreamingMotionSource {
                 self.decelerate(dt);
             }
         }
-        
+
         (self.current_y, self.current_speed)
     }
 
@@ -778,13 +814,11 @@ impl MotionSource for StreamingMotionSource {
         self.current_y = y;
         self.current_speed = speed;
     }
-    
+
     fn get_phase_info(&self) -> (f32, f32) {
         (self.stream_time, 0.0) // No phase concept in streaming
     }
 }
-
-
 
 // ===== Layer 2: Shaper =====
 // Transforms y ∈ [0, 1] → y ∈ [0, 1] with depth, direction, and reversal
@@ -797,19 +831,19 @@ pub enum DepthDirection {
 
 #[derive(Clone)]
 pub struct Shaper {
-    target_depth: f32,       // Target depth
-    current_depth: f32,      // Current depth (transitions smoothly to target)
+    target_depth: f32,  // Target depth
+    current_depth: f32, // Current depth (transitions smoothly to target)
     direction: DepthDirection,
     target_reversed: bool,
-    current_reversal: f32,   // 0.0 = normal, 1.0 = reversed (transitions smoothly)
-    
+    current_reversal: f32, // 0.0 = normal, 1.0 = reversed (transitions smoothly)
+
     // Transition state
     transitioning: bool,
 }
 
-const TRANSITION_SPEED: f32 = 0.1;  // Depth units per second
-const REVERSAL_SPEED: f32 = 0.5;    // Reversal units per second (faster)
-const PAUSE_SPEED: f32 = 0.3;       // Pause position transition speed (y units per second)
+const TRANSITION_SPEED: f32 = 0.1; // Depth units per second
+const REVERSAL_SPEED: f32 = 0.5; // Reversal units per second (faster)
+const PAUSE_SPEED: f32 = 0.3; // Pause position transition speed (y units per second)
 const TRANSITION_THRESHOLD: f32 = 0.01;
 
 impl Shaper {
@@ -823,28 +857,33 @@ impl Shaper {
             transitioning: true,
         }
     }
-    
-    pub fn set_params(&mut self, new_depth: f32, new_direction: DepthDirection, new_reversed: bool) {
+
+    pub fn set_params(
+        &mut self,
+        new_depth: f32,
+        new_direction: DepthDirection,
+        new_reversed: bool,
+    ) {
         // Check if depth or reversal changed significantly
         let depth_changed = (self.target_depth - new_depth).abs() > TRANSITION_THRESHOLD;
         let reversal_changed = self.target_reversed != new_reversed;
-        
+
         if depth_changed || reversal_changed {
             self.transitioning = true;
         }
-        
+
         // Update target parameters
         self.target_depth = new_depth;
         self.direction = new_direction;
         self.target_reversed = new_reversed;
     }
-    
+
     pub fn shape(&mut self, y_in: f32, speed_in: f32, dt: f32) -> (f32, f32) {
         // Update transitions if needed
         if self.transitioning {
             let mut depth_done = false;
             let mut reversal_done = false;
-            
+
             // Update depth
             let depth_diff = self.target_depth - self.current_depth;
             if depth_diff.abs() < TRANSITION_THRESHOLD {
@@ -858,7 +897,7 @@ impl Shaper {
                     self.current_depth = (self.current_depth - step).max(self.target_depth);
                 }
             }
-            
+
             // Update reversal
             let target_reversal = if self.target_reversed { 1.0 } else { 0.0 };
             let reversal_diff = target_reversal - self.current_reversal;
@@ -873,22 +912,22 @@ impl Shaper {
                     self.current_reversal = (self.current_reversal - step).max(target_reversal);
                 }
             }
-            
+
             // Clear transitioning flag when both are done
             if depth_done && reversal_done {
                 self.transitioning = false;
             }
         }
-        
+
         // Apply smooth reversal: lerp between y_in and (1 - y_in)
         let r = self.current_reversal;
         let y = y_in * (1.0 - r) + (1.0 - y_in) * r;
         // Simplified: y = y_in * (1 - 2r) + r
-        
+
         // Chain rule for speed: dy/dt = (∂y/∂y_in) * (dy_in/dt)
         // ∂y/∂y_in = 1 - 2r
         let speed = speed_in * (1.0 - 2.0 * r);
-        
+
         // Then apply depth and direction
         match self.direction {
             DepthDirection::Top => {
@@ -905,7 +944,7 @@ impl Shaper {
             }
         }
     }
-    
+
     // Reverse the shaping transformation to get unshaped y from shaped y
     // Returns None if currently transitioning or if reversal makes inversion ambiguous
     pub fn unshape(&self, y_shaped: f32) -> Option<f32> {
@@ -913,7 +952,7 @@ impl Shaper {
         if self.transitioning {
             return None;
         }
-        
+
         // First, reverse depth and direction transformation
         let y_after_reversal = match self.direction {
             DepthDirection::Top => {
@@ -933,21 +972,21 @@ impl Shaper {
                 (y_shaped - (1.0 - self.current_depth)) / self.current_depth
             }
         };
-        
+
         // Then, reverse the reversal transformation
         // Forward: y = y_in * (1 - r) + (1 - y_in) * r
         // Simplify: y = y_in * (1 - 2r) + r
         // Solve for y_in: y_in = (y - r) / (1 - 2r)
         let r = self.current_reversal;
         let denominator = 1.0 - 2.0 * r;
-        
+
         // When r ≈ 0.5, the transformation loses information (everything maps to 0.5)
         if denominator.abs() < TRANSITION_THRESHOLD {
             return None;
         }
-        
+
         let y_in = (y_after_reversal - r) / denominator;
-        
+
         // Clamp to valid range
         Some(y_in.clamp(0.0, 1.0))
     }
@@ -965,7 +1004,7 @@ impl PositionGenerator {
     pub fn new(pos_min: f32, pos_max: f32) -> Self {
         Self { pos_min, pos_max }
     }
-    
+
     pub fn generate(&self, y: f32, speed_y: f32) -> (f32, f32) {
         let pos_range = self.pos_max - self.pos_min;
         let position = y * pos_range + self.pos_min;
@@ -974,17 +1013,20 @@ impl PositionGenerator {
     }
 }
 
-fn create_waveform_generator(config: &MotorControllerConfig) -> alloc::boxed::Box<dyn WaveformGenerator> {
+fn create_waveform_generator(
+    config: &MotorControllerConfig,
+) -> alloc::boxed::Box<dyn WaveformGenerator> {
     match config.wave_func.as_str() {
         "sine" => alloc::boxed::Box::new(SineWaveform),
         "thrust" => alloc::boxed::Box::new(ThrustWaveform::new(config.sharpness)),
-        "spline" => {
-            match SplineWaveform::from_points(&config.spline_points) {
-                Ok(wf) => alloc::boxed::Box::new(wf),
-                Err(e) => {
-                    log::error!("Error creating spline waveform: {}. Falling back to sine wave.", e);
-                    alloc::boxed::Box::new(SineWaveform)
-                }
+        "spline" => match SplineWaveform::from_points(&config.spline_points) {
+            Ok(wf) => alloc::boxed::Box::new(wf),
+            Err(e) => {
+                log::error!(
+                    "Error creating spline waveform: {}. Falling back to sine wave.",
+                    e
+                );
+                alloc::boxed::Box::new(SineWaveform)
             }
         },
         _ => alloc::boxed::Box::new(SineWaveform),
@@ -1022,7 +1064,7 @@ pub struct MotorController {
     config: MotorControllerConfig,
     config_version: u32,
     last_cycle: Instant,
-    
+
     // Internal state
     last_y: f32,
     last_speed: f32,
@@ -1047,10 +1089,10 @@ impl MotorController {
     pub fn new(config: MotorControllerConfig, command_consumer: CommandConsumer) -> Self {
         let generator = create_waveform_generator(&config);
         let waveform_source = WaveformMotionSource::new(generator, config.bpm);
-        
+
         let paused_source = PausedMotionSource::new(config.paused_position, config.paused_position);
         let streaming_source = StreamingMotionSource::new(config.paused_position);
-        
+
         let active_mode = if config.paused {
             MotionMode::Paused
         } else if config.streaming {
@@ -1058,16 +1100,16 @@ impl MotorController {
         } else {
             MotionMode::Waveform
         };
-        
+
         let direction = if config.depth_top {
             DepthDirection::Top
         } else {
             DepthDirection::Bottom
         };
-        
+
         let shaper = Shaper::new(config.depth, direction, config.reversed);
         let position_gen = PositionGenerator::new(0.0, 0.0); // Will be updated after homing
-        
+
         let now = Instant::now();
         let default_config = config.clone();
         Self {
@@ -1169,7 +1211,7 @@ impl MotorController {
 
         // pause the motor and set pause position to current position
         let pos_normalized = (position - pos_min) / (pos_max - pos_min);
-        
+
         // Try to unshape the current position to get the waveform y
         match self.shaper.unshape(pos_normalized) {
             Some(waveform_y) => {
@@ -1182,17 +1224,17 @@ impl MotorController {
             None => {
                 // Position is outside current depth range, trigger transition
                 log::info!("Current position is outside depth range, starting transition");
-                
+
                 // Set transitioning flag so shaper will move to target depth
                 self.shaper.transitioning = true;
-                
+
                 // Start source at a default position (middle)
                 self.active_source_mut().follow(0.5, 0.0);
                 self.last_y = 0.5;
                 self.last_speed = 0.0;
             }
         }
-        
+
         // Enforce pause after homing via set_config so config_version always advances.
         let mut config = self.config.clone();
         config.paused = true;
@@ -1213,18 +1255,20 @@ impl MotorController {
     }
 
     pub fn set_config(&mut self, config: MotorControllerConfig) -> Result<()> {
-        let wave_changed = self.config.wave_func != config.wave_func || self.config.spline_points != config.spline_points;
+        let wave_changed = self.config.wave_func != config.wave_func
+            || self.config.spline_points != config.spline_points;
         let sharpness_changed = (self.config.sharpness - config.sharpness).abs() > 0.001;
         let bpm_changed = (self.config.bpm - config.bpm).abs() > 0.001;
         let spline_changed = self.config.spline_points != config.spline_points;
-        
+
         // Update shaper
         let direction = if config.depth_top {
             DepthDirection::Top
         } else {
             DepthDirection::Bottom
         };
-        self.shaper.set_params(config.depth, direction, config.reversed);
+        self.shaper
+            .set_params(config.depth, direction, config.reversed);
 
         // Determine target mode
         let target_mode = if config.paused {
@@ -1234,7 +1278,7 @@ impl MotorController {
         } else {
             MotionMode::Waveform
         };
-        
+
         // 1. Handle Paused Source
         if target_mode == MotionMode::Paused {
             if self.active_mode != MotionMode::Paused {
@@ -1243,7 +1287,8 @@ impl MotorController {
             } else {
                 // Staying in paused
                 if (self.config.paused_position - config.paused_position).abs() > 0.001 {
-                    self.paused_source = PausedMotionSource::new(self.last_y, config.paused_position);
+                    self.paused_source =
+                        PausedMotionSource::new(self.last_y, config.paused_position);
                 }
             }
         }
@@ -1257,20 +1302,20 @@ impl MotorController {
 
         // 3. Handle Waveform Source
         if target_mode == MotionMode::Waveform {
-             let need_recreate = self.active_mode != MotionMode::Waveform || // Switching to it
+            let need_recreate = self.active_mode != MotionMode::Waveform || // Switching to it
                                  wave_changed || sharpness_changed || bpm_changed || spline_changed;
-             
-             if need_recreate {
-                 let generator = create_waveform_generator(&config);
-                 let mut new_wf = WaveformMotionSource::new(generator, config.bpm);
-                 new_wf.follow(self.last_y, self.last_speed);
-                 self.waveform_source = new_wf;
-             }
+
+            if need_recreate {
+                let generator = create_waveform_generator(&config);
+                let mut new_wf = WaveformMotionSource::new(generator, config.bpm);
+                new_wf.follow(self.last_y, self.last_speed);
+                self.waveform_source = new_wf;
+            }
         }
 
         self.active_mode = target_mode;
         self.commit_config(config);
-        
+
         Ok(())
     }
 
@@ -1312,8 +1357,12 @@ impl MotorController {
             self.current_min_dt_ms = dt_ms;
             self.current_max_dt_ms = dt_ms;
         } else {
-            if dt_ms < self.current_min_dt_ms { self.current_min_dt_ms = dt_ms; }
-            if dt_ms > self.current_max_dt_ms { self.current_max_dt_ms = dt_ms; }
+            if dt_ms < self.current_min_dt_ms {
+                self.current_min_dt_ms = dt_ms;
+            }
+            if dt_ms > self.current_max_dt_ms {
+                self.current_max_dt_ms = dt_ms;
+            }
         }
         self.current_sum_dt_ms += dt_ms;
         self.current_sum_sq_dt_ms += dt_ms * dt_ms;
@@ -1326,18 +1375,26 @@ impl MotorController {
         let (y_wave, speed_wave) = self.active_source_mut().update(dt_clamped);
         self.last_y = y_wave;
         self.last_speed = speed_wave;
-        
+
         // Layer 2: Apply shaping (with smooth transitions)
         let (shaped_y, shaped_speed) = self.shaper.shape(y_wave, speed_wave, dt_clamped);
-        
+
         // Layer 3: Convert to position
         let (position, speed) = self.position_gen.generate(shaped_y, shaped_speed);
 
         self.current_window_updates += 1;
         if now.duration_since(self.last_window_time).as_micros() as f32 / 1_000_000.0 >= 1.0 {
             let n = self.current_window_updates as f32;
-            let avg_dt_ms = if n > 0.0 { self.current_sum_dt_ms / n } else { 0.0 };
-            let var = if n > 0.0 { (self.current_sum_sq_dt_ms / n) - (avg_dt_ms * avg_dt_ms) } else { 0.0 };
+            let avg_dt_ms = if n > 0.0 {
+                self.current_sum_dt_ms / n
+            } else {
+                0.0
+            };
+            let var = if n > 0.0 {
+                (self.current_sum_sq_dt_ms / n) - (avg_dt_ms * avg_dt_ms)
+            } else {
+                0.0
+            };
             let mdev_dt_ms = if var > 0.0 { libm::sqrtf(var) } else { 0.0 };
 
             self.last_loop_stats = LoopStats {
@@ -1378,10 +1435,10 @@ pub struct MotorControllerConfig {
     pub version: u32,
     pub bpm: f32,
     pub depth: f32,
-    pub depth_top: bool,     // true = top [0, depth], false = bottom [1-depth, 1]
-    pub reversed: bool,      // reverse waveform direction
-    pub wave_func: String,   // "sine", "thrust", or "spline"
-    pub sharpness: f32,      // For thrust waveform: rise duration (0.01-0.99), higher = longer rise
+    pub depth_top: bool,   // true = top [0, depth], false = bottom [1-depth, 1]
+    pub reversed: bool,    // reverse waveform direction
+    pub wave_func: String, // "sine", "thrust", or "spline"
+    pub sharpness: f32,    // For thrust waveform: rise duration (0.01-0.99), higher = longer rise
     #[serde(default)]
     pub spline_points: Vec<f32>,
     pub paused: bool,
@@ -1416,17 +1473,17 @@ pub struct ModbusStats {
 #[derive(Serialize, Clone)]
 pub struct StateResponse {
     pub config: MotorControllerConfig,
-    pub t: f32,              // Time offset in seconds
-    pub x: f32,              // Phase [0, 1]
-    pub y: f32,              // Waveform output [0, 1]
-    pub shaped_y: f32,       // After shaping [0, 1]
-    pub position: f32,       // Motor position
-    pub speed: f32,          // Motor speed
-    pub stream: StreamStatus, // Streaming source status
-    pub update_history: Vec<u32>,   // Historical motor position update count per second (10s, 1s window)
+    pub t: f32,                     // Time offset in seconds
+    pub x: f32,                     // Phase [0, 1]
+    pub y: f32,                     // Waveform output [0, 1]
+    pub shaped_y: f32,              // After shaping [0, 1]
+    pub position: f32,              // Motor position
+    pub speed: f32,                 // Motor speed
+    pub stream: StreamStatus,       // Streaming source status
+    pub update_history: Vec<u32>, // Historical motor position update count per second (10s, 1s window)
     pub position_history: Vec<f32>, // Historical motor position sampled per second (10s, 1s window)
-    pub pos_min: f32,        // Minimum motor position limit
-    pub pos_max: f32,        // Maximum motor position limit
+    pub pos_min: f32,             // Minimum motor position limit
+    pub pos_max: f32,             // Maximum motor position limit
     pub ups: u32,
     pub dt_min_ms: f32,
     pub dt_max_ms: f32,

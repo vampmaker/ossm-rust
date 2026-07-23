@@ -10,9 +10,9 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::timer::timg::TimerGroup;
 #[cfg(feature = "esp32c6")]
 use esp_hal::interrupt::Priority;
+use esp_hal::timer::timg::TimerGroup;
 #[cfg(feature = "esp32c6")]
 use esp_rtos::embassy::InterruptExecutor;
 use static_cell::StaticCell;
@@ -60,14 +60,7 @@ async fn main(spawner: Spawner) -> ! {
     #[cfg(feature = "esp32s3")]
     let uart_pins = console::UartPins::new(peripherals.GPIO43, peripherals.GPIO44);
 
-    spawner.spawn(
-        console_task(
-            peripherals.USB_DEVICE,
-            peripherals.UART0,
-            uart_pins,
-        )
-        .unwrap(),
-    );
+    spawner.spawn(console_task(peripherals.USB_DEVICE, peripherals.UART0, uart_pins).unwrap());
 
     let init = context::init_app_context(peripherals.FLASH);
     let app_context = init.ctx;
@@ -93,16 +86,15 @@ async fn main(spawner: Spawner) -> ! {
             exec.start(Priority::Priority3)
         };
         if rtu_relay {
-            motor_spawner
-                .spawn(
-                    relay_task(
-                        peripherals.UART1,
-                        peripherals.UHCI0,
-                        peripherals.DMA_CH0,
-                        pin_config,
-                    )
-                    .unwrap(),
-                );
+            motor_spawner.spawn(
+                relay_task(
+                    peripherals.UART1,
+                    peripherals.UHCI0,
+                    peripherals.DMA_CH0,
+                    pin_config,
+                )
+                .unwrap(),
+            );
             // Keep the unused motion consumer alive for AppContext lifetime.
             #[allow(clippy::forget_non_drop)]
             core::mem::forget(motion_consumer);

@@ -6,9 +6,9 @@ use alloc::string::String;
 use serde::Serialize;
 
 use bt_hci::controller::ExternalController;
+use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant, Timer};
 use esp_radio::ble::controller::BleConnector;
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
@@ -208,18 +208,19 @@ pub async fn run_ble_server(
             ..
         } = stack.build();
 
-        let server = match OssmGattServer::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-            name: "OSSM",
-            appearance: &appearance::UNKNOWN,
-        })) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("GATT server init failed: {:?}, retrying in 2s...", e);
-                Timer::after(Duration::from_secs(2)).await;
-                bt_peripheral = unsafe { esp_hal::peripherals::BT::steal() };
-                continue;
-            }
-        };
+        let server =
+            match OssmGattServer::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+                name: "OSSM",
+                appearance: &appearance::UNKNOWN,
+            })) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("GATT server init failed: {:?}, retrying in 2s...", e);
+                    Timer::after(Duration::from_secs(2)).await;
+                    bt_peripheral = unsafe { esp_hal::peripherals::BT::steal() };
+                    continue;
+                }
+            };
 
         let config = app_context.storage.motor_config();
         let pin_config = app_context.storage.pin();
@@ -240,7 +241,10 @@ pub async fn run_ble_server(
         let _ = embassy_futures::select::select(
             async {
                 if let Err(e) = runner.run().await {
-                    log::warn!("BLE runner error: {:?}, restarting BLE stack (no chip reset)...", e);
+                    log::warn!(
+                        "BLE runner error: {:?}, restarting BLE stack (no chip reset)...",
+                        e
+                    );
                 } else {
                     log::warn!("BLE runner exited cleanly, restarting BLE stack...");
                 }
@@ -361,7 +365,14 @@ async fn serve_gatt<C: Controller>(
         let push_interval_ms = AtomicU32::new(100);
 
         select(
-            handle_gatt_events(&conn, server, app_context, &subscribed, &push_interval_ms, stack),
+            handle_gatt_events(
+                &conn,
+                server,
+                app_context,
+                &subscribed,
+                &push_interval_ms,
+                stack,
+            ),
             push_telemetry(&conn, server, app_context, &subscribed, &push_interval_ms),
         )
         .await;
@@ -444,7 +455,10 @@ async fn handle_gatt_events<C: Controller>(
                             {
                                 app_context.storage.set_pin(config.clone());
                                 if let Ok(json) = serde_json_core::to_string::<_, 512>(&config) {
-                                    let _ = server.set(&server.ossm.pin_config, &to_vec::<256>(json.as_bytes()));
+                                    let _ = server.set(
+                                        &server.ossm.pin_config,
+                                        &to_vec::<256>(json.as_bytes()),
+                                    );
                                 }
                             }
                         }
@@ -452,7 +466,8 @@ async fn handle_gatt_events<C: Controller>(
                         if let Ok(config) = serde_json::from_slice::<NetworkConfiguration>(&data) {
                             app_context.storage.set_net(config.clone());
                             if let Ok(json) = serde_json_core::to_string::<_, 512>(&config) {
-                                let _ = server.set(&server.ossm.net_config, &to_vec::<256>(json.as_bytes()));
+                                let _ = server
+                                    .set(&server.ossm.net_config, &to_vec::<256>(json.as_bytes()));
                             }
                         }
                     } else if handle == server.ossm.rpc.handle {
@@ -463,7 +478,10 @@ async fn handle_gatt_events<C: Controller>(
                                     let _ = chunked_notify_rpc(conn, server, json.as_bytes()).await;
                                 }
                                 RpcAction::Subscribe { interval_ms } => {
-                                    push_interval_ms.store(interval_ms.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+                                    push_interval_ms.store(
+                                        interval_ms.min(u32::MAX as u64) as u32,
+                                        Ordering::Relaxed,
+                                    );
                                     subscribed.store(true, Ordering::Relaxed);
                                     log::info!("BLE subscribe-state: interval={}ms", interval_ms);
                                     let ack = rpc::subscribe_ack(id, interval_ms);
@@ -504,8 +522,17 @@ async fn handle_gatt_events<C: Controller>(
             GattConnectionEvent::PhyUpdated { tx_phy, rx_phy } => {
                 log::info!("BLE PHY updated: tx={:?}, rx={:?}", tx_phy, rx_phy);
             }
-            GattConnectionEvent::ConnectionParamsUpdated { conn_interval, peripheral_latency, supervision_timeout } => {
-                log::info!("BLE conn params updated: interval={:?}, latency={}, timeout={:?}", conn_interval, peripheral_latency, supervision_timeout);
+            GattConnectionEvent::ConnectionParamsUpdated {
+                conn_interval,
+                peripheral_latency,
+                supervision_timeout,
+            } => {
+                log::info!(
+                    "BLE conn params updated: interval={:?}, latency={}, timeout={:?}",
+                    conn_interval,
+                    peripheral_latency,
+                    supervision_timeout
+                );
             }
             _ => {}
         }
@@ -549,7 +576,11 @@ async fn push_telemetry(
                 Err(e) => {
                     consecutive_errors += 1;
                     if consecutive_errors % 10 == 1 {
-                        log::warn!("BLE state notify failed ({}/10): {:?}", consecutive_errors, e);
+                        log::warn!(
+                            "BLE state notify failed ({}/10): {:?}",
+                            consecutive_errors,
+                            e
+                        );
                     }
                     Timer::after(Duration::from_millis(15)).await;
                 }

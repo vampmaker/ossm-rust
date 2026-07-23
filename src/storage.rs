@@ -2,7 +2,7 @@ use alloc::string::String;
 
 use esp_nvs::{Key, Nvs};
 use esp_storage::FlashStorage;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::error::{FirmwareError, Result};
 use crate::motion::MotorControllerConfig;
@@ -50,7 +50,8 @@ fn default_operating_mode() -> String {
 
 impl PinConfiguration {
     pub fn is_rtu_relay(&self) -> bool {
-        self.operating_mode.eq_ignore_ascii_case(OPERATING_MODE_RTU_RELAY)
+        self.operating_mode
+            .eq_ignore_ascii_case(OPERATING_MODE_RTU_RELAY)
     }
 
     pub fn normalize_operating_mode(&mut self) {

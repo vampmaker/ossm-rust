@@ -181,9 +181,7 @@ pub fn init_app_context(flash: esp_hal::peripherals::FLASH<'static>) -> AppConte
     static STORAGE_CMD: static_cell::StaticCell<StorageCmdChannel> = static_cell::StaticCell::new();
 
     let mut storage_manager = StorageManager::new(flash);
-    let pin = storage_manager
-        .get_pin_configuration()
-        .unwrap_or_default();
+    let pin = storage_manager.get_pin_configuration().unwrap_or_default();
     let net = storage_manager
         .get_network_configuration()
         .unwrap_or_default();
@@ -225,10 +223,7 @@ pub fn init_app_context(flash: esp_hal::peripherals::FLASH<'static>) -> AppConte
 
 /// Sole owner of `StorageManager`; persists cache updates to NVS.
 #[embassy_executor::task]
-pub async fn storage_task(
-    mut manager: StorageManager,
-    cmd: &'static StorageCmdChannel,
-) {
+pub async fn storage_task(mut manager: StorageManager, cmd: &'static StorageCmdChannel) {
     loop {
         match cmd.receive().await {
             StoragePersist::Pin(config) => {

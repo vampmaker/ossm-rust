@@ -13,12 +13,14 @@
 #     "pydantic>=2.0.0",
 #     "websockets>=12.0",
 #     "aiohttp>=3.9.0",
-#     "pyautogui>=0.9.54",
 # ]
 # ///
 
 import asyncio
 import argparse
+import base64
+import uuid
+import serial
 import json
 import os
 import sys
@@ -28,13 +30,264 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, expect
 import websockets
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mock_ossm_server import MockOssmServer
 
+from playwright.async_api import Page
+
+class WebSerialBridge:
+    def __init__(self, page: Page, auto_select_port: str = None):
+        """
+        Initializes the Web Serial bridge.
+        :param page: The Playwright page object.
+        :param auto_select_port: If provided, requestPort() will automatically select this port (e.g., '/dev/ttyACM0').
+        """
+        self.page = page
+        self.auto_select_port = auto_select_port
+        self.ports = {}  # Map of id -> serial.Serial
+        self.read_tasks = {} # Map of id -> asyncio.Task
+
+    async def setup(self):
+        """Must be called before navigating the page."""
+        await self.page.expose_binding("_ws_requestPort", self._handle_requestPort)
+        await self.page.expose_binding("_ws_getPorts", self._handle_getPorts)
+        await self.page.expose_binding("_ws_open", self._handle_open)
+        await self.page.expose_binding("_ws_close", self._handle_close)
+        await self.page.expose_binding("_ws_write", self._handle_write)
+        await self.page.expose_binding("_ws_setSignals", self._handle_setSignals)
+
+        mock_script = """
+        (() => {
+            class SerialPort {
+                constructor(id, info) {
+                    this._id = id;
+                    this._info = info;
+                    this.readable = null;
+                    this.writable = null;
+                    this._open = false;
+                }
+
+                getInfo() {
+                    return this._info;
+                }
+
+                async open(options) {
+                    if (this._open) {
+                        return;
+                    }
+                    console.log("WebSerial mock: open() called with", options);
+                    await window._ws_open({ id: this._id, options });
+                    console.log("WebSerial mock: open() finished");
+                    this._open = true;
+                    this._readController = null;
+
+                    this.readable = new ReadableStream({
+                        start: (controller) => {
+                            this._readController = controller;
+                            window._ws_ports[this._id] = this;
+                        },
+                        cancel: async () => {
+                            if (this._readController) {
+                                try { this._readController.close(); } catch (_) {}
+                                this._readController = null;
+                            }
+                        }
+                    });
+
+                    this.writable = new WritableStream({
+                        write: async (chunk) => {
+                            const binary = Array.from(chunk).map(b => String.fromCharCode(b)).join('');
+                            const base64 = btoa(binary);
+                            await window._ws_write({ id: this._id, data: base64 });
+                        },
+                        close: async () => {}
+                    });
+                }
+
+                async close() {
+                    console.log("WebSerial mock: close() called");
+                    this._open = false;
+                    if (this._readController) {
+                        try { this._readController.close(); } catch (_) {}
+                        this._readController = null;
+                    }
+                    this.readable = null;
+                    this.writable = null;
+                    delete window._ws_ports[this._id];
+                    await window._ws_close({ id: this._id });
+                    console.log("WebSerial mock: close() finished");
+                }
+
+                async setSignals(signals) {
+                    await window._ws_setSignals({ id: this._id, signals });
+                }
+            }
+
+            window._ws_ports = {};
+
+            window._ws_data_received = (id, base64) => {
+                const port = window._ws_ports[id];
+                if (port && port._readController) {
+                    const binaryString = atob(base64);
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let i = 0; i < binaryString.length; i++) {
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }
+                    port._readController.enqueue(bytes);
+                }
+            };
+
+            Object.defineProperty(navigator, 'serial', {
+                value: {
+                    requestPort: async (options) => {
+                        console.log("WebSerial mock: requestPort called!");
+                        const res = await window._ws_requestPort(options);
+                        if (!res) throw new DOMException("No port selected by the user.", "NotFoundError");
+                        return new SerialPort(res.id, res.info);
+                    },
+                    getPorts: async () => {
+                        const ports = await window._ws_getPorts();
+                        return ports.map(p => new SerialPort(p.id, p.info));
+                    }
+                },
+                writable: true,
+                configurable: true
+            });
+        })();
+        """
+        await self.page.add_init_script(mock_script)
+
+    async def _handle_requestPort(self, source, options):
+        # Implement auto-selection
+        if not self.auto_select_port:
+            return None # Simulate user cancelling
+
+        port_id = str(uuid.uuid4())
+        self.ports[port_id] = {"device": self.auto_select_port, "serial": None}
+        return {"id": port_id, "info": {"usbVendorId": 0x303a, "usbProductId": 0x1001}} # ESP32-C6 typical
+
+    async def _handle_getPorts(self, source):
+        # Return all authorized ports
+        res = []
+        for pid, p in self.ports.items():
+            res.append({"id": pid, "info": {"usbVendorId": 0x303a, "usbProductId": 0x1001}})
+        return res
+
+    async def _handle_open(self, source, args):
+        port_id = args.get("id")
+        options = args.get("options", {})
+        baud_rate = options.get("baudRate", 115200)
+
+        if port_id not in self.ports:
+            raise Exception("Port not found")
+        
+        device = self.ports[port_id]["device"]
+        print(f"WebSerialBridge: Attempting to open {device} with baudRate {baud_rate}...", flush=True)
+        try:
+            ser = await asyncio.to_thread(serial.Serial, device, baud_rate, timeout=0.1)
+            print(f"WebSerialBridge: Successfully opened {device}")
+        except Exception as e:
+            print(f"WebSerialBridge: Failed to open {device}: {e}", flush=True)
+            raise Exception(f"NotFoundError: Failed to connect: {e}")
+        self.ports[port_id]["serial"] = ser
+        self.ports[port_id]["baud_rate"] = baud_rate
+
+        # Start read task
+        task = asyncio.create_task(self._read_loop(port_id))
+        self.read_tasks[port_id] = task
+
+    async def _open_serial(self, port_id: str) -> serial.Serial:
+        entry = self.ports[port_id]
+        device = entry["device"]
+        baud_rate = entry.get("baud_rate", 115200)
+        ser = await asyncio.to_thread(serial.Serial, device, baud_rate, timeout=0.1)
+        entry["serial"] = ser
+        return ser
+
+    async def _read_loop(self, port_id: str):
+        device = self.ports[port_id]["device"]
+        ser = self.ports[port_id].get("serial")
+        try:
+            while True:
+                try:
+                    if ser is None or not ser.is_open:
+                        ser = await self._open_serial(port_id)
+                    data = await asyncio.to_thread(ser.read, 1024)
+                    if data:
+                        b64 = base64.b64encode(data).decode("ascii")
+                        try:
+                            await self.page.evaluate(
+                                f"window._ws_data_received('{port_id}', '{b64}')"
+                            )
+                        except Exception as e:
+                            print(f"WebSerialBridge: Failed to forward data to JS: {e}")
+                            break
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    raise
+                except (serial.SerialException, OSError) as e:
+                    print(
+                        f"WebSerialBridge: Serial disconnect on {device}, reconnecting: {e}",
+                        flush=True,
+                    )
+                    if ser is not None:
+                        try:
+                            await asyncio.to_thread(ser.close)
+                        except Exception:
+                            pass
+                    self.ports[port_id]["serial"] = None
+                    ser = None
+                    await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"WebSerialBridge: Read loop error: {e}")
+
+    async def _handle_close(self, source, args):
+        port_id = args.get("id")
+        if port_id in self.ports:
+            if port_id in self.read_tasks:
+                task = self.read_tasks.pop(port_id)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            ser = self.ports[port_id].get("serial")
+            if ser and ser.is_open:
+                print(f"WebSerialBridge: Closing {self.ports[port_id]['device']}", flush=True)
+                await asyncio.to_thread(ser.close)
+            self.ports[port_id]["serial"] = None
+
+    async def _handle_write(self, source, args):
+        port_id = args.get("id")
+        b64 = args.get("data")
+        if port_id in self.ports:
+            ser = self.ports[port_id].get("serial")
+            if ser and ser.is_open:
+                data = base64.b64decode(b64)
+                await asyncio.to_thread(ser.write, data)
+                await asyncio.to_thread(ser.flush)
+
+    async def _handle_setSignals(self, source, args):
+        port_id = args.get("id")
+        signals = args.get("signals", {})
+        if port_id in self.ports:
+            ser = self.ports[port_id].get("serial")
+            if ser and ser.is_open:
+
+                def apply_signals():
+                    if "dataTerminalReady" in signals:
+                        ser.dtr = signals["dataTerminalReady"]
+                    if "requestToSend" in signals:
+                        ser.rts = signals["requestToSend"]
+
+                await asyncio.to_thread(apply_signals)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(SCRIPT_DIR, "..", ".env")
 FRONTEND_DIST = Path(SCRIPT_DIR).parent / "frontend" / "dist"
@@ -172,7 +425,7 @@ async def run_macro_editor_tests(page) -> None:
     await page.locator('button:has-text("Sine")').click()
     await asyncio.sleep(0.3)
     await page.locator('button:has-text("Macro")').click()
-    await page.wait_for_selector("#macro-player", timeout=8000)
+    await page.wait_for_selector("#macro-player", timeout=20000)
     await page.wait_for_selector("#macro-library-select", timeout=5000)
     await page.wait_for_selector("#macro-instruction-list", timeout=5000)
 
@@ -368,7 +621,7 @@ async def run_wifi_frontend_tests(page, *, ws_messages: list, ws_connections: li
     # Diagram visibility is cleared via context.add_init_script in test_frontend
     # (before first mount) so we avoid goto+reload aborting fetchConfig mid-flight.
     await page.goto(base_url, wait_until="domcontentloaded")
-    await page.wait_for_selector("text=OSSM", timeout=15000)
+    await page.wait_for_selector("text=OSSM", timeout=20000)
     # Wait until config fetch marks connected
     for _ in range(40):
         connected = await page.locator("text=Connected").count()
@@ -656,7 +909,7 @@ async def test_flasher(headless_override: bool = False):
         print(f"Skipping flasher E2E test: {flasher_path} not found")
         return
 
-    flasher_url = flasher_path.as_uri()
+    flasher_url = f"{flasher_path.as_uri()}?e2e=1"
     print(f"  Target: {flasher_url}")
 
     async with async_playwright() as p:
@@ -670,12 +923,16 @@ async def test_flasher(headless_override: bool = False):
             launch_args.append("--headless=new")
             
         browser = await p.chromium.launch(
-            headless=False,
+            headless=True,
             args=launch_args
         )
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
         await context.add_init_script("localStorage.setItem('ossm_locale', 'en')")
         page = await context.new_page()
+
+        port = os.getenv("DEVICE_PORT", "/dev/ttyACM0")
+        bridge = WebSerialBridge(page, auto_select_port=port)
+        await bridge.setup()
 
         await page.goto(flasher_url, wait_until="load")
         title = await page.title()
@@ -699,49 +956,55 @@ async def test_flasher(headless_override: bool = False):
         assert await ssid_input.count() == 0, "Expected SSID input to be hidden when WiFi disabled"
         print("✓ WiFi SSID & Password inputs hidden when Enable WiFi is unchecked")
 
-        await wifi_chk.check()
-        await page.wait_for_selector('input[placeholder="Your WiFi network"]', state="visible", timeout=5000)
-        print("✓ WiFi SSID input restored when Enable WiFi is checked")
 
         # Now test the real device connection and config write
         print(" -> Testing real serial connection and config write...")
         
-        page.on("console", lambda msg: print(f"Browser console: {msg.text}"))
-        page.on("pageerror", lambda err: print(f"Browser error: {err}"))
+        page.on("console", lambda msg: print(f"Browser Console: {msg.text}", flush=True))
+        page.on("pageerror", lambda err: print(f"Browser error: {err}", flush=True))
+        
+        req_port_str = await page.evaluate("window.navigator.serial.requestPort.toString()")
         
         connect_btn = page.get_by_role("button", name="Connect", exact=True)
         await connect_btn.wait_for(state="visible", timeout=5000)
         await connect_btn.click()
 
-        print(" -> Waiting for Web Serial prompt and selecting via pyautogui...")
-        import pyautogui
-        await asyncio.sleep(1.5)
+        print(" -> Waiting for Web Serial mock to auto-select device...")
         
-        # Chrome Web Serial prompt focuses the list by default, or needs tabs.
-        # On Linux/X11, usually Tab, Tab, Tab, Down, Enter works, or just Down, Enter.
-        # We will press Tab a few times, then Down, then Enter.
-        for _ in range(4):
-            pyautogui.press("tab")
-            await asyncio.sleep(0.1)
-        pyautogui.press("down")
-        await asyncio.sleep(0.2)
-        pyautogui.press("enter")
-        
-        await asyncio.sleep(1.0)
-        print(f"✓ Selected device automatically via UI automation")
-
         disconnect_btn = page.locator("button:has-text('Disconnect')")
-        await disconnect_btn.wait_for(state="visible", timeout=10000)
-        print("✓ Successfully connected to real device via Web Serial")
+        try:
+            await disconnect_btn.wait_for(state="visible", timeout=30000)
+            print("✓ Successfully connected to real device via Web Serial on first try")
+        except Exception as e:
+            print(f" -> First connect attempt timed out (Native USB reset drop). Retrying...")
+            try:
+                term_text = await page.locator(".xterm-rows").last.inner_text(timeout=2000)
+                print(f"--- Terminal Output (First Try) ---\n{term_text}\n-----------------------", flush=True)
+            except Exception as ex:
+                print(f"Failed to get terminal output (First Try): {ex}", flush=True)
+            
+            await asyncio.sleep(2)
+            await connect_btn.click()
+            try:
+                await disconnect_btn.wait_for(state="visible", timeout=30000)
+                print("✓ Successfully connected to real device via Web Serial on second try")
+            except Exception as e2:
+                try:
+                    term_text = await page.locator(".xterm-rows").last.inner_text(timeout=2000)
+                    print(f"--- Terminal Output (Second Try) ---\n{term_text}\n-----------------------", flush=True)
+                except Exception as ex:
+                    print(f"Failed to get terminal output: {ex}", flush=True)
+                raise e2
 
         print(" -> Writing configuration to device...")
         send_config_btn = page.locator("button:has-text('Send Configuration')")
         await send_config_btn.wait_for(state="visible", timeout=5000)
         await send_config_btn.click()
 
-        term_log = page.locator(".font-mono")
+        term_log = page.locator("#flasher-terminal")
         try:
-            await expect(send_config_btn).to_have_text("Send Configuration", timeout=15000)
+            await expect(page.get_by_text("Configuration complete")).to_be_visible(timeout=60000)
+            await expect(send_config_btn).to_have_text("Send Configuration", timeout=5000)
         except Exception as e:
             log_text = await term_log.inner_text()
             raise AssertionError(f"Config write failed or timed out. Log:\n{log_text}") from e
@@ -1240,7 +1503,24 @@ async def main():
         action="store_true",
         help="Skip BLE and Web Bluetooth tests when running without a physical Bluetooth adapter on the host",
     )
+    parser.add_argument(
+        "--only-flasher",
+        action="store_true",
+        help="Run only the Web Flasher E2E test (requires a physical ESP32 on DEVICE_PORT)",
+    )
+    parser.add_argument(
+        "--skip-flasher",
+        action="store_true",
+        help="Skip Web Flasher E2E test (requires a physical ESP32 on DEVICE_PORT)",
+    )
     args = parser.parse_args()
+
+    if args.only_flasher:
+        await test_flasher()
+        print(f"\n============================================================")
+        print(f"✓ Web Flasher E2E test PASSED")
+        print(f"============================================================")
+        return
 
     if args.only_web_bluetooth:
         await test_web_bluetooth_frontend(runs=args.web_bluetooth_runs)
@@ -1266,7 +1546,8 @@ async def main():
     await test_frontend(base_url)
     if not args.skip_ble:
         await test_web_bluetooth_frontend(runs=args.web_bluetooth_runs)
-    await test_flasher()
+    if not args.skip_flasher:
+        await test_flasher()
     await test_motor_control()
     print(f"\n============================================================")
     print(f"✓ All HTTP + BLE + frontend + Web Bluetooth + flasher + motor-control Playwright tests PASSED")

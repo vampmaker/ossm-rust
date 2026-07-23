@@ -126,15 +126,15 @@ async def main_async():
 
     print(f"\n\033[33m--- Sending Device Configurations (SSID: {args.ssid}) ---\033[0m")
     commands = [
-        f"set-wifi-ssid {args.ssid}",
-        f"set-wifi-password {args.password}",
-        f"set-pin-modbus-tx {args.tx}",
-        f"set-pin-modbus-rx {args.rx}",
-        f"set-pin-modbus-de-re {args.dere}",
-        "set-modbus-timeout-ms 0",
-        "set-modbus-scan-delay-us 0",
-        'set-motor-config {"bpm":36.0,"depth":1.0,"depth_top":false,"reversed":false,"wave_func":"sine","sharpness":0.3,"spline_points":[0.0,1.0],"paused":false,"paused_position":0.0,"streaming":false}',
-        "get-pin-configuration",
+        f"set net.ssid {args.ssid}",
+        f"set net.password {args.password}",
+        f"set pin.modbus_tx {args.tx}",
+        f"set pin.modbus_rx {args.rx}",
+        f"set pin.modbus_de_re {args.dere}",
+        "set pin.modbus_timeout_ms 0",
+        "set pin.modbus_scan_delay_us 0",
+        'set motor {"bpm":36.0,"depth":1.0,"depth_top":false,"reversed":false,"wave_func":"sine","sharpness":0.3,"spline_points":[0.0,1.0],"paused":false,"paused_position":0.0,"streaming":false}',
+        "get pin",
     ]
 
     for cmd in commands:

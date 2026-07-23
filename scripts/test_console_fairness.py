@@ -52,7 +52,7 @@ def try_serial_ack(mode: str, nbytes: int, attempts: int = 12) -> str | None:
     needle = f"modbus_inject_junk: {mode} {nbytes}"
     for _ in range(attempts):
         try:
-            log = serial_query("get-modbus-inject-junk", timeout_s=6.0)
+            log = serial_query("get inject", timeout_s=6.0)
         except serial.SerialTimeoutException:
             continue
         if needle in log:

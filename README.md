@@ -68,7 +68,7 @@ Next, connect your ESP32 development board to the MAX3485 module and the motor's
 | GPIO 20 | --> | MAX3485 Module (DE / RE) | Controls data transmission direction |
 
 > [!NOTE]
-> **About GPIO pins**: GPIO 18, 19, and 20 are the default Modbus pins in firmware NVS (same defaults on both chips). On ESP32-S3 boards, pins 19 and 20 are often reserved for USB Serial/JTAG — wire Modbus TX/RX/DE-RE to free GPIOs and set them via the web UI, serial CLI (`set-pin-modbus-*`), or the flasher config panel. There is **no automatic GPIO pin detection**; only Modbus baud rate / slave ID scanning runs at boot when the motor does not respond at `115200`.
+> **About GPIO pins**: GPIO 18, 19, and 20 are the default Modbus pins in firmware NVS (same defaults on both chips). On ESP32-S3 boards, pins 19 and 20 are often reserved for USB Serial/JTAG — wire Modbus TX/RX/DE-RE to free GPIOs and set them via the web UI, serial CLI (`set pin.modbus_tx`, etc.), or the flasher config panel. There is **no automatic GPIO pin detection**; only Modbus baud rate / slave ID scanning runs at boot when the motor does not respond at `115200`.
 
 ### Step 3: Powering the ESP32 Board
 
@@ -160,7 +160,7 @@ Stay on the same `flasher.html` page after flashing. Fill in **Device Configurat
 ### Send Configuration
 
 1.  Keep USB connected. Status should be **Flash complete**, **Connected to …**, or **Configuration complete** (those states enable **Send Configuration**). If you previously **Disconnect**ed, click **Connect** again first.
-2.  Click **Send Configuration**. The flasher resets the device, waits for boot, then sends UART CLI commands (`set-wifi-*`, `set-pin-modbus-*`, `set-modbus-*`, `set-ble-enabled`, then `reset`) and waits for each ACK in **Console**.
+2.  Click **Send Configuration**. The flasher resets the device, waits for boot, then sends UART CLI commands (`set net.*`, `set pin.*`, then `reset`) and waits for each ACK in **Console**.
 3.  After a successful send, it automatically starts **Serial** monitoring. Look for WiFi association and a line like `http://<hostname>.local` / an assigned IP. **Copy the IP** (or use `http://ossm.local` if mDNS works on your network) to open the control UI later.
 4.  Use **Stop** to pause monitoring, **Monitor** to attach again, or **Reset** to pulse the chip without sending config. **Disconnect** releases the Web Serial port.
 
@@ -190,35 +190,55 @@ You can also drive the device over USB serial (115200 baud, `\r\n`). In `flasher
 
 The firmware `console` task owns USB Serial/JTAG and UART0. Log output (`log::*` / `MODBUS_DBG`) and CLI echo/replies share the wire but use **separate paths**: a priority **`CLI_OUT_CH`** queue and dedicated USB TX ring for CLI bytes, **RX-first** polling, and batched log drain so host serial stays responsive under diagnostic log floods. Non-debug motor `ups` remains ~320 Hz on ESP32-C6; `modbus_debug` adds USB log volume but steady-state `ups` is typically only a few percent lower once homing settles.
 
+Configuration uses nmcli-style **`get`** / **`set`** over dotted paths. Type **`paths`** on-device (or `help get` / `help set`) for the full catalog.
+
 ```
-help                           - Show this help message
+get <path>                     - Get config section JSON or scalar value
+set <path> <value>             - Set config (quote strings with spaces)
+paths                          - Print full path/value catalog on device
+
+# Sections (full JSON)
+get pin | get net | get motor
+
+# Examples
+set net.ssid "MyNetwork"
+set net.password secret
+set net.wifi_enabled true
+set pin.modbus_tx 2
+set pin.modbus_debug false
+set motor.paused true
+set motor {"bpm":36,"depth":1.0,"wave_func":"sine","paused":true}
+
+# Config path catalog
+pin.modbus_tx / modbus_rx / modbus_de_re          GPIO 0..48
+pin.modbus_timeout_ms                             0..1000 (0 = default ~10 ms)
+pin.modbus_rx_timeout_us                          0..200000 (0 = auto)
+pin.modbus_scan_delay_us                          0..200000 (0 = t3.5)
+pin.modbus_inter_frame_delay_us                   0..200000 (0 = auto)
+pin.ble_enabled / pin.modbus_debug                true|false (debug: reboot)
+pin.operating_mode                                servo|rtu_relay (reboot)
+net.wifi_enabled / net.dhcp_enabled               true|false
+net.ssid / net.password / net.hostname          string
+net.static_ip / static_mask / static_gateway / static_dns   IPv4
+motor.bpm                                         > 0
+motor.depth                                       0.01..1
+motor.depth_top / reversed / paused / streaming   true|false
+motor.wave_func                                   sine|thrust|spline
+motor.sharpness                                   0.01..0.99
+motor.paused_position                             0..1
+motor.spline_points                               space-separated floats
+motor (bulk)                                      full MotorControllerConfig JSON
+inject                                            get inject | set inject <off|leading|trailing|both> <nbytes 0..64>
+
+# Actions (not config)
 reset                          - Soft reset the MCU
-set-wifi-ssid <ssid>           - Set WiFi SSID
-set-wifi-password <password>   - Set WiFi password
-get-pin-configuration          - Get pin configuration in JSON format
-set-pin-modbus-tx <pin>        - Set Modbus TX pin
-set-pin-modbus-rx <pin>        - Set Modbus RX pin
-set-pin-modbus-de-re <pin>     - Set Modbus DE/RE pin
-get-motor-config               - Get motor config in JSON format
-set-motor-config <json>        - Set motor config from a JSON string
-pause                          - Pause the motor
-start                          - Start the motor
-set-bpm <bpm>                  - Set motor BPM
-set-wave <sine|thrust|spline>  - Set motor waveform
-set-paused-position <position> - Set motor position when paused (0.0 to 1.0)
-set-depth <depth>              - Set motor stroke depth (0.0 to 1.0)
-set-depth-top <true|false>     - Set depth direction
-set-sharpness <sharpness>      - Set sharpness for thrust wave (0.01 to 0.99)
-set-spline-points <p1> <p2>... - Set points for spline wave (0.0 to 1.0)
-set-modbus-timeout-ms <val>    - Set Modbus per-read timeout in ms (0 = use default for baud rate)
-get-modbus-timeout-ms          - Get Modbus per-read timeout in ms
-set-modbus-scan-delay-us <val> - Set Modbus scan inter-probe delay in us (0 = use Modbus t3.5 only)
-get-modbus-scan-delay-us       - Get Modbus scan inter-probe delay in us
-set-modbus-debug <true|false>  - Enable Modbus RX diagnostics (reboot required)
-get-modbus-debug               - Get modbus_debug flag
-set-modbus-inject-junk <mode> <nbytes> - RAM-only capture fault injection (modbus_debug only)
-get-modbus-inject-junk         - Get inject mode/nbytes
+get-state / get-status         - Telemetry JSON
+reset-timestamp                - Reset motion stream time
+set-waypoints <json>           - Replace waypoint buffer
+append-waypoints <json>        - Append waypoints
 ```
+
+Set ACKs log as `{path} set to {value}` (e.g. `pin.modbus_tx set to 2`). Scalar gets log as `{path}: {value}`.
 
 ### Automated Device Tests (Developers)
 
@@ -463,7 +483,7 @@ A **macro** is a shareable JSON sequence of timestamped control instructions (`s
 *   `modbus_scan_delay_us` (number): Modbus scan inter-probe delay in microseconds (`0` = use Modbus t3.5 timing only, up to `200000`).
 *   `modbus_inter_frame_delay_us` (number): Modbus inter-frame quiet interval ($t_{3.5}$) in microseconds (`0` = auto based on baud rate: 350µs @ 115200 baud, enabling <3ms total end-to-end request-response cycle time for >300 Hz position updates).
 *   `ble_enabled` (boolean): Enable Bluetooth Low Energy GATT server.
-*   `modbus_debug` (boolean): Diagnostic Modbus RX mode — **5 ms** RX deadline (same **256 B** UHCI DMA buffers as production), classifies each reply (`empty` / `short` / `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`), and prints `MODBUS_DBG` TX/RX hex lines on the USB console. **Restart required.** Increases USB log volume; steady-state motor `ups` is typically only a few percent below non-debug (~310 vs ~320 Hz on ESP32-C6). Serial CLI stays responsive under the flood via console **TX/RX fairness** (`CLI_OUT_CH`, separate CLI/log USB rings). Verify with `./scripts/test_console_fairness.py`; disable after diagnosis. Also via CLI `set-modbus-debug`, flasher, or `ossm.py pins --modbus-debug`.
+*   `modbus_debug` (boolean): Diagnostic Modbus RX mode — **5 ms** RX deadline (same **256 B** UHCI DMA buffers as production), classifies each reply (`empty` / `short` / `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`), and prints `MODBUS_DBG` TX/RX hex lines on the USB console. **Restart required.** Increases USB log volume; steady-state motor `ups` is typically only a few percent below non-debug (~310 vs ~320 Hz on ESP32-C6). Serial CLI stays responsive under the flood via console **TX/RX fairness** (`CLI_OUT_CH`, separate CLI/log USB rings). Verify with `./scripts/test_console_fairness.py`; disable after diagnosis. Also via CLI `set pin.modbus_debug`, flasher, or `ossm.py pins --modbus-debug`.
 *   `operating_mode` (string): `"servo"` (default OSSM motion controller) or `"rtu_relay"` (Modbus RTU bridge). **Restart required.**
 
 #### `POST /pin-config`
@@ -475,7 +495,7 @@ A **macro** is a shareable JSON sequence of timestamped control instructions (`s
 
 ### RTU Relay Mode
 
-When `operating_mode` is `"rtu_relay"` (Settings UI, `POST /pin-config`, or CLI `set-operating-mode rtu_relay`, then restart), the firmware does not run the motor controller. Instead it bridges RS-485 Modbus RTU:
+When `operating_mode` is `"rtu_relay"` (Settings UI, `POST /pin-config`, or CLI `set pin.operating_mode rtu_relay`, then restart), the firmware does not run the motor controller. Instead it bridges RS-485 Modbus RTU:
 
 * **Modbus TCP** on port **502** (standard MBAP)
 * **WebSocket** `ws://<device>/ws/modbus` — binary full RTU frames (with CRC)

@@ -68,7 +68,7 @@
 | GPIO 20 | --> | MAX3485 收发方向控制 (DE / RE) | 控制 RS-485 总线的收发方向转换 |
 
 > [!NOTE]
-> **关于 GPIO 引脚分配的说明**：固件 NVS 中默认的 Modbus 引脚为 GPIO 18 / 19 / 20（两款芯片默认值相同）。在 ESP32-S3 上，19 / 20 常被 USB Serial/JTAG 占用——请将 Modbus TX/RX/DE-RE 接到空闲 GPIO，并通过网页界面、串口命令（`set-pin-modbus-*`）或烧录器配置面板写入 NVS。固件**不会**自动探测 GPIO 接线；开机时仅在电机未以 `115200` 响应时扫描 Modbus 波特率 / 从站 ID。
+> **关于 GPIO 引脚分配的说明**：固件 NVS 中默认的 Modbus 引脚为 GPIO 18 / 19 / 20（两款芯片默认值相同）。在 ESP32-S3 上，19 / 20 常被 USB Serial/JTAG 占用——请将 Modbus TX/RX/DE-RE 接到空闲 GPIO，并通过网页界面、串口命令（`set pin.modbus_tx` 等）或烧录器配置面板写入 NVS。固件**不会**自动探测 GPIO 接线；开机时仅在电机未以 `115200` 响应时扫描 Modbus 波特率 / 从站 ID。
 
 ### 第三步：为 ESP32 开发板供电
 
@@ -150,7 +150,7 @@ cargo b-s3 --release    # 为 ESP32-S3 平台编译固件
 ### 发送配置
 
 1.  保持 USB 连接。状态应为 **Flash complete**、**Connected to …** 或 **Configuration complete**（这些状态才会启用 **Send Configuration**）。若曾点过 **Disconnect**，请先再点 **Connect**。
-2.  点击 **Send Configuration**。烧录器会复位设备、等待启动，再依次发送串口 CLI（`set-wifi-*`、`set-pin-modbus-*`、`set-modbus-*`、`set-ble-enabled`，最后 `reset`），并在 **Console** 中等待每条 ACK。
+2.  点击 **Send Configuration**。烧录器会复位设备、等待启动，再依次发送串口 CLI（`set net.*`、`set pin.*`，最后 `reset`），并在 **Console** 中等待每条 ACK。
 3.  配置成功后会自动进入 **Serial** 监视。请留意 WiFi 连接成功日志以及类似 `http://<hostname>.local` 或分配到的 IP。**请记下该 IP**（若本机 mDNS 可用也可访问 `http://ossm.local`），随后用浏览器打开控制面板。
 4.  **Stop** 可暂停监视，**Monitor** 可再次附着，**Reset** 仅复位芯片而不发送配置，**Disconnect** 释放 Web Serial 端口。
 
@@ -178,39 +178,61 @@ cargo b-s3 --release    # 为 ESP32-S3 平台编译固件
 
 ### 串口命令与调试
 
+### 串口命令
+
 也可通过 USB 串口（`115200` 波特，`\r\n`）控制设备。在 `flasher.html` 中请使用 **Serial** 面板（或 **Monitor**）进行交互式 CLI；**Console** 仅显示烧录 / 配置工具自身的日志。同一套命令也适用于任意串口终端。
 
 固件 `console` 任务独占 USB Serial/JTAG 与 UART0。日志输出（`log::*` / `MODBUS_DBG`）与 CLI 回显/应答共用物理链路，但走**独立路径**：优先 **`CLI_OUT_CH`** 队列、CLI 专用 USB TX 环形缓冲、**RX 优先**轮询与分批日志发送，使诊断日志洪泛时主机串口 CLI 仍可响应。非调试模式下电机 `ups` 在 ESP32-C6 上仍约 **320 Hz**；`modbus_debug` 会增加 USB 日志量，但 homing 稳定后 `ups` 通常仅比非调试低几个百分点。
 
+配置采用类似 nmcli 的 **`get`** / **`set`** 点分路径。设备上输入 **`paths`**（或 `help get` / `help set`）查看完整目录。
+
 ```
-help                           - 显示此帮助消息
-reset                          - 重启
-set-wifi-ssid <ssid>           - 设置 WiFi SSID
-set-wifi-password <password>   - 设置 WiFi 密码
-get-pin-configuration          - 以 JSON 格式获取引脚配置
-set-pin-modbus-tx <pin>        - 设置 Modbus TX 引脚
-set-pin-modbus-rx <pin>        - 设置 Modbus RX 引脚
-set-pin-modbus-de-re <pin>     - 设置 Modbus DE/RE 引脚
-get-motor-config               - 以 JSON 格式获取电机配置
-set-motor-config <json>        - 从 JSON 字符串设置电机配置
-pause                          - 暂停电机
-start                          - 启动电机
-set-bpm <bpm>                  - 设置电机 BPM
-set-wave <sine|thrust|spline>  - 设置电机波形
-set-paused-position <position> - 设置电机暂停时的位置（0.0 到 1.0）
-set-depth <depth>              - 设置电机行程深度（0.0 到 1.0）
-set-depth-top <true|false>     - 设置深度方向
-set-sharpness <sharpness>      - 设置推力波的锐度（0.01 到 0.99）
-set-spline-points <p1> <p2>... - 设置样条波的点（0.0 到 1.0）
-set-modbus-timeout-ms <val>    - 设置 Modbus 读超时时间毫秒（0 = 使用对应波特率默认值）
-get-modbus-timeout-ms          - 获取 Modbus 读超时时间毫秒
-set-modbus-scan-delay-us <val> - 设置 Modbus 扫描间隔微秒（0 = 仅使用 Modbus t3.5 时序）
-get-modbus-scan-delay-us       - 获取 Modbus 扫描间隔微秒
-set-modbus-debug <true|false>  - 启用 Modbus RX 诊断（需重启）
-get-modbus-debug               - 读取 modbus_debug 标志
-set-modbus-inject-junk <mode> <nbytes> - RAM 捕获故障注入（仅 modbus_debug 生效）
-get-modbus-inject-junk         - 读取注入模式/字节数
+get <path>                     - 获取配置节 JSON 或标量值
+set <path> <value>             - 设置配置（含空格的字符串请加引号）
+paths                          - 在设备上打印完整路径/取值目录
+
+# 配置节（完整 JSON）
+get pin | get net | get motor
+
+# 示例
+set net.ssid "MyNetwork"
+set net.password secret
+set net.wifi_enabled true
+set pin.modbus_tx 2
+set pin.modbus_debug false
+set motor.paused true
+set motor {"bpm":36,"depth":1.0,"wave_func":"sine","paused":true}
+
+# 配置路径目录
+pin.modbus_tx / modbus_rx / modbus_de_re          GPIO 0..48
+pin.modbus_timeout_ms                             0..1000（0 = 默认约 10 ms）
+pin.modbus_rx_timeout_us                          0..200000（0 = 自动）
+pin.modbus_scan_delay_us                          0..200000（0 = t3.5）
+pin.modbus_inter_frame_delay_us                   0..200000（0 = 自动）
+pin.ble_enabled / pin.modbus_debug                true|false（debug 需重启）
+pin.operating_mode                                servo|rtu_relay（需重启）
+net.wifi_enabled / net.dhcp_enabled               true|false
+net.ssid / net.password / net.hostname          字符串
+net.static_ip / static_mask / static_gateway / static_dns   IPv4
+motor.bpm                                         > 0
+motor.depth                                       0.01..1
+motor.depth_top / reversed / paused / streaming   true|false
+motor.wave_func                                   sine|thrust|spline
+motor.sharpness                                   0.01..0.99
+motor.paused_position                             0..1
+motor.spline_points                               空格分隔浮点数
+motor（批量）                                      完整 MotorControllerConfig JSON
+inject                                            get inject | set inject <off|leading|trailing|both> <nbytes 0..64>
+
+# 动作命令（非配置）
+reset                          - 软重启
+get-state / get-status         - 遥测 JSON
+reset-timestamp                - 重置运动流时间
+set-waypoints <json>           - 替换航点缓冲
+append-waypoints <json>        - 追加航点
 ```
+
+设置成功日志格式为 `{path} set to {value}`（如 `pin.modbus_tx set to 2`）。标量读取为 `{path}: {value}`。
 
 ### 自动化设备测试（开发者）
 
@@ -447,7 +469,7 @@ get-modbus-inject-junk         - 读取注入模式/字节数
 *   `modbus_scan_delay_us`（数字）：Modbus 自动扫描时的帧间检测延迟（微秒），`0` 表示仅采用 Modbus 规范标准的 t3.5 间隙时序（最高支持 `200000`）。
 *   `modbus_inter_frame_delay_us`（数字）：Modbus 正常通信时的帧间静默延迟（微秒，$t_{3.5}$），`0` 表示自动（115200 波特率默认为 `350µs`，确保完整的往返控制时延于 <3ms 以支撑 >300Hz 的电机控制刷新率）。
 *   `ble_enabled`（布尔）：是否启用 BLE GATT 服务。
-*   `modbus_debug`（布尔）：Modbus RX 诊断模式——**5 ms** 接收截止（与生产相同的 **256 B** UHCI DMA 缓冲），对每帧分类（`empty` / `short` / `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`），并在 USB 控制台打印 `MODBUS_DBG` TX/RX 十六进制。**需重启生效。** 会显著增加 USB 日志量；稳态电机 `ups` 通常仅比非调试低几个百分点（ESP32-C6 上约 310 vs 320 Hz）。控制台 **TX/RX 公平性**（`CLI_OUT_CH`、CLI/日志独立 USB 环形缓冲）使串口 CLI 在洪泛下仍可响应。可用 `./scripts/test_console_fairness.py` 验证；诊断后请关闭。也可通过 CLI `set-modbus-debug`、刷写器或 `ossm.py pins --modbus-debug` 设置。
+*   `modbus_debug`（布尔）：Modbus RX 诊断模式——**5 ms** 接收截止（与生产相同的 **256 B** UHCI DMA 缓冲），对每帧分类（`empty` / `short` / `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`），并在 USB 控制台打印 `MODBUS_DBG` TX/RX 十六进制。**需重启生效。** 会显著增加 USB 日志量；稳态电机 `ups` 通常仅比非调试低几个百分点（ESP32-C6 上约 310 vs 320 Hz）。控制台 **TX/RX 公平性**（`CLI_OUT_CH`、CLI/日志独立 USB 环形缓冲）使串口 CLI 在洪泛下仍可响应。可用 `./scripts/test_console_fairness.py` 验证；诊断后请关闭。也可通过 CLI `set pin.modbus_debug`、刷写器或 `ossm.py pins --modbus-debug` 设置。
 *   `operating_mode`（字符串）：`"servo"`（默认 OSSM 运动控制）或 `"rtu_relay"`（Modbus RTU 桥接）。**需重启生效。**
 
 #### `POST /pin-config`
@@ -459,7 +481,7 @@ get-modbus-inject-junk         - 读取注入模式/字节数
 
 ### RTU 中继模式
 
-当 `operating_mode` 为 `"rtu_relay"`（设置面板、`POST /pin-config` 或串口 CLI `set-operating-mode rtu_relay`，然后重启）时，固件不运行电机控制环，而是作为 RS-485 Modbus RTU 桥：
+当 `operating_mode` 为 `"rtu_relay"`（设置面板、`POST /pin-config` 或串口 CLI `set pin.operating_mode rtu_relay`，然后重启）时，固件不运行电机控制环，而是作为 RS-485 Modbus RTU 桥：
 
 * **Modbus TCP** 端口 **502**
 * **WebSocket** `ws://<设备>/ws/modbus`（二进制完整 RTU 帧含 CRC）

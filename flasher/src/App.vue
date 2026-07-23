@@ -288,7 +288,33 @@ async function closePortNoLock() {
 async function openPortNoLock(baudRate: number = 115200) {
   if (!serialPort) throw new Error(t('errors.noPort'))
   if (!isPortOpenNoLock()) {
-    await serialPort.open({ baudRate })
+    try {
+      await serialPort.open({ baudRate })
+    } catch (e: any) {
+      if (String(e).includes('NetworkError') || String(e).includes('lost') || String(e).includes('NotFoundError') || String(e).includes('disconnected') || String(e).includes('Failed to connect')) {
+        // Recover lost port (Native USB disconnect/reconnect)
+        termLog(`\x1b[90mPort lost. Attempting recovery...\x1b[0m`)
+        let recovered = false
+        for (let i = 0; i < 20; i++) {
+          await sleep(250)
+          const ports = await navigator.serial.getPorts()
+          if (ports.length > 0) {
+            setPort(ports[0] || null)
+            try {
+              await serialPort!.open({ baudRate })
+              recovered = true
+              termLog(`\x1b[32mPort recovered!\x1b[0m`)
+              break
+            } catch (openErr) {
+              // Port might not be fully ready yet
+            }
+          }
+        }
+        if (!recovered) throw e
+      } else {
+        throw e
+      }
+    }
   }
 }
 
@@ -312,7 +338,12 @@ async function leaveCurrentMode() {
 
 async function cleanupEsptool() {
   if (transport) {
-    try { await transport.disconnect() } catch { /* ignore */ }
+    try {
+      await Promise.race([
+        transport.disconnect(),
+        sleep(3000),
+      ])
+    } catch { /* ignore */ }
     transport = null
     esploader = null
   }
@@ -493,6 +524,10 @@ const espTerminal = {
   write(data: string) { serialXterm?.write(data) },
 }
 
+function isE2eSerialMode(): boolean {
+  return new URLSearchParams(window.location.search).get('e2e') === '1'
+}
+
 async function connect() {
   if (!webSerialSupported.value) return
   status.value = 'connecting'
@@ -501,6 +536,18 @@ async function connect() {
   try {
     const port = await navigator.serial.requestPort()
     setPort(port)
+    if (isE2eSerialMode()) {
+      termLog(`\x1b[33mE2E mode: opening serial for configuration (bootloader skipped).\x1b[0m`)
+      await withSerialLock(async () => {
+        await closePortNoLock()
+        await openPortNoLock(115200)
+      })
+      chipName.value = 'E2E'
+      serialMode.value = 'idle'
+      status.value = 'flash_done'
+      termLog(`\x1b[1;32mSerial port ready for configuration.\x1b[0m`)
+      return
+    }
     transport = new Transport(port, true)
     esploader = new ESPLoader({
       transport,
@@ -515,9 +562,17 @@ async function connect() {
     status.value = 'connected'
     termLog(`\x1b[1;32m${t('log.connected', { chip })}\x1b[0m`)
   } catch (err: any) {
-    status.value = 'error'
-    errorMessage.value = err?.message || String(err)
-    termLog(`\x1b[1;31m${t('log.connectionFailed', { error: errorMessage.value })}\x1b[0m`)
+    if (String(err).includes('NetworkError') || String(err).includes('lost') || String(err).includes('Timeout') || String(err).includes('Failed to connect')) {
+      termLog(`\x1b[33mFailed to enter bootloader mode (Native USB reset drop). Falling back to normal mode.\x1b[0m`)
+      await cleanupEsptool()
+      esploader = null
+      serialMode.value = 'idle'
+      status.value = 'connected'
+    } else {
+      status.value = 'error'
+      errorMessage.value = err?.message || String(err)
+      termLog(`\x1b[1;31m${t('log.connectionFailed', { error: errorMessage.value })}\x1b[0m`)
+    }
   }
 }
 
@@ -676,56 +731,56 @@ async function sendConfig() {
     // ACK substrings below are firmware protocol English — do not translate
     const commands: Array<{ cmd: string; ack: string[] }> = []
     commands.push({
-      cmd: `set-wifi-enabled ${wifiEnabled.value}`,
-      ack: ['wifi_enabled set to'],
+      cmd: `set net.wifi_enabled ${wifiEnabled.value}`,
+      ack: ['net.wifi_enabled set to'],
     })
     if (wifiEnabled.value && wifiSsid.value) {
       commands.push({
-        cmd: `set-wifi-ssid ${escapeCliArg(wifiSsid.value)}`,
-        ack: ['SSID saved:'],
+        cmd: `set net.ssid ${escapeCliArg(wifiSsid.value)}`,
+        ack: ['net.ssid set to'],
       })
     }
     if (wifiEnabled.value && wifiPassword.value) {
       commands.push({
-        cmd: `set-wifi-password ${escapeCliArg(wifiPassword.value)}`,
-        ack: ['Password saved:'],
+        cmd: `set net.password ${escapeCliArg(wifiPassword.value)}`,
+        ack: ['net.password set to'],
       })
     }
     commands.push({
-      cmd: `set-pin-modbus-tx ${pinModbusTx.value}`,
-      ack: ['Modbus TX pin set to'],
+      cmd: `set pin.modbus_tx ${pinModbusTx.value}`,
+      ack: ['pin.modbus_tx set to'],
     })
     commands.push({
-      cmd: `set-pin-modbus-rx ${pinModbusRx.value}`,
-      ack: ['Modbus RX pin set to'],
+      cmd: `set pin.modbus_rx ${pinModbusRx.value}`,
+      ack: ['pin.modbus_rx set to'],
     })
     commands.push({
-      cmd: `set-pin-modbus-de-re ${pinModbusDeRe.value}`,
-      ack: ['Modbus DE/RE pin set to'],
+      cmd: `set pin.modbus_de_re ${pinModbusDeRe.value}`,
+      ack: ['pin.modbus_de_re set to'],
     })
     commands.push({
-      cmd: `set-modbus-timeout-ms ${modbusTimeoutMs.value}`,
-      ack: ['modbus_timeout_ms set to'],
+      cmd: `set pin.modbus_timeout_ms ${modbusTimeoutMs.value}`,
+      ack: ['pin.modbus_timeout_ms set to'],
     })
     commands.push({
-      cmd: `set-modbus-rx-timeout-us ${modbusRxTimeoutUs.value}`,
-      ack: ['modbus_rx_timeout_us set to'],
+      cmd: `set pin.modbus_rx_timeout_us ${modbusRxTimeoutUs.value}`,
+      ack: ['pin.modbus_rx_timeout_us set to'],
     })
     commands.push({
-      cmd: `set-modbus-inter-frame-delay-us ${modbusInterFrameDelayUs.value}`,
-      ack: ['modbus_inter_frame_delay_us set to'],
+      cmd: `set pin.modbus_inter_frame_delay_us ${modbusInterFrameDelayUs.value}`,
+      ack: ['pin.modbus_inter_frame_delay_us set to'],
     })
     commands.push({
-      cmd: `set-modbus-scan-delay-us ${modbusScanDelayUs.value}`,
-      ack: ['modbus_scan_delay_us set to'],
+      cmd: `set pin.modbus_scan_delay_us ${modbusScanDelayUs.value}`,
+      ack: ['pin.modbus_scan_delay_us set to'],
     })
     commands.push({
-      cmd: `set-ble-enabled ${bleEnabled.value}`,
-      ack: ['ble_enabled set to'],
+      cmd: `set pin.ble_enabled ${bleEnabled.value}`,
+      ack: ['pin.ble_enabled set to'],
     })
     commands.push({
-      cmd: `set-modbus-debug ${modbusDebug.value}`,
-      ack: ['modbus_debug set to'],
+      cmd: `set pin.modbus_debug ${modbusDebug.value}`,
+      ack: ['pin.modbus_debug set to'],
     })
 
     const encoder = new TextEncoder()
@@ -1189,6 +1244,7 @@ function switchLocale(next: AppLocale) {
       <div>
         <h2 class="text-lg font-semibold border-b border-gray-200 pb-2 mb-2">{{ t('terminals.console') }}</h2>
         <div
+          id="flasher-terminal"
           ref="terminalEl"
           class="border border-gray-200 rounded-lg overflow-hidden h-72 shadow-inner"
         />

@@ -512,7 +512,7 @@ class DeviceBackend:
                     return res
                 except Exception:
                     pass
-            lines = await self._serial_command("get-motor-config")
+            lines = await self._serial_command("get motor")
             config = {}
             text = "\n".join(lines)
             if "{" in text and "}" in text:
@@ -574,7 +574,7 @@ class DeviceBackend:
         elif self.mode == "serial":
             payload = json.dumps(full_config, separators=(",", ":"))
             await self._serial_command(
-                f"set-motor-config {payload}", wait_response=False
+                f"set motor {payload}", wait_response=False
             )
             self._track_version(full_config)
             return full_config
@@ -633,7 +633,7 @@ class DeviceBackend:
             raw = await client.read_gatt_char(BleUUID.CHAR_PIN_CONFIG)
             return json.loads(raw.decode("utf-8"))
         elif self.mode == "serial":
-            lines = await self._serial_command("get-pin-configuration")
+            lines = await self._serial_command("get pin")
             text = "\n".join(lines)
             if "{" in text and "}" in text:
                 try:
@@ -658,52 +658,33 @@ class DeviceBackend:
             raw = await client.read_gatt_char(BleUUID.CHAR_PIN_CONFIG)
             return json.loads(raw.decode("utf-8"))
         elif self.mode == "serial":
-            if "modbus_tx" in pin_dict:
-                await self._serial_command(
-                    f"set-pin-modbus-tx {pin_dict['modbus_tx']}", wait_response=False
-                )
-            if "modbus_rx" in pin_dict:
-                await self._serial_command(
-                    f"set-pin-modbus-rx {pin_dict['modbus_rx']}", wait_response=False
-                )
-            if "modbus_de_re" in pin_dict:
-                await self._serial_command(
-                    f"set-pin-modbus-de-re {pin_dict['modbus_de_re']}",
-                    wait_response=False,
-                )
-            if "modbus_timeout_ms" in pin_dict:
-                await self._serial_command(
-                    f"set-modbus-timeout-ms {pin_dict['modbus_timeout_ms']}",
-                    wait_response=False,
-                )
-            if "modbus_rx_timeout_us" in pin_dict:
-                await self._serial_command(
-                    f"set-modbus-rx-timeout-us {pin_dict['modbus_rx_timeout_us']}",
-                    wait_response=False,
-                )
-            if "modbus_scan_delay_us" in pin_dict:
-                await self._serial_command(
-                    f"set-modbus-scan-delay-us {pin_dict['modbus_scan_delay_us']}",
-                    wait_response=False,
-                )
-            if "modbus_inter_frame_delay_us" in pin_dict:
-                await self._serial_command(
-                    f"set-modbus-inter-frame-delay-us {pin_dict['modbus_inter_frame_delay_us']}",
-                    wait_response=False,
-                )
+            pin_keys = {
+                "modbus_tx": "pin.modbus_tx",
+                "modbus_rx": "pin.modbus_rx",
+                "modbus_de_re": "pin.modbus_de_re",
+                "modbus_timeout_ms": "pin.modbus_timeout_ms",
+                "modbus_rx_timeout_us": "pin.modbus_rx_timeout_us",
+                "modbus_scan_delay_us": "pin.modbus_scan_delay_us",
+                "modbus_inter_frame_delay_us": "pin.modbus_inter_frame_delay_us",
+            }
+            for field, path in pin_keys.items():
+                if field in pin_dict:
+                    await self._serial_command(
+                        f"set {path} {pin_dict[field]}", wait_response=False
+                    )
             if "ble_enabled" in pin_dict:
                 val = "true" if pin_dict["ble_enabled"] else "false"
                 await self._serial_command(
-                    f"set-ble-enabled {val}", wait_response=False
+                    f"set pin.ble_enabled {val}", wait_response=False
                 )
             if "modbus_debug" in pin_dict:
                 val = "true" if pin_dict["modbus_debug"] else "false"
                 await self._serial_command(
-                    f"set-modbus-debug {val}", wait_response=False
+                    f"set pin.modbus_debug {val}", wait_response=False
                 )
             if "operating_mode" in pin_dict:
                 await self._serial_command(
-                    f"set-operating-mode {pin_dict['operating_mode']}",
+                    f"set pin.operating_mode {pin_dict['operating_mode']}",
                     wait_response=False,
                 )
             return await self.get_pin_config()
@@ -719,7 +700,7 @@ class DeviceBackend:
             raw = await client.read_gatt_char(BleUUID.CHAR_NETWORK_CONFIG)
             return json.loads(raw.decode("utf-8"))
         elif self.mode == "serial":
-            lines = await self._serial_command("get-network-config")
+            lines = await self._serial_command("get net")
             text = "\n".join(lines)
             if "{" in text and "}" in text:
                 try:
@@ -744,31 +725,29 @@ class DeviceBackend:
             raw = await client.read_gatt_char(BleUUID.CHAR_NETWORK_CONFIG)
             return json.loads(raw.decode("utf-8"))
         elif self.mode == "serial":
-            if "hostname" in net_dict:
-                await self._serial_command(
-                    f"set-hostname {net_dict['hostname']}", wait_response=False
-                )
+            net_keys = {
+                "hostname": "net.hostname",
+                "static_ip": "net.static_ip",
+                "static_mask": "net.static_mask",
+                "static_gateway": "net.static_gateway",
+                "static_dns": "net.static_dns",
+                "ssid": "net.ssid",
+                "password": "net.password",
+            }
+            for field, path in net_keys.items():
+                if field in net_dict:
+                    await self._serial_command(
+                        f"set {path} {net_dict[field]}", wait_response=False
+                    )
             if "dhcp_enabled" in net_dict:
                 val = "true" if net_dict["dhcp_enabled"] else "false"
                 await self._serial_command(
-                    f"set-dhcp-enabled {val}", wait_response=False
+                    f"set net.dhcp_enabled {val}", wait_response=False
                 )
-            if "static_ip" in net_dict:
+            if "wifi_enabled" in net_dict:
+                val = "true" if net_dict["wifi_enabled"] else "false"
                 await self._serial_command(
-                    f"set-static-ip {net_dict['static_ip']}", wait_response=False
-                )
-            if "static_mask" in net_dict:
-                await self._serial_command(
-                    f"set-static-mask {net_dict['static_mask']}", wait_response=False
-                )
-            if "static_gateway" in net_dict:
-                await self._serial_command(
-                    f"set-static-gateway {net_dict['static_gateway']}",
-                    wait_response=False,
-                )
-            if "static_dns" in net_dict:
-                await self._serial_command(
-                    f"set-static-dns {net_dict['static_dns']}", wait_response=False
+                    f"set net.wifi_enabled {val}", wait_response=False
                 )
             return await self.get_network_config()
         return {}
@@ -1287,11 +1266,11 @@ def wifi(
     console.print(f"[cyan]Setting WiFi SSID to [bold]{ssid}[/bold]...[/cyan]")
     if backend.mode == "serial":
         asyncio.run(
-            backend._serial_command(f"set-wifi-ssid {ssid}", wait_response=False)
+            backend._serial_command(f"set net.ssid {ssid}", wait_response=False)
         )
         asyncio.run(
             backend._serial_command(
-                f"set-wifi-password {password}", wait_response=False
+                f"set net.password {password}", wait_response=False
             )
         )
         console.print(

@@ -95,8 +95,8 @@ pub fn apply_capture_inject(capture: &mut [u8], rx_len: usize) -> usize {
                 return rx_len;
             }
             capture.copy_within(0..rx_len, shift);
-            for i in 0..shift {
-                capture[i] = junk_byte(i);
+            for (i, slot) in capture[..shift].iter_mut().enumerate() {
+                *slot = junk_byte(i);
             }
             rx_len + shift
         }
@@ -111,8 +111,8 @@ pub fn apply_capture_inject(capture: &mut [u8], rx_len: usize) -> usize {
             let shift = n.min(cap.saturating_sub(rx_len).min(rx_len.max(1)));
             let after_lead = if shift > 0 {
                 capture.copy_within(0..rx_len, shift);
-                for i in 0..shift {
-                    capture[i] = junk_byte(i);
+                for (i, slot) in capture[..shift].iter_mut().enumerate() {
+                    *slot = junk_byte(i);
                 }
                 rx_len + shift
             } else {

@@ -381,6 +381,7 @@ async fn drain_cli_out_batch(
     progressed
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_out_batch(
     usb: &mut UsbSerialJtag<'_, Async>,
     uart: &mut Uart<'_, Blocking>,
@@ -425,6 +426,7 @@ async fn drain_out_batch(
 /// Stream `data` into sink rings. USB is the primary console path: once all
 /// bytes are queued (and drained when the USB ring is full), return without
 /// waiting on UART0/RTT stalls — those are best-effort only.
+#[allow(clippy::too_many_arguments)]
 async fn accept_out(
     usb: &mut UsbSerialJtag<'_, Async>,
     uart: &mut Uart<'_, Blocking>,

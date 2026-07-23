@@ -502,6 +502,7 @@ impl<'d> ModbusRTUMaster<'d> {
         Ok((len, timing))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log_modbus_dbg(
         &self,
         tx: &[u8],

@@ -645,7 +645,7 @@ async def test_ble_connection():
         raise
 
 
-async def test_flasher():
+async def test_flasher(headless_override: bool = False):
     print(f"\n============================================================")
     print(f"  OSSM Web Flasher Playwright E2E Verification Suite")
     print(f"============================================================")
@@ -659,7 +659,19 @@ async def test_flasher():
     print(f"  Target: {flasher_url}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        launch_args = [
+            "--enable-features=WebSerial",
+            "--enable-experimental-web-platform-features",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+        if headless_override:
+            launch_args.append("--headless=new")
+            
+        browser = await p.chromium.launch(
+            headless=False,
+            args=launch_args
+        )
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
         await context.add_init_script("localStorage.setItem('ossm_locale', 'en')")
         page = await context.new_page()
@@ -689,6 +701,84 @@ async def test_flasher():
         await wifi_chk.check()
         await page.wait_for_selector('input[placeholder="Your WiFi network"]', state="visible", timeout=5000)
         print("✓ WiFi SSID input restored when Enable WiFi is checked")
+
+        # Now test the real device connection and config write
+        print(" -> Testing real serial connection and config write...")
+        
+        page.on("console", lambda msg: print(f"Browser console: {msg.text}"))
+        page.on("pageerror", lambda err: print(f"Browser error: {err}"))
+        
+        cdp = await context.new_cdp_session(page)
+        await cdp.send("DeviceAccess.enable")
+
+        selection_done = asyncio.Event()
+        last_prompt_id = None
+        selection_error = None
+        selected_device_name = None
+
+        async def on_device_prompt(event):
+            nonlocal last_prompt_id, selection_error, selected_device_name
+            last_prompt_id = event["id"]
+            try:
+                devices = event.get("devices", [])
+                if not devices:
+                    raise AssertionError("No Web Serial devices found in prompt")
+                device_id = devices[0]["id"]
+                selected_device_name = devices[0].get("name", "Unknown")
+                await cdp.send(
+                    "DeviceAccess.selectPrompt",
+                    {"id": event["id"], "deviceId": device_id},
+                )
+            except Exception as exc:
+                selection_error = exc
+                selected_device_name = None
+            finally:
+                selection_done.set()
+
+        cdp.on(
+            "DeviceAccess.deviceRequestPrompted",
+            lambda event: asyncio.create_task(on_device_prompt(event)),
+        )
+
+        connect_btn = page.get_by_role("button", name="Connect", exact=True)
+        await connect_btn.wait_for(state="visible", timeout=5000)
+        await connect_btn.click()
+
+        try:
+            await asyncio.wait_for(selection_done.wait(), timeout=10.0)
+        except asyncio.TimeoutError as exc:
+            if last_prompt_id:
+                try:
+                    await cdp.send("DeviceAccess.cancelPrompt", {"id": last_prompt_id})
+                except: pass
+            raise AssertionError("Timed out waiting for Web Serial prompt") from exc
+
+        if selection_error:
+            raise selection_error
+
+        print(f"✓ Selected device automatically: {selected_device_name}")
+
+        disconnect_btn = page.locator("button:has-text('Disconnect')")
+        await disconnect_btn.wait_for(state="visible", timeout=10000)
+        print("✓ Successfully connected to real device via Web Serial")
+
+        print(" -> Writing configuration to device...")
+        send_config_btn = page.locator("button:has-text('Send Configuration')")
+        await send_config_btn.wait_for(state="visible", timeout=5000)
+        await send_config_btn.click()
+
+        term_log = page.locator(".font-mono")
+        try:
+            await expect(send_config_btn).to_have_text("Send Configuration", timeout=15000)
+        except Exception as e:
+            log_text = await term_log.inner_text()
+            raise AssertionError(f"Config write failed or timed out. Log:\n{log_text}") from e
+            
+        log_text = await term_log.inner_text()
+        if "Failed" in log_text or "Error" in log_text:
+            raise AssertionError(f"Config write failed with error in log:\n{log_text}")
+
+        print("✓ Flasher correctly wrote the configuration to the real device")
 
         await browser.close()
     print("✓ All Web Flasher E2E tests PASSED")

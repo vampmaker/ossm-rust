@@ -586,7 +586,7 @@ async function waitForBoot(
       buffer += text
       serialXterm?.write(text)
       // Firmware boot markers — do not translate
-      if (buffer.includes('Hello, world!') || buffer.includes('ossm')) {
+      if (buffer.includes('Hello, world!') || buffer.toLowerCase().includes('ossm')) {
         termLog(`\x1b[1;32m${t('log.bootDetected')}\x1b[0m`)
         return true
       }
@@ -642,12 +642,31 @@ async function sendConfig() {
   termLog(`\x1b[33m${t('log.preparingConfig')}\x1b[0m`)
   try {
     if (!serialPort) throw new Error(t('errors.noPortConnect'))
+    
+    const neededReset = !esploader
     await ensureNormalModeFromBootloader()
+
+    if (neededReset) {
+      termLog(`\x1b[90m${t('log.togglingDtr')}\x1b[0m`)
+      try {
+        await withSerialLock(async () => {
+          await releaseIoNoLock()
+          await closePortNoLock()
+          await openPortNoLock(115200)
+          await pulseResetSignalsNoLock(serialPort!)
+        })
+      } catch {
+        // Ignore disconnect errors from native USB CDC resetting
+      }
+      await withSerialLock(async () => {
+        await closePortNoLock()
+      })
+      await sleep(1000)
+    }
+
     await enterConfigMode()
     if (!sessionReader || !sessionWriter) throw new Error(t('errors.openStreams'))
 
-    termLog(`\x1b[90m${t('log.togglingDtr')}\x1b[0m`)
-    await pulseResetSignalsNoLock(serialPort!)
     termLog(`\x1b[33m${t('log.waitingBoot')}\x1b[0m`)
     const booted = await waitForBoot(sessionReader, 15000)
     if (!booted) {

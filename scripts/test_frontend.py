@@ -13,6 +13,7 @@
 #     "pydantic>=2.0.0",
 #     "websockets>=12.0",
 #     "aiohttp>=3.9.0",
+#     "pyautogui>=0.9.54",
 # ]
 # ///
 
@@ -708,55 +709,26 @@ async def test_flasher(headless_override: bool = False):
         page.on("console", lambda msg: print(f"Browser console: {msg.text}"))
         page.on("pageerror", lambda err: print(f"Browser error: {err}"))
         
-        cdp = await context.new_cdp_session(page)
-        await cdp.send("DeviceAccess.enable")
-
-        selection_done = asyncio.Event()
-        last_prompt_id = None
-        selection_error = None
-        selected_device_name = None
-
-        async def on_device_prompt(event):
-            nonlocal last_prompt_id, selection_error, selected_device_name
-            last_prompt_id = event["id"]
-            try:
-                devices = event.get("devices", [])
-                if not devices:
-                    raise AssertionError("No Web Serial devices found in prompt")
-                device_id = devices[0]["id"]
-                selected_device_name = devices[0].get("name", "Unknown")
-                await cdp.send(
-                    "DeviceAccess.selectPrompt",
-                    {"id": event["id"], "deviceId": device_id},
-                )
-            except Exception as exc:
-                selection_error = exc
-                selected_device_name = None
-            finally:
-                selection_done.set()
-
-        cdp.on(
-            "DeviceAccess.deviceRequestPrompted",
-            lambda event: asyncio.create_task(on_device_prompt(event)),
-        )
-
         connect_btn = page.get_by_role("button", name="Connect", exact=True)
         await connect_btn.wait_for(state="visible", timeout=5000)
         await connect_btn.click()
 
-        try:
-            await asyncio.wait_for(selection_done.wait(), timeout=10.0)
-        except asyncio.TimeoutError as exc:
-            if last_prompt_id:
-                try:
-                    await cdp.send("DeviceAccess.cancelPrompt", {"id": last_prompt_id})
-                except: pass
-            raise AssertionError("Timed out waiting for Web Serial prompt") from exc
-
-        if selection_error:
-            raise selection_error
-
-        print(f"✓ Selected device automatically: {selected_device_name}")
+        print(" -> Waiting for Web Serial prompt and selecting via pyautogui...")
+        import pyautogui
+        await asyncio.sleep(1.5)
+        
+        # Chrome Web Serial prompt focuses the list by default, or needs tabs.
+        # On Linux/X11, usually Tab, Tab, Tab, Down, Enter works, or just Down, Enter.
+        # We will press Tab a few times, then Down, then Enter.
+        for _ in range(4):
+            pyautogui.press("tab")
+            await asyncio.sleep(0.1)
+        pyautogui.press("down")
+        await asyncio.sleep(0.2)
+        pyautogui.press("enter")
+        
+        await asyncio.sleep(1.0)
+        print(f"✓ Selected device automatically via UI automation")
 
         disconnect_btn = page.locator("button:has-text('Disconnect')")
         await disconnect_btn.wait_for(state="visible", timeout=10000)

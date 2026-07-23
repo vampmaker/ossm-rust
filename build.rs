@@ -1,8 +1,8 @@
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 
 fn main() {
     println!("cargo:rustc-link-arg=-Tlinkall.x");

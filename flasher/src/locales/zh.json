@@ -71,7 +71,7 @@
       "scanDelay": "扫描延迟 (µs)",
       "scanDelayHint": "0 = t3.5",
       "debug": "Modbus RX 调试模式",
-      "debugHint": "5 ms 接收截止 + USB 上 MODBUS_DBG 分类/十六进制（256 B DMA）。需重启。会显著降低 UPS。"
+      "debugHint": "5 ms 接收截止 + USB 上 MODBUS_DBG 分类/base64（256 B DMA）。需重启。会显著降低 UPS。"
     },
     "ble": {
       "enable": "启用低功耗蓝牙 (BLE)"

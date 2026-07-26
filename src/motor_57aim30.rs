@@ -524,8 +524,8 @@ impl<'d> ModbusRTUMaster<'d> {
         skip: usize,
         frame_len: usize,
     ) {
-        let tx_hex = bytes_to_hex(tx, 64);
-        let rx_hex = bytes_to_hex(rx, 64);
+        let tx_b64 = bytes_to_base64(tx, 64);
+        let rx_b64 = bytes_to_base64(rx, 64);
         let trim = rx.len().saturating_sub(skip + frame_len);
         log::info!(
             "MODBUS_DBG ok={} class={} expected={} skip={} frame_len={} trim={} tx={} rx_len={} rx={}",
@@ -535,9 +535,9 @@ impl<'d> ModbusRTUMaster<'d> {
             skip,
             frame_len,
             trim,
-            tx_hex,
+            tx_b64,
             rx.len(),
-            rx_hex
+            rx_b64
         );
     }
 
@@ -901,7 +901,7 @@ pub(crate) fn init_uart_and_modbus(
     configure_uart1_rx_idle_threshold(timeout_symbols);
 
     if pin_config.modbus_debug {
-        log::info!("Modbus debug mode ON: 5ms RX deadline, hex dumps on console (DMA RX 256 B)");
+        log::info!("Modbus debug mode ON: 5ms RX deadline, base64 dumps on console (DMA RX 256 B)");
     }
 
     Ok(ModbusRTUMaster::new(
@@ -952,17 +952,29 @@ fn expected_modbus_response_len(req: &[u8]) -> u16 {
     }
 }
 
-fn bytes_to_hex(data: &[u8], max_bytes: usize) -> alloc::string::String {
+fn bytes_to_base64(data: &[u8], max_bytes: usize) -> alloc::string::String {
+    const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let n = data.len().min(max_bytes);
-    let mut s = alloc::string::String::with_capacity(n * 3);
-    for (i, b) in data.iter().take(n).enumerate() {
-        if i > 0 {
-            s.push(' ');
+    let mut s = alloc::string::String::with_capacity((n + 2) / 3 * 4);
+    let mut i = 0;
+    while i < n {
+        let b0 = data[i];
+        let b1 = if i + 1 < n { data[i + 1] } else { 0 };
+        let b2 = if i + 2 < n { data[i + 2] } else { 0 };
+
+        s.push(CHARSET[(b0 >> 2) as usize] as char);
+        s.push(CHARSET[((b0 & 3) << 4 | b1 >> 4) as usize] as char);
+        if i + 1 < n {
+            s.push(CHARSET[((b1 & 15) << 2 | b2 >> 6) as usize] as char);
+        } else {
+            s.push('=');
         }
-        let hi = b >> 4;
-        let lo = b & 0x0f;
-        s.push(core::char::from_digit(hi as u32, 16).unwrap_or('?'));
-        s.push(core::char::from_digit(lo as u32, 16).unwrap_or('?'));
+        if i + 2 < n {
+            s.push(CHARSET[(b2 & 63) as usize] as char);
+        } else {
+            s.push('=');
+        }
+        i += 3;
     }
     if data.len() > max_bytes {
         s.push_str(" …");

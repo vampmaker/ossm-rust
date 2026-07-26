@@ -1151,7 +1151,7 @@ def pins(
     modbus_debug: Optional[bool] = typer.Option(
         None,
         "--modbus-debug/--no-modbus-debug",
-        help="Modbus RX debug mode (5ms deadline + MODBUS_DBG class/hex; 256B DMA; reboot required)",
+        help="Modbus RX debug mode (5ms deadline + MODBUS_DBG class/base64; 256B DMA; reboot required)",
     ),
     operating_mode: Optional[str] = typer.Option(
         None,

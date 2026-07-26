@@ -71,7 +71,7 @@
       "scanDelay": "Scan delay (µs)",
       "scanDelayHint": "0 = t3.5",
       "debug": "Modbus RX debug mode",
-      "debugHint": "5 ms RX deadline + MODBUS_DBG class/hex on USB (256 B DMA). Restart required. Collapses UPS."
+      "debugHint": "5 ms RX deadline + MODBUS_DBG class/base64 on USB (256 B DMA). Restart required. Collapses UPS."
     },
     "ble": {
       "enable": "Enable Bluetooth Low Energy (BLE)"

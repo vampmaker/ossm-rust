@@ -33,7 +33,7 @@ pub struct PinConfiguration {
     pub modbus_inter_frame_delay_us: u32,
     #[serde(default = "default_ble_enabled")]
     pub ble_enabled: bool,
-    /// Diagnostic Modbus RX mode (5 ms deadline + MODBUS_DBG class/hex; 256 B DMA). Requires reboot.
+    /// Diagnostic Modbus RX mode (5 ms deadline + MODBUS_DBG class/base64; 256 B DMA). Requires reboot.
     #[serde(default)]
     pub modbus_debug: bool,
     #[serde(default = "default_operating_mode")]

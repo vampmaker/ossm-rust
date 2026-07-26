@@ -236,6 +236,7 @@
     "addFirst": "Add first instruction",
     "seekGap": "Seek to this position",
     "loadPrompt": "Select or edit a macro, then press Play",
+    "editTimestampToSeek": "Edit current timestamp to seek",
     "loaded": "Loaded “{name}”",
     "saved": "Saved “{name}”",
     "imported": "Imported “{name}”",

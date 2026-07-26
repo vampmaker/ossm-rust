@@ -120,7 +120,12 @@
     "noPort": "没有可用串口。",
     "resettingDevice": "正在复位设备...",
     "deviceReset": "设备已复位。",
-    "resetFailed": "复位失败：{message}"
+    "resetFailed": "复位失败：{message}",
+    "portLostRecovery": "端口丢失。正在尝试恢复...",
+    "portRecovered": "端口已恢复！",
+    "e2eMode": "E2E 模式：打开串口以进行配置（跳过 bootloader）。",
+    "serialReadyConfig": "串口已准备好进行配置。",
+    "fallbackNormalMode": "进入 bootloader 模式失败（原生 USB 复位断开）。回退到正常模式。"
   },
   "errors": {
     "noPort": "没有可用串口。",

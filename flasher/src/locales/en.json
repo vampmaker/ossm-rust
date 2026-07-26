@@ -120,7 +120,12 @@
     "noPort": "No serial port available.",
     "resettingDevice": "Resetting device...",
     "deviceReset": "Device reset.",
-    "resetFailed": "Reset failed: {message}"
+    "resetFailed": "Reset failed: {message}",
+    "portLostRecovery": "Port lost. Attempting recovery...",
+    "portRecovered": "Port recovered!",
+    "e2eMode": "E2E mode: opening serial for configuration (bootloader skipped).",
+    "serialReadyConfig": "Serial port ready for configuration.",
+    "fallbackNormalMode": "Failed to enter bootloader mode (Native USB reset drop). Falling back to normal mode."
   },
   "errors": {
     "noPort": "No serial port available.",

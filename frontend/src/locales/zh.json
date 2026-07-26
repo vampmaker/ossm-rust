@@ -236,6 +236,7 @@
     "addFirst": "添加第一条指令",
     "seekGap": "定位到此处",
     "loadPrompt": "选择或编辑宏，然后按播放",
+    "editTimestampToSeek": "编辑当前时间戳以跳转",
     "loaded": "已加载「{name}」",
     "saved": "已保存「{name}」",
     "imported": "已导入「{name}」",

@@ -293,7 +293,7 @@ async function openPortNoLock(baudRate: number = 115200) {
     } catch (e: any) {
       if (String(e).includes('NetworkError') || String(e).includes('lost') || String(e).includes('NotFoundError') || String(e).includes('disconnected') || String(e).includes('Failed to connect')) {
         // Recover lost port (Native USB disconnect/reconnect)
-        termLog(`\x1b[90mPort lost. Attempting recovery...\x1b[0m`)
+        termLog(`\x1b[90m${t('log.portLostRecovery')}\x1b[0m`)
         let recovered = false
         for (let i = 0; i < 20; i++) {
           await sleep(250)
@@ -303,7 +303,7 @@ async function openPortNoLock(baudRate: number = 115200) {
             try {
               await serialPort!.open({ baudRate })
               recovered = true
-              termLog(`\x1b[32mPort recovered!\x1b[0m`)
+              termLog(`\x1b[32m${t('log.portRecovered')}\x1b[0m`)
               break
             } catch (openErr) {
               // Port might not be fully ready yet
@@ -537,7 +537,7 @@ async function connect() {
     const port = await navigator.serial.requestPort()
     setPort(port)
     if (isE2eSerialMode()) {
-      termLog(`\x1b[33mE2E mode: opening serial for configuration (bootloader skipped).\x1b[0m`)
+      termLog(`\x1b[33m${t('log.e2eMode')}\x1b[0m`)
       await withSerialLock(async () => {
         await closePortNoLock()
         await openPortNoLock(115200)
@@ -545,7 +545,7 @@ async function connect() {
       chipName.value = 'E2E'
       serialMode.value = 'idle'
       status.value = 'flash_done'
-      termLog(`\x1b[1;32mSerial port ready for configuration.\x1b[0m`)
+      termLog(`\x1b[1;32m${t('log.serialReadyConfig')}\x1b[0m`)
       return
     }
     transport = new Transport(port, true)
@@ -563,7 +563,7 @@ async function connect() {
     termLog(`\x1b[1;32m${t('log.connected', { chip })}\x1b[0m`)
   } catch (err: any) {
     if (String(err).includes('NetworkError') || String(err).includes('lost') || String(err).includes('Timeout') || String(err).includes('Failed to connect')) {
-      termLog(`\x1b[33mFailed to enter bootloader mode (Native USB reset drop). Falling back to normal mode.\x1b[0m`)
+      termLog(`\x1b[33m${t('log.fallbackNormalMode')}\x1b[0m`)
       await cleanupEsptool()
       esploader = null
       serialMode.value = 'idle'

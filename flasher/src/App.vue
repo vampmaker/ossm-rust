@@ -110,7 +110,7 @@ function persistDeviceConfig() {
 
 function resetDeviceConfig() {
   applyDeviceConfig(DEFAULT_DEVICE_CONFIG)
-  termLog(`\x1b[33m${t('log.configReset')}\x1b[0m`)
+  termLog(`\x1b[33m${t('log.configResetDefaults')}\x1b[0m`)
 }
 
 let transport: Transport | null = null
@@ -354,7 +354,7 @@ async function cleanupEsptool() {
 
 async function ensureNormalModeFromBootloader() {
   if (esploader) {
-    termLog(`\x1b[33m${t('log.bootloaderReset')}\x1b[0m`)
+    termLog(`\x1b[33m${t('log.bootloaderResetting')}\x1b[0m`)
     try {
       await esploader.after('hard_reset')
     } catch {
@@ -447,7 +447,7 @@ async function monitorLoop(token: number, logStart: boolean) {
         sessionWriter = serialPort.writable.getWriter()
         return reader
       })
-      if (!activeReader) throw new Error(t('errors.monitorReader'))
+      if (!activeReader) throw new Error(t('errors.acquireMonitorReader'))
 
       reconnectAttempts = 0
       while (monitorRequested && token === monitorToken && serialMode.value === 'monitor') {
@@ -464,7 +464,7 @@ async function monitorLoop(token: number, logStart: boolean) {
       if (String(err?.message || err) === '__STREAM_DONE__') {
         termLog(`\x1b[33m${t('log.monitorStreamEnded')}\x1b[0m`)
       } else {
-        termLog(`\x1b[31m${t('log.monitorError', { error: err?.message || err })}\x1b[0m`)
+        termLog(`\x1b[31m${t('log.monitorError', { message: err?.message || err })}\x1b[0m`)
       }
       reconnectAttempts += 1
       if (reconnectAttempts > maxReconnectAttempts) {
@@ -560,7 +560,7 @@ async function connect() {
     chipName.value = chip
     serialMode.value = 'bootloader'
     status.value = 'connected'
-    termLog(`\x1b[1;32m${t('log.connected', { chip })}\x1b[0m`)
+    termLog(`\x1b[1;32m${t('log.connectedChip', { chip })}\x1b[0m`)
   } catch (err: any) {
     if (String(err).includes('NetworkError') || String(err).includes('lost') || String(err).includes('Timeout') || String(err).includes('Failed to connect')) {
       termLog(`\x1b[33m${t('log.fallbackNormalMode')}\x1b[0m`)
@@ -571,7 +571,7 @@ async function connect() {
     } else {
       status.value = 'error'
       errorMessage.value = err?.message || String(err)
-      termLog(`\x1b[1;31m${t('log.connectionFailed', { error: errorMessage.value })}\x1b[0m`)
+      termLog(`\x1b[1;31m${t('log.connectionFailed', { message: errorMessage.value })}\x1b[0m`)
     }
   }
 }
@@ -589,12 +589,12 @@ async function flash() {
   if (!esploader || !firmwareDataStr.value) return
   const address = parseInt(flashAddress.value, 16)
   if (isNaN(address)) {
-    termLog(`\x1b[31m${t('log.invalidAddress')}\x1b[0m`)
+    termLog(`\x1b[31m${t('log.invalidFlashAddress')}\x1b[0m`)
     return
   }
   status.value = 'flashing'
   flashProgress.value = 0
-  termLog(`\x1b[33m${t('log.flashing', { name: firmwareFile.value?.name ?? '', address: `0x${address.toString(16)}` })}\x1b[0m`)
+  termLog(`\x1b[33m${t('log.flashingFile', { name: firmwareFile.value?.name ?? '', address: `0x${address.toString(16)}` })}\x1b[0m`)
   try {
     await esploader.writeFlash({
       fileArray: [{ data: firmwareDataStr.value, address }],
@@ -608,7 +608,7 @@ async function flash() {
       },
     })
     flashProgress.value = 100
-    termLog(`\x1b[1;32m${t('log.flashComplete')}\x1b[0m`)
+    termLog(`\x1b[1;32m${t('log.flashCompleteResetting')}\x1b[0m`)
     await esploader.after('hard_reset')
     await cleanupEsptool()
     serialMode.value = 'idle'
@@ -617,7 +617,7 @@ async function flash() {
   } catch (err: any) {
     status.value = 'error'
     errorMessage.value = err?.message || String(err)
-    termLog(`\x1b[1;31m${t('log.flashFailed', { error: errorMessage.value })}\x1b[0m`)
+    termLog(`\x1b[1;31m${t('log.flashFailed', { message: errorMessage.value })}\x1b[0m`)
   }
 }
 
@@ -673,7 +673,7 @@ async function waitForAck(
 
     if (result === null) continue
     if (result.done) {
-      throw new Error(t('errors.streamEndedAck', { acks: expectedSubstrings.join(' | ') }))
+      throw new Error(t('errors.streamEndedWaitingAck', { expected: expectedSubstrings.join(' | ') }))
     }
 
     if (result.value && result.value.length > 0) {
@@ -696,13 +696,13 @@ async function sendConfig() {
   errorMessage.value = ''
   termLog(`\x1b[33m${t('log.preparingConfig')}\x1b[0m`)
   try {
-    if (!serialPort) throw new Error(t('errors.noPortConnect'))
+    if (!serialPort) throw new Error(t('errors.noPortConnectFirst'))
     
     const neededReset = !esploader
     await ensureNormalModeFromBootloader()
 
     if (neededReset) {
-      termLog(`\x1b[90m${t('log.togglingDtr')}\x1b[0m`)
+      termLog(`\x1b[90m${t('log.togglingReset')}\x1b[0m`)
       try {
         await withSerialLock(async () => {
           await releaseIoNoLock()
@@ -789,34 +789,28 @@ async function sendConfig() {
       await sessionWriter.write(encoder.encode(item.cmd + '\r'))
       const acked = await waitForAck(sessionReader, item.ack, 10000)
       if (!acked) {
-        throw new Error(t('errors.ackTimeout', { acks: item.ack.join(' | ') }))
+        throw new Error(t('errors.timeoutWaitingAck', { expected: item.ack.join(' | ') }))
       }
       termLog(`\x1b[32m${t('log.ackReceived')}\x1b[0m`)
     }
 
-    termLog(`\x1b[32m${t('log.configSentReset')}\x1b[0m`)
-    await sessionWriter.write(encoder.encode('reset\r'))
-    const resetAcked = await waitForAck(sessionReader, ['Restarting device...'], 8000)
-    if (!resetAcked) {
-      termLog(`\x1b[33m${t('log.resetAckMissing')}\x1b[0m`)
-    }
-
     await leaveCurrentMode()
     status.value = 'config_done'
-    termLog(`\x1b[1;32m${t('log.configComplete')}\x1b[0m`)
+    termLog(`\x1b[1;32m${t('log.configCompleteRestarting')}\x1b[0m`)
+    // Allow the firmware's storage task to persist the final config before hardware reset
     await sleep(500)
     await startMonitor(true)
   } catch (err: any) {
     await leaveCurrentMode()
     status.value = 'error'
     errorMessage.value = err?.message || String(err)
-    termLog(`\x1b[1;31m${t('log.configFailed', { error: errorMessage.value })}\x1b[0m`)
+    termLog(`\x1b[1;31m${t('log.configFailed', { message: errorMessage.value })}\x1b[0m`)
   }
 }
 
 async function startMonitor(resetFirst: boolean = true) {
   if (!serialPort) {
-    termLog(`\x1b[31m${t('log.noPortConnect')}\x1b[0m`)
+    termLog(`\x1b[31m${t('log.noPortConnectFirst')}\x1b[0m`)
     return
   }
   await ensureNormalModeFromBootloader()
@@ -835,7 +829,7 @@ async function resetDevice() {
     termLog(`\x1b[31m${t('log.noPort')}\x1b[0m`)
     return
   }
-  termLog(`\x1b[33m${t('log.resetting')}\x1b[0m`)
+  termLog(`\x1b[33m${t('log.resettingDevice')}\x1b[0m`)
   try {
     await ensureNormalModeFromBootloader()
     await performReset(true)
@@ -844,7 +838,7 @@ async function resetDevice() {
   } catch (err: any) {
     status.value = 'error'
     errorMessage.value = err?.message || String(err)
-    termLog(`\x1b[31m${t('log.resetFailed', { error: errorMessage.value })}\x1b[0m`)
+    termLog(`\x1b[31m${t('log.resetFailed', { message: errorMessage.value })}\x1b[0m`)
   }
 }
 

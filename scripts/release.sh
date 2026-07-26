@@ -41,6 +41,9 @@ espflash save-image \
     target/xtensa-esp32s3-none-elf/release/ossm-rust \
     "$RELEASE_DIR/ossm-esp32s3.bin"
 
+echo "==> Verifying ESP32-S3 flash image (single DROM segment)..."
+uv run scripts/verify_s3_flash_image.py "$RELEASE_DIR/ossm-esp32s3.bin"
+
 echo ""
 echo "Release artifacts in $RELEASE_DIR/:"
 ls -lh "$RELEASE_DIR/"

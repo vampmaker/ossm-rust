@@ -1,11 +1,20 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
 fn main() {
-    println!("cargo:rustc-link-arg=-Tlinkall.x");
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    if env::var("CARGO_FEATURE_ESP32S3").is_ok() {
+        let ld_dir = Path::new(&manifest_dir).join("ld/esp32s3");
+        println!("cargo:rustc-link-arg=-T{}", ld_dir.join("linkall.x").display());
+        println!("cargo:rustc-link-search={}", ld_dir.display());
+        println!("cargo:rerun-if-changed={}", ld_dir.display());
+    } else {
+        println!("cargo:rustc-link-arg=-Tlinkall.x");
+    }
 
     println!("cargo:rerun-if-changed=frontend/dist/index.html");
 

@@ -53,7 +53,7 @@ This is a `no_std` bare-metal project using `esp-hal`. Both chips use the Espres
 
 ### Build System Details
 - `build-std = ["core", "alloc"]` is enabled in `.cargo/config.toml` (no `std` available).
-- `build.rs` emits `cargo:rustc-link-arg=-Tlinkall.x` for the esp-hal linker script.
+- `build.rs` emits `cargo:rustc-link-arg=-Tlinkall.x` for the esp-hal linker script. **ESP32-S3** uses `ld/esp32s3/linkall.x` + `ossm-rodata.x` instead: merges `.flash.appdesc` alignment padding into one DROM PROGBITS section so espflash emits a single DROM segment (bootloader error: *multiple DROM segments*).
 - `esp-bootloader-esp-idf` provides the ESP-IDF app descriptor macro required by `espflash`.
 - Feature flags (`esp32c6` / `esp32s3`) gate chip-specific deps across `esp-hal`, `esp-rtos`, `esp-radio`, `esp-storage`, `esp-nvs`, `esp-alloc`, `esp-backtrace`, `esp-println`, `rtt-target`, and `esp-bootloader-esp-idf`.
 - **Logging vs crash dump**: Runtime logs go through `console` (`log` + bounded OUT channel + USB/UART0/RTT). `esp-backtrace` **must** enable the `println` feature (build gate), which pulls in `esp-println` — keep `esp-println` on `jtag-serial` + `critical-section` only (**no** `log` feature, **never** call `esp_println::logger::init_logger_from_env()`). Do **not** enable `esp-backtrace` `panic-handler` or `exception-handler` (duplicate symbols with `console` / `esp-hal`). Panic frames: `console::panic_write` + `esp_backtrace::arch::backtrace()`. RISC-V needs `-C force-frame-pointers` in `.cargo/config.toml`.
@@ -347,7 +347,7 @@ When interacting over USB serial (`115200` baud, `\r\n` terminated), configurati
 12. **NVS during RF activity**:
     - Flash erase/write starves the shared 2.4 GHz radio and can drop BLE/WiFi sessions. `nvs_saver_task` debounces motor-config persist (≥ **2s**) and ignores ephemeral pause-only diffs (`persistent_motor_changed` excludes `paused` / `paused_position`). Do not add hot-path NVS writes from BLE/HTTP pause toggles.
 13. **Linker & Build Script**:
-    - `build.rs` must emit `cargo:rustc-link-arg=-Tlinkall.x` for the esp-hal linker script. The `esp-bootloader-esp-idf` crate provides the `esp_app_desc!()` macro required by `espflash` for the ESP-IDF bootloader compatibility layer. RISC-V targets must keep `-C force-frame-pointers` for `esp-backtrace` unwinds.
+    - `build.rs` emits `cargo:rustc-link-arg=-Tlinkall.x` for the esp-hal linker script (ESP32-S3: `ld/esp32s3/linkall.x` — see §2). The `esp-bootloader-esp-idf` crate provides the `esp_app_desc!()` macro required by `espflash` for the ESP-IDF bootloader compatibility layer. RISC-V targets must keep `-C force-frame-pointers` for `esp-backtrace` unwinds.
 14. **Console I/O, Logging & Panic/Backtrace**:
     - **Runtime logger is `console`, not `esp-println`.** `esp-println`'s `jtag-serial` mode sets a sticky `TIMED_OUT` when the USB TX FIFO cannot drain without a host — forever silencing later writes. Never route normal logs through `esp_println::println!` / its `log` feature.
     - A single `console_task` owns USB Serial/JTAG and UART0 (C6 DevKit defaults: GPIO16 TX / GPIO17 RX; S3: GPIO43/44) and fans out to RTT (TX only). Each sink has a pending TX **ring** (**256 B**, head/len — no O(n) `memmove` on consume).

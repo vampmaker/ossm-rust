@@ -23,6 +23,7 @@ import uuid
 import serial
 import json
 import os
+import pty
 import sys
 import tempfile
 import time
@@ -141,6 +142,19 @@ class WebSerialBridge:
                 }
             };
 
+            window._ws_stream_closed = (id, reason) => {
+                const port = window._ws_ports[id];
+                if (!port) return;
+                port._open = false;
+                if (port._readController) {
+                    try { port._readController.close(); } catch (_) {}
+                    port._readController = null;
+                }
+                port.readable = null;
+                port.writable = null;
+                console.log("WebSerial mock: stream closed (" + (reason || "disconnect") + ")");
+            };
+
             Object.defineProperty(navigator, 'serial', {
                 value: {
                     requestPort: async (options) => {
@@ -200,13 +214,14 @@ class WebSerialBridge:
         task = asyncio.create_task(self._read_loop(port_id))
         self.read_tasks[port_id] = task
 
-    async def _open_serial(self, port_id: str) -> serial.Serial:
-        entry = self.ports[port_id]
-        device = entry["device"]
-        baud_rate = entry.get("baud_rate", 115200)
-        ser = await asyncio.to_thread(serial.Serial, device, baud_rate, timeout=0.1)
-        entry["serial"] = ser
-        return ser
+    async def _notify_stream_closed(self, port_id: str, reason: str = "disconnect") -> None:
+        try:
+            reason_js = json.dumps(reason)
+            await self.page.evaluate(
+                f"window._ws_stream_closed && window._ws_stream_closed('{port_id}', {reason_js})"
+            )
+        except Exception as e:
+            print(f"WebSerialBridge: Failed to notify JS stream closed: {e}", flush=True)
 
     async def _read_loop(self, port_id: str):
         device = self.ports[port_id]["device"]
@@ -215,8 +230,10 @@ class WebSerialBridge:
             while True:
                 try:
                     if ser is None or not ser.is_open:
-                        ser = await self._open_serial(port_id)
+                        break
                     data = await asyncio.to_thread(ser.read, 1024)
+                    if not ser.is_open:
+                        raise serial.SerialException("serial port closed")
                     if data:
                         b64 = base64.b64encode(data).decode("ascii")
                         try:
@@ -231,7 +248,7 @@ class WebSerialBridge:
                     raise
                 except (serial.SerialException, OSError) as e:
                     print(
-                        f"WebSerialBridge: Serial disconnect on {device}, reconnecting: {e}",
+                        f"WebSerialBridge: Serial disconnect on {device}, closing JS stream: {e}",
                         flush=True,
                     )
                     if ser is not None:
@@ -240,8 +257,8 @@ class WebSerialBridge:
                         except Exception:
                             pass
                     self.ports[port_id]["serial"] = None
-                    ser = None
-                    await asyncio.sleep(0.25)
+                    await self._notify_stream_closed(port_id)
+                    break
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -267,12 +284,14 @@ class WebSerialBridge:
     async def _handle_write(self, source, args):
         port_id = args.get("id")
         b64 = args.get("data")
-        if port_id in self.ports:
-            ser = self.ports[port_id].get("serial")
-            if ser and ser.is_open:
-                data = base64.b64decode(b64)
-                await asyncio.to_thread(ser.write, data)
-                await asyncio.to_thread(ser.flush)
+        if port_id not in self.ports:
+            raise Exception("Port not found")
+        ser = self.ports[port_id].get("serial")
+        if ser is None or not ser.is_open:
+            raise Exception("NetworkError: Serial port is not open")
+        data = base64.b64decode(b64)
+        await asyncio.to_thread(ser.write, data)
+        await asyncio.to_thread(ser.flush)
 
     async def _handle_setSignals(self, source, args):
         port_id = args.get("id")
@@ -899,6 +918,61 @@ async def test_ble_connection():
         raise
 
 
+async def test_webserial_bridge_stream_close_on_disconnect():
+    """Verify pyserial disconnect closes the injected JS ReadableStream (no silent reconnect)."""
+    print("\n============================================================")
+    print("  WebSerialBridge disconnect regression test (PTY)")
+    print("============================================================")
+
+    master_fd, slave_fd = pty.openpty()
+    slave_name = os.ttyname(slave_fd)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        page = await browser.new_page()
+        bridge = WebSerialBridge(page, auto_select_port=slave_name)
+        await bridge.setup()
+        await page.goto("about:blank")
+
+        await page.evaluate(
+            """async () => {
+                const port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+                window.__ws_test_reader = port.readable.getReader();
+                window.__ws_test_port = port;
+            }"""
+        )
+
+        os.close(master_fd)
+        await asyncio.sleep(0.3)
+
+        result = await asyncio.wait_for(
+            page.evaluate(
+                """async () => {
+                    const result = await window.__ws_test_reader.read();
+                    return {
+                        done: result.done,
+                        open: window.__ws_test_port._open,
+                        readable: window.__ws_test_port.readable,
+                    };
+                }"""
+            ),
+            timeout=5.0,
+        )
+
+        await browser.close()
+
+    os.close(slave_fd)
+
+    assert result.get("done") is True, f"Expected reader.read() to resolve with done=true, got {result}"
+    assert result.get("open") is False, "Port mock should mark _open=false after disconnect"
+    assert result.get("readable") is None, "readable should be null after disconnect"
+    print("✓ WebSerialBridge closes JS ReadableStream on pyserial disconnect")
+
+
 async def test_flasher(headless_override: bool = False):
     print(f"\n============================================================")
     print(f"  OSSM Web Flasher Playwright E2E Verification Suite")
@@ -1012,6 +1086,18 @@ async def test_flasher(headless_override: bool = False):
         log_text = await term_log.inner_text()
         if "Failed" in log_text or "Error" in log_text:
             raise AssertionError(f"Config write failed with error in log:\n{log_text}")
+        for bad in (
+            "Timeout waiting for ACK",
+            "等待 ACK 超时",
+            "Stream ended while waiting for ACK",
+            "等待 ACK 时流已结束",
+            "Configuration failed",
+            "配置失败",
+            "errors.",
+            "log.",
+        ):
+            if bad in log_text:
+                raise AssertionError(f"Config write log contains failure marker '{bad}':\n{log_text}")
 
         print("✓ Flasher correctly wrote the configuration to the real device")
 
@@ -1504,6 +1590,11 @@ async def main():
         help="Skip BLE and Web Bluetooth tests when running without a physical Bluetooth adapter on the host",
     )
     parser.add_argument(
+        "--only-webserial-bridge",
+        action="store_true",
+        help="Run only the WebSerialBridge PTY disconnect regression test (no hardware)",
+    )
+    parser.add_argument(
         "--only-flasher",
         action="store_true",
         help="Run only the Web Flasher E2E test (requires a physical ESP32 on DEVICE_PORT)",
@@ -1514,6 +1605,13 @@ async def main():
         help="Skip Web Flasher E2E test (requires a physical ESP32 on DEVICE_PORT)",
     )
     args = parser.parse_args()
+
+    if args.only_webserial_bridge:
+        await test_webserial_bridge_stream_close_on_disconnect()
+        print(f"\n============================================================")
+        print(f"✓ WebSerialBridge disconnect regression test PASSED")
+        print(f"============================================================")
+        return
 
     if args.only_flasher:
         await test_flasher()

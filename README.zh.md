@@ -87,6 +87,10 @@
 ```
 cargo b-c6 --release    # 为 ESP32-C6 平台编译固件
 cargo b-s3 --release    # 为 ESP32-S3 平台编译固件
+
+# 桌面壳（stable；无电机的 mock HTTP/WS）：
+cargo +stable run -p ossm-std -- --mock --bind 127.0.0.1:8080
+# 脚本将 DEVICE_IP=127.0.0.1:8080
 ```
 
 构建目标由 Cargo 特性 / 别名（`esp32c6` / `esp32s3`）选择。两款芯片的默认 Modbus GPIO 编号相同；若板级接线不同，请在 NVS 中修改引脚配置。

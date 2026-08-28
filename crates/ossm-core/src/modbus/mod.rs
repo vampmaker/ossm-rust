@@ -1,5 +1,7 @@
 //! Modbus RTU helpers shared by the motor master and relay bridge.
 
+pub mod aim30;
+
 use core::sync::atomic::Ordering;
 
 use portable_atomic::AtomicU8;
@@ -234,12 +236,15 @@ mod tests {
 
     #[test]
     fn find_leading_junk_resync() {
+        // Match scripts/test_modbus_resync.py: junk prefix + CRC over payload only.
         let mut raw = [0u8; 20];
         raw[0] = 0xAA;
         raw[1] = 0xBB;
         raw[2] = 0xCC;
         raw[3..10].copy_from_slice(&[0x01, 0x03, 0x04, 0x00, 0x10, 0x00, 0x20]);
-        append_crc(&mut raw, 10);
+        let crc = calc_crc16(&raw[3..10]);
+        raw[10] = (crc & 0xFF) as u8;
+        raw[11] = (crc >> 8) as u8;
         let found = find_modbus_response(&raw[..12], 1, 9);
         assert_eq!(found, Some((3, 9)));
         assert_eq!(classify_recovered(12, 3, 9), "long_resync");

@@ -17,11 +17,22 @@ use crate::modbus_rtu::{
     apply_capture_inject, classify_modbus_rx_miss, classify_recovered, find_modbus_response,
     get_inject_junk, InjectJunkMode,
 };
-use crate::motion::{LoopStats, ModbusStats, MotorController, TimingWindowStats};
+use crate::motion::{CommandConsumer, LoopStats, ModbusStats, TimingWindowStats};
 use crate::motor::Motor;
 use crate::storage::PinConfiguration;
+use ossm_core::{Command, Engine, Micros};
 
 pub const TARGET_BAUD_RATE: u32 = 115200;
+
+fn now_us() -> Micros {
+    Instant::now().as_micros()
+}
+
+fn drain_motion(engine: &mut Engine, consumer: &mut CommandConsumer) {
+    while let Some(cmd) = consumer.dequeue() {
+        engine.apply(Command::from(cmd));
+    }
+}
 
 static LAST_INJECT_NOTE: AtomicU16 = AtomicU16::new(u16::MAX);
 
@@ -690,8 +701,10 @@ impl<'d> Modbus57AIM30Motor<'d> {
     }
 
     async fn write_position_raw(&mut self, position: i32) -> Result<()> {
-        let data = [position as u16, (position >> 16) as u16];
-        self.client.write_holding_registers(0x16, &data).await
+        let data = ossm_core::modbus::aim30::pack_position_i32(position);
+        self.client
+            .write_holding_registers(ossm_core::modbus::aim30::REG_POSITION, &data)
+            .await
     }
 
     async fn wait_stable_position(&mut self, timeout_ms: u32) -> Result<f32> {
@@ -772,21 +785,15 @@ impl<'d> Motor for Modbus57AIM30Motor<'d> {
     async fn read_position(&mut self) -> Result<f32> {
         let mut rsp = [0u16; 2];
         self.client
-            .read_holding_registers(0x16, 2, &mut rsp)
+            .read_holding_registers(ossm_core::modbus::aim30::REG_POSITION, 2, &mut rsp)
             .await?;
-        let low = rsp[0];
-        let high = rsp[1];
-        let position = (high as i32) << 16 | low as i32;
-        Ok(position as f32 / 32768.0 * 2.0 * PI)
+        let position = ossm_core::modbus::aim30::unpack_position_i32(rsp);
+        Ok(ossm_core::modbus::aim30::counts_to_radians(position))
     }
 
     async fn write_position(&mut self, position: f32, _speed: f32) -> Result<()> {
-        let position_i32 = (position / (2.0 * PI) * 32768.0) as i32;
-        if position_i32 == 0 {
-            self.write_position_raw(1).await
-        } else {
-            self.write_position_raw(position_i32).await
-        }
+        let position_i32 = ossm_core::modbus::aim30::write_counts_for_radians(position);
+        self.write_position_raw(position_i32).await
     }
 
     async fn set_max_power(&mut self, power: f32) -> Result<()> {
@@ -984,7 +991,7 @@ fn bytes_to_base64(data: &[u8], max_bytes: usize) -> alloc::string::String {
 
 pub async fn run_motor(
     app_context: AppContext,
-    motion_consumer: crate::motion::CommandConsumer,
+    mut motion_consumer: crate::motion::CommandConsumer,
     uart_periph: esp_hal::peripherals::UART1<'static>,
     uhci_periph: esp_hal::peripherals::UHCI0<'static>,
     dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
@@ -993,9 +1000,9 @@ pub async fn run_motor(
     let motor_config = app_context.storage.motor_config();
     log::info!("Using motor config from storage cache");
 
-    let mut mc = MotorController::new(motor_config, motion_consumer);
-    mc.flush_snapshot();
-    app_context.update_snapshot(mc.snapshot());
+    let mut engine = Engine::new(motor_config);
+    engine.flush_snapshot();
+    app_context.update_snapshot(engine.snapshot());
 
     log::info!("Waiting 3s for WiFi/BLE initialization to settle before scanning motor...");
     Timer::after_millis(3000).await;
@@ -1078,9 +1085,10 @@ pub async fn run_motor(
         );
         loop {
             Timer::after_millis(10).await;
-            mc.set_motor_connected(false);
-            let _ = mc.compute_cycle();
-            app_context.update_snapshot(mc.snapshot());
+            drain_motion(&mut engine, &mut motion_consumer);
+            engine.apply(Command::SetMotorConnected(false));
+            let _ = engine.tick(now_us());
+            app_context.update_snapshot(engine.snapshot());
         }
     }
 
@@ -1088,11 +1096,15 @@ pub async fn run_motor(
     motor.homing().await?;
 
     let current_position = motor.read_position().await.unwrap_or(0.0);
-    mc.set_motor_connected(true);
-    let _ = mc.sync_to_position(motor.pos_min(), motor.pos_max(), current_position);
-    mc.flush_snapshot();
-    mc.reset_cycle_clock();
-    app_context.update_snapshot(mc.snapshot());
+    engine.apply(Command::SetMotorConnected(true));
+    engine.apply(Command::HomingComplete {
+        pos_min: motor.pos_min(),
+        pos_max: motor.pos_max(),
+        position: current_position,
+    });
+    engine.flush_snapshot();
+    engine.reset_cycle_clock(now_us());
+    app_context.update_snapshot(engine.snapshot());
 
     let _ = motor.set_max_power(0.6).await;
     let _ = motor.set_acceleration(4000.0).await;
@@ -1105,16 +1117,22 @@ pub async fn run_motor(
     loop {
         let log_stats = Instant::now().duration_since(last_stats_log) >= Duration::from_secs(5);
 
+        drain_motion(&mut engine, &mut motion_consumer);
+
         let modbus_stats = motor.get_stats();
-        mc.modbus_stats = modbus_stats;
-        mc.motor_connected = modbus_stats.successful_requests > 0;
-        let (position, speed) = mc.compute_cycle();
+        engine.apply(Command::SetModbusStats(modbus_stats));
+        engine.apply(Command::SetMotorConnected(
+            modbus_stats.successful_requests > 0,
+        ));
+        let out = engine.tick(now_us());
+        let position = out.position;
+        let speed = out.speed;
         let stats_opt = if log_stats {
-            Some(mc.last_loop_stats)
+            Some(engine.last_loop_stats())
         } else {
             None
         };
-        app_context.update_snapshot(mc.snapshot());
+        app_context.update_snapshot(engine.snapshot());
 
         if let Some(st) = stats_opt {
             pending_stats = Some(st);

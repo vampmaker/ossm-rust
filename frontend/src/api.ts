@@ -21,7 +21,7 @@ export function setConnectionMode(mode: ConnectionMode): void {
   currentMode = mode
 }
 
-const api_base = window.location.hostname === 'localhost' ? 'http://ossm.lan' : document.location.href;
+const api_base = import.meta.env.DEV ? 'http://ossm.lan' : document.location.href;
 
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(new URL(path, api_base).toString())

@@ -55,7 +55,7 @@ jobs:
       - name: Run Clippy (C6 Target)
         run: |
           source ~/export-esp.sh
-          cargo clippy --target riscv32imac-unknown-none-elf -- -D warnings
+          cargo clippy -p ossm-esp32 --config='unstable.build-std=["core","alloc"]' --target riscv32imac-unknown-none-elf --features esp32c6 --no-default-features -- -D warnings
 
       - name: Run release script
         run: |

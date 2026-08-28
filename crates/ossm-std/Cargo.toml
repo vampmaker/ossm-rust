@@ -1,0 +1,28 @@
+[package]
+name = "ossm-std"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Desktop OSSM shell (tokio + axum) around ossm-core"
+
+[[bin]]
+name = "ossm-std"
+path = "src/main.rs"
+
+[dependencies]
+ossm-core = { path = "../ossm-core" }
+tokio = { version = "1", features = ["full"] }
+tokio-serial = "5.4"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rmodbus = { version = "0.9", default-features = false, features = ["fixedvec"] }
+fixedvec = "0.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

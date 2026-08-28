@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""Host-side mirror of modbus_rtu CRC + find_modbus_response (see src/modbus_rtu.rs)."""
+"""Host-side mirror of ossm-core Modbus CRC + find_modbus_response (see crates/ossm-core/src/modbus/mod.rs)."""
 
 from __future__ import annotations
 

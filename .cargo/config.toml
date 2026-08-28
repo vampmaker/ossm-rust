@@ -7,9 +7,7 @@ runner = "espflash flash --monitor"
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor"
 
-[unstable]
-build-std = ["core", "alloc"]
-
 [alias]
-b-c6 = "build --target riscv32imac-unknown-none-elf --features esp32c6 --no-default-features"
-b-s3 = "build --target xtensa-esp32s3-none-elf --features esp32s3 --no-default-features"
+# Alias args are not shell-parsed; do not wrap --config in extra quotes.
+b-c6 = "build -p ossm-esp32 --config=unstable.build-std=[\"core\",\"alloc\"] --target riscv32imac-unknown-none-elf --features esp32c6 --no-default-features"
+b-s3 = "build -p ossm-esp32 --config=unstable.build-std=[\"core\",\"alloc\"] --target xtensa-esp32s3-none-elf --features esp32s3 --no-default-features"

@@ -90,6 +90,13 @@ The firmware is built on **`esp-hal`** (bare-metal) with **Embassy** async and *
 # Both targets use the Espressif `esp` channel pinned in rust-toolchain.toml
 cargo b-c6 --release   # ESP32-C6 (RISC-V)
 cargo b-s3 --release   # ESP32-S3 (Xtensa)
+
+# Desktop shell (stable Rust; mock HTTP/WS without a motor):
+cargo +stable run -p ossm-std -- --mock --bind 127.0.0.1:8080
+# Flags override env (.env aliases: DEVICE_PORT, DEVICE_BAUD). Point scripts at:
+#   DEVICE_IP=127.0.0.1:8080
+# Real RS-485 dongle: --serial /dev/ttyUSB0 --baud 115200
+# Config is atomic JSON (`--config ossm-config.json`).
 ```
 
 Install the toolchain with [espup](https://github.com/esp-rs/espup): `espup install --targets esp32c6,esp32s3` (then `source ~/export-esp.sh` if your shell does not pick up `esp` automatically).

@@ -4,7 +4,7 @@ use core::sync::atomic::Ordering;
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_hal::delay::Delay;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
-use esp_hal::gpio::{AnyPin, Level, Output, OutputConfig};
+use esp_hal::gpio::{AnyPin, Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::uart::uhci::{Uhci, UhciRx, UhciTx};
 use esp_hal::uart::{Config, Uart};
 use fixedvec::FixedVec;
@@ -864,7 +864,10 @@ pub(crate) fn init_uart_and_modbus(
     pin_config: &PinConfiguration,
 ) -> Result<ModbusRTUMaster<'static>> {
     let tx_pin = unsafe { AnyPin::steal(pin_config.modbus_tx as u8) };
-    let rx_pin = unsafe { AnyPin::steal(pin_config.modbus_rx as u8) };
+    let rx_pin = Input::new(
+        unsafe { AnyPin::steal(pin_config.modbus_rx as u8) },
+        InputConfig::default().with_pull(Pull::Up),
+    );
     let de_pin = unsafe { AnyPin::steal(pin_config.modbus_de_re as u8) };
 
     let de_re = Output::new(de_pin, Level::Low, OutputConfig::default());

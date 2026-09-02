@@ -118,10 +118,12 @@ fn base_to_cli(command: BaseCommand<'_>) -> Option<CliCommand> {
 
 fn log_set(path: &str, value: &str) {
     log::info!("{} set to {}", path, value);
+    console::write_line(&format!("{} set to {}", path, value));
 }
 
 fn log_get(path: &str, value: &str) {
     log::info!("{}: {}", path, value);
+    console::write_line(&format!("{}: {}", path, value));
 }
 
 fn print_paths_catalog() {
@@ -144,7 +146,7 @@ fn log_path_err(path: &str, err: PathError) {
     }
 }
 
-/// CLI consumer: bytes from `console` IN channel, replies via OUT / `log::*`.
+/// CLI consumer: bytes from `console` IN channel, replies via `write_line` / `log::*`.
 pub async fn handle_cli(app_context: AppContext) {
     let mut cli = CliBuilder::default()
         .writer(CliOutputWriter)
@@ -285,7 +287,6 @@ async fn execute_get(app_context: AppContext, path: &str) {
             let (mode, nbytes) = crate::modbus_rtu::get_inject_junk();
             let msg = format!("{} {}", mode.as_str(), nbytes);
             log_get("inject", msg.as_str());
-            console::write_line(&format!("inject: {}", msg));
         }
         _ => log::error!(
             "Unknown section: {} (try: pin, net, motor, inject)",
@@ -407,7 +408,6 @@ fn set_inject(value: &str) {
     crate::modbus_rtu::set_inject_junk(mode, nbytes as u8);
     let msg = format!("{} {}", mode.as_str(), nbytes);
     log_set("inject", msg.as_str());
-    console::write_line(&format!("inject set to {}", msg));
 }
 
 async fn enqueue(app_context: AppContext, cmd: MotionCommand) {

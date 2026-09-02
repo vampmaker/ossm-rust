@@ -195,7 +195,7 @@ Key interface features include:
 
 You can also drive the device over USB serial (115200 baud, `\r\n`). In `flasher.html`, use the **Serial** panel (or **Monitor**) for interactive CLI; the **Console** panel is for flash/config tool messages only. The same commands work in any serial terminal.
 
-The firmware `console` task owns USB Serial/JTAG and UART0. Log output (`log::*` / `MODBUS_DBG`) and CLI echo/replies share the wire but use **separate paths**: a priority **`CLI_OUT_CH`** queue and dedicated USB TX ring for CLI bytes, **RX-first** polling, and batched log drain so host serial stays responsive under diagnostic log floods. Non-debug motor `ups` remains ~320 Hz on ESP32-C6; `modbus_debug` adds USB log volume but steady-state `ups` is typically only a few percent lower once homing settles.
+The firmware `console` task owns USB Serial/JTAG and UART0. Log output (`log::*` / `MODBUS_DBG`) and CLI echo/replies share the wire but use **separate paths**: a priority **`CLI_OUT_CH`** queue and dedicated USB TX ring for CLI bytes. USB TX is **commit-then-wait** (never rewrite a packet already in the 64-byte IN FIFO). With no ACM reader the console **stalls** and drops logs rather than stuffing the endpoint; CLI ACKs stay on the priority path. RX stays armed while draining so late attach still accepts commands. Non-debug motor `ups` remains ~320 Hz on ESP32-C6; `modbus_debug` adds USB log volume but steady-state `ups` is typically only a few percent lower once homing settles.
 
 Configuration uses nmcli-style **`get`** / **`set`** over dotted paths. Type **`paths`** on-device (or `help get` / `help set`) for the full catalog.
 
@@ -245,7 +245,7 @@ set-waypoints <json>           - Replace waypoint buffer
 append-waypoints <json>        - Append waypoints
 ```
 
-Set ACKs log as `{path} set to {value}` (e.g. `pin.modbus_tx set to 2`). Scalar gets log as `{path}: {value}`.
+Set ACKs are emitted on the CLI path as `{path} set to {value}` (e.g. `pin.modbus_tx set to 2`) and also logged. Scalar gets print `{path}: {value}`.
 
 ### Automated Device Tests (Developers)
 
@@ -254,6 +254,7 @@ Live-hardware scripts in `scripts/` (run with `uv run`); set `DEVICE_IP` in `.en
 | Script | Purpose |
 | --- | --- |
 | `./scripts/test_console_fairness.py` | Serial CLI ACK under `modbus_debug` + `MODBUS_DBG` TX flood (`POST /modbus-inject`, motor running) |
+| `./scripts/test_console_late_attach.py` | Serial CLI ACK after ~12 s with ACM closed (configurator late-attach) |
 | `./scripts/test_modbus_debug_device.py` | Modbus CRC resync / inject via **probe-rs RTT** (avoids USB ACM stalls) |
 | `./scripts/test_modbus_resync.py` | Host-only CRC/resync mirror (no hardware) |
 | `./scripts/stress_dt_max.py` | HTTP+WebSocket load; asserts `dt_max_ms` < 4.5 ms |

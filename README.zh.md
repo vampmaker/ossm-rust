@@ -186,7 +186,7 @@ cargo +stable run -p ossm-std -- --mock --bind 127.0.0.1:8080
 
 也可通过 USB 串口（`115200` 波特，`\r\n`）控制设备。在 `flasher.html` 中请使用 **Serial** 面板（或 **Monitor**）进行交互式 CLI；**Console** 仅显示烧录 / 配置工具自身的日志。同一套命令也适用于任意串口终端。
 
-固件 `console` 任务独占 USB Serial/JTAG 与 UART0。日志输出（`log::*` / `MODBUS_DBG`）与 CLI 回显/应答共用物理链路，但走**独立路径**：优先 **`CLI_OUT_CH`** 队列、CLI 专用 USB TX 环形缓冲、**RX 优先**轮询与分批日志发送，使诊断日志洪泛时主机串口 CLI 仍可响应。非调试模式下电机 `ups` 在 ESP32-C6 上仍约 **320 Hz**；`modbus_debug` 会增加 USB 日志量，但 homing 稳定后 `ups` 通常仅比非调试低几个百分点。
+固件 `console` 任务独占 USB Serial/JTAG 与 UART0。日志输出（`log::*` / `MODBUS_DBG`）与 CLI 回显/应答共用物理链路，但走**独立路径**：优先 **`CLI_OUT_CH`** 队列与 CLI 专用 USB TX 环形缓冲。USB TX 采用 **先提交再等待**（已写入 64 字节 IN FIFO 的包不会被重写）。无 ACM 读端时进入 **Stalled** 并丢弃日志，而不是向满的端点继续塞数据；CLI ACK 走优先队列。TX 进行中仍武装 RX，晚打开串口仍能收命令。非调试模式下电机 `ups` 在 ESP32-C6 上仍约 **320 Hz**；`modbus_debug` 会增加 USB 日志量，但 homing 稳定后 `ups` 通常仅比非调试低几个百分点。
 
 配置采用类似 nmcli 的 **`get`** / **`set`** 点分路径。设备上输入 **`paths`**（或 `help get` / `help set`）查看完整目录。
 
@@ -236,7 +236,7 @@ set-waypoints <json>           - 替换航点缓冲
 append-waypoints <json>        - 追加航点
 ```
 
-设置成功日志格式为 `{path} set to {value}`（如 `pin.modbus_tx set to 2`）。标量读取为 `{path}: {value}`。
+设置成功时 CLI 输出 `{path} set to {value}`（如 `pin.modbus_tx set to 2`），同时写入日志。标量读取为 `{path}: {value}`。
 
 ### 自动化设备测试（开发者）
 
@@ -245,6 +245,7 @@ append-waypoints <json>        - 追加航点
 | 脚本 | 用途 |
 | --- | --- |
 | `./scripts/test_console_fairness.py` | `modbus_debug` + `MODBUS_DBG` TX 洪泛下串口 CLI 应答（`POST /modbus-inject`，电机运行） |
+| `./scripts/test_console_late_attach.py` | ACM 关闭约 12 秒后再打开时的串口 CLI ACK（配置器晚接入） |
 | `./scripts/test_modbus_debug_device.py` | 经 **probe-rs RTT** 验证 Modbus CRC 重同步 / 注入（避免 USB ACM 写阻塞） |
 | `./scripts/test_modbus_resync.py` | 纯主机 CRC/重同步镜像测试（无需硬件） |
 | `./scripts/stress_dt_max.py` | HTTP+WebSocket 负载；断言 `dt_max_ms` < 4.5 ms |

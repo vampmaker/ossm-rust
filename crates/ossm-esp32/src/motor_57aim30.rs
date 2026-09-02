@@ -1115,6 +1115,7 @@ pub async fn run_motor(
     let _ = motor.set_speed_ring_ratio(3000.0).await;
 
     let mut last_stats_log = Instant::now();
+    let mut last_error_log = Instant::now() - Duration::from_secs(1);
     let mut pending_stats: Option<LoopStats> = None;
 
     loop {
@@ -1156,12 +1157,18 @@ pub async fn run_motor(
         }
 
         if let Err(e) = motor.write_position(position, speed).await {
-            log::warn!("Motor write error: {}, retrying...", e);
+            if Instant::now().duration_since(last_error_log) >= Duration::from_secs(1) {
+                last_error_log = Instant::now();
+                log::warn!("Motor write error: {}, retrying...", e);
+            }
             Timer::after_millis(10).await;
             continue;
         }
         if let Err(e) = motor.cycle().await {
-            log::warn!("Motor cycle error: {}, retrying...", e);
+            if Instant::now().duration_since(last_error_log) >= Duration::from_secs(1) {
+                last_error_log = Instant::now();
+                log::warn!("Motor cycle error: {}, retrying...", e);
+            }
             Timer::after_millis(10).await;
             continue;
         }

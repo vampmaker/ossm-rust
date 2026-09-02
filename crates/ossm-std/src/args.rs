@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 /// Desktop OSSM HTTP/WS shell. Flags override environment; environment overrides defaults.
 ///
@@ -10,7 +10,12 @@ use clap::Parser;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ossm-std", version, about)]
 pub struct Args {
-    /// RS-485 / USB-UART device (env: OSSM_SERIAL, DEVICE_PORT)
+    /// Process role: servo (Engine is RTU master) or rtu-relay (serve :502 + /ws/modbus)
+    #[arg(long, value_enum, default_value_t = StdMode::Servo)]
+    pub mode: StdMode,
+
+    /// RS-485 / USB-UART device (env: OSSM_SERIAL, DEVICE_PORT).
+    /// Requires automatic DE/RE direction control; TX-loopback adapters are not supported.
     #[arg(long)]
     pub serial: Option<PathBuf>,
 
@@ -21,6 +26,22 @@ pub struct Args {
     /// HTTP bind address (env: OSSM_BIND; default 127.0.0.1:8080)
     #[arg(long)]
     pub bind: Option<SocketAddr>,
+
+    /// Modbus TCP bind when `--mode rtu-relay` (env: OSSM_MODBUS_BIND; default 127.0.0.1:502)
+    #[arg(long)]
+    pub modbus_bind: Option<SocketAddr>,
+
+    /// Modbus TCP client `HOST:502` (firmware or another ossm-std relay)
+    #[arg(long)]
+    pub relay_tcp: Option<String>,
+
+    /// Binary RTU WebSocket `ws://HOST/ws/modbus`
+    #[arg(long)]
+    pub relay_ws: Option<String>,
+
+    /// Raw RS-485 WebSocket `ws://HOST/ws/rs485`
+    #[arg(long)]
+    pub rs485_ws: Option<String>,
 
     /// Atomic `{pin,net,motor}` JSON path (env: OSSM_CONFIG; default ossm-config.json)
     #[arg(long)]
@@ -38,10 +59,6 @@ pub struct Args {
     #[arg(long)]
     pub static_dir: Option<PathBuf>,
 
-    /// Skip 57AIM30 travel homing (env: OSSM_NO_HOMING=1)
-    #[arg(long, default_value_t = false)]
-    pub no_homing: bool,
-
     /// Force stdin REPL even when stdin is not a TTY (env: OSSM_REPL=1)
     #[arg(long, default_value_t = false)]
     pub repl: bool,
@@ -49,6 +66,14 @@ pub struct Args {
     /// Disable stdin REPL even on a TTY (env: OSSM_NO_REPL=1)
     #[arg(long, default_value_t = false)]
     pub no_repl: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum StdMode {
+    #[default]
+    Servo,
+    #[value(name = "rtu-relay")]
+    RtuRelay,
 }
 
 impl Args {
@@ -78,6 +103,33 @@ impl Args {
                 self.config = Some(PathBuf::from(v));
             }
         }
+        if self.modbus_bind.is_none() {
+            if let Some(v) = env_first(&["OSSM_MODBUS_BIND"]) {
+                self.modbus_bind = v.parse().ok();
+            }
+        }
+        if self.relay_tcp.is_none() {
+            if let Some(v) = env_first(&["OSSM_RELAY_TCP"]) {
+                self.relay_tcp = Some(v);
+            }
+        }
+        if self.relay_ws.is_none() {
+            if let Some(v) = env_first(&["OSSM_RELAY_WS"]) {
+                self.relay_ws = Some(v);
+            }
+        }
+        if self.rs485_ws.is_none() {
+            if let Some(v) = env_first(&["OSSM_RS485_WS"]) {
+                self.rs485_ws = Some(v);
+            }
+        }
+        if let Some(v) = env_first(&["OSSM_MODE"]) {
+            match v.to_ascii_lowercase().as_str() {
+                "rtu-relay" | "rtu_relay" => self.mode = StdMode::RtuRelay,
+                "servo" => self.mode = StdMode::Servo,
+                _ => {}
+            }
+        }
         if env_truthy("OSSM_MOCK") {
             self.mock = true;
         }
@@ -90,9 +142,6 @@ impl Args {
             if let Some(v) = env_first(&["OSSM_STATIC_DIR"]) {
                 self.static_dir = Some(PathBuf::from(v));
             }
-        }
-        if env_truthy("OSSM_NO_HOMING") {
-            self.no_homing = true;
         }
         if env_truthy("OSSM_REPL") {
             self.repl = true;
@@ -116,17 +165,33 @@ impl Args {
         if self.static_dir.is_none() {
             self.static_dir = Some(default_static_dir());
         }
-        if self.serial.is_none() {
-            self.mock = true;
+        if self.modbus_bind.is_none() {
+            self.modbus_bind = Some(default_modbus_bind());
         }
-        if self.mock {
-            self.no_homing = true;
+        if self.serial.is_none()
+            && self.relay_tcp.is_none()
+            && self.relay_ws.is_none()
+            && self.rs485_ws.is_none()
+        {
+            self.mock = true;
         }
         self
     }
 
     pub fn is_mock(&self) -> bool {
-        self.mock || self.serial.is_none()
+        self.mock
+            || (self.serial.is_none()
+                && self.relay_tcp.is_none()
+                && self.relay_ws.is_none()
+                && self.rs485_ws.is_none())
+    }
+
+    pub fn is_rtu_relay(&self) -> bool {
+        self.mode == StdMode::RtuRelay
+    }
+
+    pub fn has_remote_bus(&self) -> bool {
+        self.relay_tcp.is_some() || self.relay_ws.is_some() || self.rs485_ws.is_some()
     }
 
     /// Interactive stdin CLI. Default: on when stdin is a TTY.
@@ -157,10 +222,18 @@ impl Args {
     pub fn slave_id(&self) -> u8 {
         self.slave_id.unwrap_or(1)
     }
+
+    pub fn modbus_bind_addr(&self) -> SocketAddr {
+        self.modbus_bind.unwrap_or_else(default_modbus_bind)
+    }
 }
 
 fn default_bind() -> SocketAddr {
     "127.0.0.1:8080".parse().unwrap()
+}
+
+fn default_modbus_bind() -> SocketAddr {
+    "127.0.0.1:502".parse().unwrap()
 }
 
 pub fn default_static_dir() -> PathBuf {
@@ -200,14 +273,18 @@ mod tests {
         std::env::remove_var("OSSM_SERIAL");
 
         let args = Args {
+            mode: StdMode::Servo,
             serial: None,
             baud: None,
             bind: None,
+            modbus_bind: None,
+            relay_tcp: None,
+            relay_ws: None,
+            rs485_ws: None,
             config: None,
             mock: false,
             slave_id: None,
             static_dir: None,
-            no_homing: false,
             repl: false,
             no_repl: false,
         }
@@ -223,7 +300,6 @@ mod tests {
         }
 
         assert!(args.is_mock());
-        assert!(args.no_homing);
         assert_eq!(args.baud(), 115200);
         assert_eq!(args.bind_addr(), default_bind());
     }

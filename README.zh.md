@@ -1,107 +1,148 @@
-# OSSM-Rust 固件
+# OSSM-Rust
 
-本仓库为用 Rust 编写的开源通用性控制嵌入式软件（OSSM Controller Firmware）。本固件专为 ESP32-C6 或 ESP32-S3 微控制器量身打造，通过 RS-485 Modbus 协议驱动 57AIM30 一体化伺服电机（集成驱动）。
+同一套 57AIM30 运动 Engine 有**两条互不共用控制器的路径**，请只选 **一条**：
 
-本指南专为所有用户编写，即使您没有任何编程、硬件或工程技术背景，也能轻松上手！请仔细按照以下图文步骤进行接线与配置，即可顺利运行您的设备。
+| | **路径 A — `ossm-std`** | **路径 B — `ossm-esp32`** |
+| --- | --- | --- |
+| **是什么** | Linux 桌面进程。电脑本身就是设备。 | ESP32-C6 / ESP32-S3 固件。WiFi / BLE / USB CLI。 |
+| **硬件** | 电脑 + USB-RS485 适配器（自动 DE/RE）。**无需单片机。** | ESP32 开发板 + TTL MAX3485（DI / RO / DE+RE）。 |
+| **接线** | 适配器 A/B/GND 接电机。24 V 动力 + 5 V 逻辑。 | ESP32 GPIO 接 MAX3485；ESP32 5 V / GND 给电机逻辑。 |
+| **配置** | `--serial` / `--bind` / `--config`（或 `.env`）。HTTP 在 `127.0.0.1:8080`。 | NVS `pin.*` / `net.*`（烧录器、网页或 USB CLI）。 |
+| **界面** | `http://127.0.0.1:8080`（脚本设 `DEVICE_IP=127.0.0.1:8080`） | 设备 WiFi IP 或 `http://ossm.local` |
 
-## 第一部分：所需硬件
+两条路径的电机插头与 24 V 供电相同。
 
-以下是搭建 OSSM 控制器所需的硬件组件清单。
+> [!TIP]
+> **电机插头（两条路径通用）**
+> • **前侧 6 针动力：** 绿色 **KF2EDGK-3.81 6P** — 24 V。
+> • **后侧 10 针通信/逻辑：** 白色 **PHB2.0 2×5P** — 5 V + RS-485。切勿把 24 V 接到后侧插座。
+
+---
+
+## 路径 A：桌面（`ossm-std`）——无需单片机
+
+### A.1 硬件
+
+| 组件 | 说明 |
+| --- | --- |
+| **Linux 电脑** | 运行 `ossm-std`（stable Rust）。 |
+| **USB-RS485 适配器** | 必须**自动 DE/RE**。不支持 TX 环回、也不支持由主机驱动 DE/RE（ossm-std 不剥离 TX 回显）。常见设备 `/dev/ttyUSB0`。 |
+| **电机** | `57AIM30`（不要 `57AIM30H`）。 |
+| **24 V 直流电源** | 前侧端子，驱动轴。 |
+| **5 V USB 充电器** | 后侧逻辑 5 V / COM（若适配器 5 V 脚电流足够也可用）。 |
+| **线缆** | DC 5.5×2.1/2.5 mm 母头、**KF2EDGK-3.81 6P**、**PHB2.0 2×5P**。 |
+
+### A.2 接线
+
+<div align="center">
+  <img src="./assets/wiring_diagram_std_zh.svg" alt="ossm-std USB-RS485 接线（无 ESP32）" width="100%"/>
+</div>
+
+| 电机 | --> | 主机侧 |
+| --- | --- | --- |
+| 前侧 **+V** / **GND** | --> | 24 V 适配器正极 / 负极 |
+| 后侧 **10: 5V** / **6: COM** | --> | 5 V 充电器 5 V / GND |
+| 后侧 **2: 485A** / **3: 485B** | --> | USB-RS485 **A** / **B** |
+| 后侧 **COM** | --> | USB-RS485 **GND**（信号参考） |
+
+> [!CAUTION]
+> 通电前核对 24 V 极性。禁止把 24 V 接到后侧 10 针插座。
+
+### A.3 配置
+
+命令行优先于环境变量（`.env` 可用 `DEVICE_PORT`、`DEVICE_BAUD`），再落到默认值。电机 JSON 为 `--config`（默认 `ossm-config.json`）。没有 `pin.*` / `net.*`。
+
+```bash
+# 仅界面、无电机：
+cargo +stable run -p ossm-std -- --mock --bind 127.0.0.1:8080
+
+# USB-RS485（始终回零）：
+cargo +stable run -p ossm-std -- --serial /dev/ttyUSB0 --baud 115200 \
+  --bind 127.0.0.1:8080 --config ossm-config.json
+```
+
+打开 `http://127.0.0.1:8080`。脚本：`DEVICE_IP=127.0.0.1:8080`。
+
+`--mode servo`（默认）作为 RTU 主机。`--mode rtu-relay` 则提供 Modbus TCP `--modbus-bind`（默认 `127.0.0.1:502`）和 `/ws/modbus`，不再占用运动。`--mock` 使用虚拟 `0..100` 行程。
+
+---
+
+## 路径 B：ESP32 固件（`ossm-esp32`）
+
+### B.1 硬件
 
 | 组件 | 规格描述 | 选型建议与备注 |
 | --- | --- | --- |
-| **微控制器** | ESP32-C6 或 ESP32-S3 开发板 | 任何带有 Type-C (USB-C) 接口的标准 ESP32-C6 或 ESP32-S3 开发板均可使用。<br><br>**关于 USB 接口的重要提示：** 很多市面上的开发板配有**两个** Type-C 接口（通常分别标注为 "USB" / "Native" / "JTAG" 与 "UART" / "COM"）。请务必将数据线插在 **Native JTAG / USB 接口**（即原生 USB 接口），而非 USB 转串口（UART）接口上！原生 JTAG 接口直接连接主控芯片，通信传输更快，且在网页中能即插即用，无需额外安装复杂的电脑驱动程序。 |
-| **驱动电机** | 57AIM30 一体化伺服电机（内置驱动） | **重要提示：** 请务必选购 `57AIM30` 型号，而非 `57AIM30H`。`57AIM30` 额定转速为 1500 RPM，额定扭矩为 0.96 N·m，其性能曲线最适合本项目的负载需求。 |
-| **总线收发器** | MAX3485 (RS-485) 转换模块 | 用于实现 ESP32 微控制器与伺服电机之间的 RS-485 Modbus 串行总线通信。 |
-| **主电源（电机）** | 24V 直流电源适配器 | 为一体化伺服电机供电。请确保输出功率与电流能够满足您的负载需求。 |
-| **逻辑电源（ESP32）**| 5V USB 充电器 | 任何标准的智能手机 5V 充电头搭配 USB-C 数据线即可，在系统完成配置后为开发板稳定供电。 |
-| **线缆与接插件** | - DC 5.5×2.1/2.5mm 母头插座<br>- **KF2EDGK-3.81 6P** 绿色端子插头<br>- **PHB2.0 2×5P** 通信插头/连接线<br>- 杜邦线 | **关于电机接座端子的重要提示：** 请检查购买电机时包装盒内的配件。如果电机未附带配套的绿色与白色插头，您需要自行购买：<br>• **电机前侧 6 针动力电源座：** 需要购买 **KF2EDGK-3.81 6P** 间距3.81mm绿色拔插式接线端子。<br>• **电机后侧 10 针通信与逻辑电源座：** 需要购买 **PHB2.0 2×5P** (2.0mm间距，2行5针) 插头或预压制好的排线。<br>DC 母头插座用于将 24V 电源适配器引出，并接入到绿色的 KF2EDGK 动力接线端子中。 |
+| **微控制器** | ESP32-C6 或 ESP32-S3 开发板（USB-C） | 很多板有**两个 Type-C 口**：<br>• **USB / Native / JTAG** — USB Serial/JTAG。烧录与固件 CLI（Linux 上多为 `/dev/ttyACM*`）。<br>• **UART / COM** — USB-UART 接到 UART0（C6：GPIO16 TX / GPIO17 RX）。仅控制台日志。不是电机总线，也不能用于网页烧录器。 |
+| **电机** | 57AIM30（不要 `57AIM30H`） | 1500 RPM，0.96 N·m。 |
+| **RS-485 收发器** | MAX3485 TTL 模块 | 接在 ESP32 UART 与电机之间。 |
+| **24 V 直流电源** | 电机动力 | 按负载选择功率。 |
+| **5 V USB 充电器** | 配置完成后给 ESP32 供电 | USB-C。电机逻辑 5 V 来自 ESP32 的 5 V 脚。 |
+| **线缆** | DC 母头、**KF2EDGK-3.81 6P**、**PHB2.0 2×5P**、杜邦线 | 电机插头与路径 A 相同。 |
 
-## 第二部分：硬件接线与组装
-
-正确的接线是设备正常稳定运行的关键。如果您是第一次接触硬件，不用担心，只需按照步骤一步一步对照即可！在给任何设备接通电源之前，请务必仔细核对每一个线路连接。
-
-### 硬件接线系统总览图
-下图为整体硬件系统接线示意图，清晰展示了电源适配器、ESP32 开发板、MAX3485 通信收发模块以及 57AIM30 一体化伺服电机前、后插座端子之间的完整连线方式：
+### B.2 接线
 
 <div align="center">
-  <img src="./assets/wiring_diagram_zh.svg" alt="OSSM 硬件接线总览图" width="100%"/>
+  <img src="./assets/wiring_diagram_zh.svg" alt="ossm-esp32 ESP32 + MAX3485 接线" width="100%"/>
 </div>
 
-> [!TIP]
-> **插头该接哪个插座？**
-> 您的 57AIM30 电机上有两个插座接口：
-> • **前侧 6 针动力插座：** 使用绿色 **KF2EDGK-3.81 6P** 插头，用于输入 24V 大电流动力电源。
-> • **后侧 10 针控制插座：** 使用白色 **PHB2.0 2×5P** 插头，用于提供 5V 控制芯片工作电源及 RS-485 通信信号线。
-
-### 第一步：电机主电源接线（前侧 6 针动力端子）
-
-该端子负责为伺服驱动及电机定子提供 24V 高压动力。请在此处使用绿色的 **KF2EDGK-3.81 6P** 插头：
+**电机 24 V（前侧 6 针）**
 
 | 电机引脚 (+V) | --> | 24V 直流电源适配器（正极 `+`） |
 | --- | --- | --- |
 | 电机引脚 (GND) | --> | 24V 直流电源适配器（负极 `-`） |
 
-> [!CAUTION]
-> **注意极性！** 在将 24V 电源适配器插入插座通电之前，请务必再三核对正极 (`+`) 与负极 (`-`) 绝对不能接反！
+**RS-485 与逻辑（后侧 10 针与 ESP32）**
 
-### 第二步：通信总线与逻辑电源接线（后侧 2×5 针控制端子与 ESP32）
-
-电机背部的控制端子使用白色的 **PHB2.0 2×5P** 插头。它不仅为电机内部的智能芯片提供 5V 逻辑电源，还通过 RS-485 收发模块 (MAX3485) 与 ESP32 进行控制指令的双向通信。
-
-首先，将电机的 RS-485 通信数据线连接至 MAX3485 模块：
-
-| 电机引脚 (485A) | --> | MAX3485 模块 (A 端口) |
+| 电机 (485A) | --> | MAX3485 **A** |
 | --- | --- | --- |
-| 电机引脚 (485B) | --> | MAX3485 模块 (B 端口) |
-
-随后，将您的 ESP32 开发板与 MAX3485 模块以及电机后侧控制端子进行连接：
+| 电机 (485B) | --> | MAX3485 **B** |
 
 | ESP32 开发板引脚 | --> | 目标硬件引脚 | 功能作用说明 |
 | --- | --- | --- | --- |
-| 5V (或 VBUS / VIN) | --> | 电机引脚 (5V) | 为电机内部控制逻辑芯片供电 |
-| GND (地线) | --> | 电机引脚 (COM / GND) | 共地，确保信号稳定与电气回路安全 |
-| 3.3V (或 3V3) | --> | MAX3485 模块电源 (VCC / 3.3V) | 为 RS-485 数据通信模块供电 |
-| GND (地线) | --> | MAX3485 模块地 (GND) | RS-485 模块共地 |
-| GPIO 18 (TX) | --> | MAX3485 数据发送端 (DI / TX) | 向电机发送各种控制指令 |
-| GPIO 19 (RX) | --> | MAX3485 数据接收端 (RO / RX) | 接收电机的反馈与遥测数据 |
-| GPIO 20 | --> | MAX3485 收发方向控制 (DE / RE) | 控制 RS-485 总线的收发方向转换 |
+| 5V (或 VBUS / VIN) | --> | 电机引脚 (5V) | 电机逻辑 |
+| GND | --> | 电机引脚 (COM / GND) | 逻辑共地 |
+| 3.3V | --> | MAX3485 VCC | 收发器供电 |
+| GND | --> | MAX3485 GND | 收发器共地 |
+| GPIO 18 (UART **TX**) | --> | MAX3485 **DI** | MCU 发送 |
+| GPIO 19 (UART **RX**) | --> | MAX3485 **RO** | MCU 接收 |
+| GPIO 20 | --> | MAX3485 **DE** 与 **RE**（短接） | 方向控制 |
 
-> [!NOTE]
-> **关于 GPIO 引脚分配的说明**：固件 NVS 中默认的 Modbus 引脚为 GPIO 18 / 19 / 20（两款芯片默认值相同）。在 ESP32-S3 上，19 / 20 常被 USB Serial/JTAG 占用——请将 Modbus TX/RX/DE-RE 接到空闲 GPIO，并通过网页界面、串口命令（`set pin.modbus_tx` 等）或烧录器配置面板写入 NVS。固件**不会**自动探测 GPIO 接线；开机时仅在电机未以 `115200` 响应时扫描 Modbus 波特率 / 从站 ID。
+> [!WARNING]
+> UART **必须交叉**：ESP32 **TX → DI**，ESP32 **RX → RO**。丝印 TXD/RXD 的模块常常 **TXD = RO**、**RXD = DI**——不要把 MCU TX 接到 TXD。
+>
+> NVS 默认：`pin.modbus_tx=18`、`pin.modbus_rx=19`、`pin.modbus_de_re=20`。板级不同请改（ESP32-S3 的 19/20 常被 USB D−/D+ 占用）。不会自动探测 GPIO；仅在电机未以 `115200` 响应时扫描波特率 / 从站 ID。
 
-### 第三步：为 ESP32 开发板供电
-
-最后，使用 USB-C 数据线将 ESP32 开发板连接至电脑（用于下一步烧录），或连接至标准的 5V USB 充电头（日常独立运行时）：
-
-| ESP32 Type-C 接口 | --> | 5V USB 充电头 / 电脑 USB 接口 |
-| --- | --- | --- |
-
-> [!IMPORTANT]
-> 再次提醒：如果您的 ESP32 开发板上有两个 Type-C 接口，请务必把线插在 **Native JTAG / USB 接口**（而非 UART / COM 串口转换接口）上！
+用 **USB / Native / JTAG** 给 ESP32 供电（烧录 / CLI）。**UART / COM** 只是 UART0 控制台。
 
 ### 从源码编译（开发者可选）
 
-普通用户完全无需自行搭建开发环境或编译代码——我们在“第三部分”为您准备好了现成的编译版本！如果您是开发者，想要从源代码进行定制与构建，本项目采用 Espressif 官方的 `esp` Rust 工具链（已在 `rust-toolchain.toml` 中精确配置）。通过 `.cargo/config.toml` 中预设的快捷命令即可一键编译：
+预编译固件见第三部分（烧录）。自行编译：
+
+固件为 **`esp-hal`** + Embassy + **`esp-rtos`**，`no_std`。快捷命令在 `.cargo/config.toml`：
 
 ```
-cargo b-c6 --release    # 为 ESP32-C6 平台编译固件
-cargo b-s3 --release    # 为 ESP32-S3 平台编译固件
-
-# 桌面壳（stable；无电机的 mock HTTP/WS）：
-cargo +stable run -p ossm-std -- --mock --bind 127.0.0.1:8080
-# 脚本将 DEVICE_IP=127.0.0.1:8080
+cargo b-c6 --release    # ESP32-C6
+cargo b-s3 --release    # ESP32-S3
 ```
 
-构建目标由 Cargo 特性 / 别名（`esp32c6` / `esp32s3`）选择。两款芯片的默认 Modbus GPIO 编号相同；若板级接线不同，请在 NVS 中修改引脚配置。
+路径 A（`ossm-std`）使用 **stable** Rust：`cargo +stable run -p ossm-std`（见 **A.3**）。
 
-## 第三部分：烧录固件
+用 [espup](https://github.com/esp-rs/espup) 安装工具链：`espup install --targets esp32c6,esp32s3`（必要时 `source ~/export-esp.sh`）。
+
+```bash
+./scripts/release.sh
+```
+
+会构建前端、烧录器与两款固件。芯片特性：`esp32c6` / `esp32s3`。
+
+## 第三部分：烧录固件（仅 `ossm-esp32`）
 
 您无需从源码编译。预编译好的**合并**固件镜像（`ossm-esp32c6.bin` / `ossm-esp32s3.bin`）在仓库 **Releases** 中提供，并附带基于 [Web Serial API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API) 的独立网页烧录器（`flasher.html`）——无需安装命令行工具。
 
 > [!IMPORTANT]
-> **请使用 Native USB / JTAG 接口！**
-> 若开发板有**两个** Type-C 口（常见标注 "USB" / "Native" / "JTAG" 与 "UART" / "COM" / "CP2102"），**请始终插入 Native JTAG / USB 口**。该口直连芯片，可在 Chrome / Edge 中即插即用，通常不必安装额外 USB–UART 驱动。
+> **请使用 USB / Native / JTAG 口烧录！**
+> 若开发板有**两个** Type-C 口，请把烧录器插在 **USB / Native / JTAG**，不要插 **UART / COM**。原生 USB 直连芯片（Chrome / Edge，通常不必额外 USB–UART 驱动）。UART/COM 只是 UART0 控制台。
 
 ### 烧录器界面一览
 
@@ -147,7 +188,7 @@ cargo +stable run -p ossm-std -- --mock --bind 127.0.0.1:8080
 | 分组 | 填写内容 |
 | --- | --- |
 | **WiFi** | 开关 **Enable WiFi**；开启时填写 SSID 与密码。若仅用 BLE / USB，可关闭 WiFi。 |
-| **GPIO Pins** | Modbus **TX** / **RX** / **DE/RE**（默认 `18` / `19` / `20`）。接线不同时请改（尤其 ESP32-S3 上 19/20 可能被 USB 占用）。 |
+| **GPIO Pins** | Modbus **TX**（UART TX → MAX3485 DI）、**RX**（UART RX → RO）、**DE/RE**（默认 `18` / `19` / `20`）。接线不同时请改（尤其 ESP32-S3 上 19/20 可能被 USB 占用）。 |
 | **Motor / Modbus** | 可选时序：读超时 (ms)、字节间超时 (µs)、帧间静默 (µs)、扫描延迟 (µs)。填 `0` 使用固件自动默认值（115200 下：**10 ms** 帧超时、**750 µs** 字节间、**350 µs** 帧间）。界面中波特率 `115200` 与设备 ID `1` 为固定显示。 |
 | **BLE** | **Enable Bluetooth Low Energy (BLE)** — 默认开启，不需要时可关闭。 |
 
@@ -214,7 +255,8 @@ pin.modbus_rx_timeout_us                          0..200000（0 = 自动）
 pin.modbus_scan_delay_us                          0..200000（0 = t3.5）
 pin.modbus_inter_frame_delay_us                   0..200000（0 = 自动）
 pin.ble_enabled / pin.modbus_debug                true|false（debug 需重启）
-pin.operating_mode                                servo|rtu_relay（需重启）
+pin.operating_mode                                servo|rtu_relay|rs485
+pin.modbus_baud                                   1200..3000000（默认 115200）
 net.wifi_enabled / net.dhcp_enabled               true|false
 net.ssid / net.password / net.hostname          字符串
 net.static_ip / static_mask / static_gateway / static_dns   IPv4
@@ -247,6 +289,7 @@ append-waypoints <json>        - 追加航点
 | `./scripts/test_console.py` | USB CLI 晚接入、电机 `ups`（ACM 开/关）、probe-rs RTT、`MODBUS_DBG` 洪泛下 CLI |
 | `./scripts/test_modbus_debug_device.py` | 经 **probe-rs RTT** 验证 Modbus CRC 重同步 / 注入（避免 USB ACM 写阻塞） |
 | `./scripts/test_modbus_resync.py` | 纯主机 CRC/重同步镜像测试（无需硬件） |
+| `./scripts/test_rs485_transceiver.py` | 在线切换 `operating_mode=rs485`（无需重启）；经 ossm-std 测 USB 与 `/ws/rs485` |
 | `./scripts/stress_dt_max.py` | HTTP+WebSocket 负载；断言 `dt_max_ms` < 4.5 ms |
 
 ### 多模 CLI 控制工具 (`ossm.py`)
@@ -474,24 +517,36 @@ append-waypoints <json>        - 追加航点
 *   `modbus_inter_frame_delay_us`（数字）：Modbus 正常通信时的帧间静默延迟（微秒，$t_{3.5}$），`0` 表示自动（115200 波特率默认为 `350µs`，确保完整的往返控制时延于 <3ms 以支撑 >300Hz 的电机控制刷新率）。
 *   `ble_enabled`（布尔）：是否启用 BLE GATT 服务。
 *   `modbus_debug`（布尔）：Modbus RX 诊断模式——**5 ms** 接收截止（与生产相同的 **256 B** UHCI DMA 缓冲），对每帧分类（`empty` / `short` / `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`），并在 USB 控制台打印 `MODBUS_DBG` TX/RX 十六进制。**需重启生效。** 会显著增加 USB 日志量；稳态电机 `ups` 通常仅比非调试低几个百分点（ESP32-C6 上约 310 vs 320 Hz）。控制台 **TX/RX 公平性**（`CLI_OUT_CH`、CLI/日志独立 USB 环形缓冲）使串口 CLI 在洪泛下仍可响应。可用 `./scripts/test_console.py --only fairness` 验证；诊断后请关闭。也可通过 CLI `set pin.modbus_debug`、刷写器或 `ossm.py pins --modbus-debug` 设置。
-*   `operating_mode`（字符串）：`"servo"`（默认 OSSM 运动控制）或 `"rtu_relay"`（Modbus RTU 桥接）。**需重启生效。**
+*   `operating_mode`（字符串）：`"servo"`（OSSM 运动）、`"rtu_relay"`（成帧 Modbus TCP `:502` + `/ws/modbus`）或 `"rs485"`（UART1 原始管道，USB ACM + `/ws/rs485`）。**在线切换，无需重启。** `rs485` 激活时 USB 无 CLI（经 HTTP/BLE 退出）。
+*   `modbus_baud`（数字）：UART1 启动波特率（默认 `115200`）。`rs485` 模式下实时波特率跟随 USB `SET_LINE_CODING`（ESP32-C6）以及 `/ws/rs485` CFG 包。
 
 #### `POST /pin-config`
 
 *   **请求方法：** `POST`
-*   **接口描述：** 更新 Modbus GPIO 引脚映射及通信时序配置。注意，修改硬件引脚映射或 `operating_mode` 后需要软重启微控制器方可生效。
+*   **接口描述：** 更新 Modbus GPIO 引脚映射及通信时序配置。`operating_mode` 与 UART 引脚重映射立即生效（UART1 所有者重启当前角色）。WiFi/SSID 仍需重启。
 *   **请求消息体：** 结构与 `GET /pin-config` 返回的 JSON 对象相同。
 *   **响应消息体：** 成功更新后的配置 JSON 对象。
 
 ### RTU 中继模式
 
-当 `operating_mode` 为 `"rtu_relay"`（设置面板、`POST /pin-config` 或串口 CLI `set pin.operating_mode rtu_relay`，然后重启）时，固件不运行电机控制环，而是作为 RS-485 Modbus RTU 桥：
+当 `operating_mode` 为 `"rtu_relay"`（设置面板、`POST /pin-config` 或串口 CLI `set pin.operating_mode rtu_relay`；**无需重启**）时，固件不运行电机控制环，而是作为 RS-485 Modbus RTU 桥：
 
 * **Modbus TCP** 端口 **502**
 * **WebSocket** `ws://<设备>/ws/modbus`（二进制完整 RTU 帧含 CRC）
 * 网页前端显示中继提示并隐藏电机控制面板
 * `release/motor-control.html` 支持 **Remote WebSocket** 连接
 * 测试：`./scripts/test_modbus_relay.py --switch-mode`、`./scripts/test_modbus_tcp.py`
+
+### RS-485 收发模式
+
+当 `operating_mode` 为 `"rs485"` 时，UART1 为原始字节管道（主机负责 RTU 时序）：
+
+* USB ACM 为数据面（无 CLI / USB 日志）。UART0/RTT 日志保留。经 HTTP/BLE 改回 `operating_mode` 退出。
+* WebSocket `ws://<设备>/ws/rs485` — 报文 `u8 type | u16le len | payload`（`0` TX，`1` RX，`2` CFG JSON `{"baud":115200}`）
+* ESP32-C6 将 USB `SET_LINE_CODING` 的 `dwDTERate` 应用到 UART1
+* 固件管道自行驱动 DE/RE。主机 `--serial` USB-RS485 适配器也必须自动切换方向（ossm-std 不剥离 TX 回显；环回适配器不受支持）。
+* `ossm-std --mode rtu-relay --serial …` 或 `--rs485-ws ws://HOST/ws/rs485` 可为 motor-control 提供 Modbus TCP
+* 测试：`./scripts/test_rs485_transceiver.py`
 
 #### `POST /restart`
 

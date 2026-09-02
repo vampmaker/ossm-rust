@@ -8,7 +8,7 @@ const { t } = useI18n()
 
 const props = defineProps<{
   state: DriveState | null
-  connectionType: 'serial' | 'websocket'
+  connectionType: 'serial' | 'websocket' | 'rs485'
   baudRate: number
   wsUrl: string
   isConnected: boolean
@@ -17,7 +17,7 @@ const props = defineProps<{
 }>()
 
 defineEmits<{
-  (e: 'update:connectionType', value: 'serial' | 'websocket'): void
+  (e: 'update:connectionType', value: 'serial' | 'websocket' | 'rs485'): void
   (e: 'update:baudRate', value: number): void
   (e: 'update:wsUrl', value: string): void
   (e: 'toggle'): void
@@ -74,14 +74,15 @@ const connectCaption = computed(() => {
           class="border border-gray-400 bg-white px-1 py-0.5 disabled:bg-gray-100 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] font-sans"
           :value="connectionType"
           :disabled="isConnected"
-          @input="$emit('update:connectionType', ($event.target as HTMLSelectElement).value as 'serial' | 'websocket')"
+          @input="$emit('update:connectionType', ($event.target as HTMLSelectElement).value as 'serial' | 'websocket' | 'rs485')"
         >
           <option value="serial">{{ t('connect.localSerial') }}</option>
           <option value="websocket">{{ t('connect.remoteWebSocket') }}</option>
+          <option value="rs485">{{ t('connect.rs485WebSocket') }}</option>
         </select>
       </div>
 
-      <div v-if="connectionType === 'serial'" class="flex items-center gap-1.5 flex-wrap">
+      <div v-if="connectionType === 'serial' || connectionType === 'rs485'" class="flex items-center gap-1.5 flex-wrap">
         <label for="mc-baud" class="text-gray-900 select-none">{{ t('connect.baudRate') }}</label>
         <select
           id="mc-baud"
@@ -94,7 +95,7 @@ const connectCaption = computed(() => {
         </select>
       </div>
 
-      <div v-else class="flex flex-col gap-0.5">
+      <div v-if="connectionType !== 'serial'" class="flex flex-col gap-0.5">
         <label for="mc-ws-url" class="text-gray-900 select-none">{{ t('connect.wsUrl') }}</label>
         <input
           id="mc-ws-url"
@@ -102,7 +103,7 @@ const connectCaption = computed(() => {
           class="border border-gray-400 bg-white px-1 py-0.5 font-mono text-[11px] disabled:bg-gray-100 w-full shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)]"
           :value="wsUrl"
           :disabled="isConnected"
-          :placeholder="t('connect.wsUrlPlaceholder')"
+          :placeholder="connectionType === 'rs485' ? t('connect.wsRs485Placeholder') : t('connect.wsUrlPlaceholder')"
           @input="$emit('update:wsUrl', ($event.target as HTMLInputElement).value)"
         />
       </div>

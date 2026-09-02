@@ -39,6 +39,7 @@ const defaultPinConfig: PinConfiguration = {
   ble_enabled: true,
   modbus_debug: false,
   operating_mode: 'servo',
+  modbus_baud: 115200,
 }
 
 const defaultNetConfig: NetworkConfiguration = {
@@ -429,8 +430,41 @@ const isMotorConnected = computed<boolean>(() => {
 })
 
 const isRelayMode = computed(
-  () => (pinConfig.value.operating_mode ?? 'servo') === 'rtu_relay',
+  () => (pinConfig.value.operating_mode ?? 'servo') !== 'servo',
 )
+
+async function waitPinOperatingMode(want: string, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const pin = await api.getPinConfig()
+    if ((pin.operating_mode ?? 'servo') === want) {
+      pinConfig.value = pin
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  throw new Error(`operating_mode did not become ${want}`)
+}
+
+async function applyOperatingMode(mode?: PinConfiguration['operating_mode']) {
+  pinConfigSaving.value = true
+  pinConfigSaved.value = false
+  error.value = null
+  try {
+    const want = mode ?? pinConfig.value.operating_mode ?? 'servo'
+    pinConfig.value = { ...pinConfig.value, operating_mode: want }
+    pinConfig.value = await api.setPinConfig(pinConfig.value)
+    await waitPinOperatingMode(want)
+    pinConfigSaved.value = true
+  }
+  catch (e) {
+    console.error(e)
+    error.value = t('errors.saveSettingsFailed')
+  }
+  finally {
+    pinConfigSaving.value = false
+  }
+}
 
 async function saveAllSettings() {
   pinConfigSaving.value = true
@@ -438,7 +472,9 @@ async function saveAllSettings() {
   netConfigSaved.value = false
   error.value = null
   try {
+    const want = pinConfig.value.operating_mode ?? 'servo'
     pinConfig.value = await api.setPinConfig(pinConfig.value)
+    await waitPinOperatingMode(want)
     netConfig.value = await api.setNetworkConfig(netConfig.value)
     pinConfigSaved.value = true
     netConfigSaved.value = true
@@ -711,6 +747,7 @@ watch(() => config.value.wave_func, (newWaveFunc, oldWaveFunc) => {
           @save="saveAllSettings"
           @reset="resetAllSettings"
           @restart="restartDevice"
+          @apply-operating-mode="applyOperatingMode"
         />
       </div>
     </div>

@@ -15,7 +15,8 @@ pin — full PinConfiguration JSON
   pin.modbus_scan_delay_us                     0..200000 (0 = t3.5)
   pin.modbus_inter_frame_delay_us              0..200000 (0 = auto)
   pin.ble_enabled / modbus_debug               true|false (debug: reboot)
-  pin.operating_mode                           servo|rtu_relay (reboot)
+  pin.operating_mode                           servo|rtu_relay|rs485
+  pin.modbus_baud                              1200..3000000 (default 115200)
 
 net — full NetworkConfiguration JSON
   net.wifi_enabled / dhcp_enabled              true|false
@@ -38,6 +39,7 @@ pub fn pin_field(pin: &PinConfiguration, key: &str) -> Result<String, PathError>
         "ble_enabled" => Ok(bool_str(pin.ble_enabled)),
         "modbus_debug" => Ok(bool_str(pin.modbus_debug)),
         "operating_mode" => Ok(pin.operating_mode.clone()),
+        "modbus_baud" => Ok(format!("{}", pin.modbus_baud)),
         _ => Err(PathError::UnknownKey),
     }
 }
@@ -91,10 +93,18 @@ pub fn set_pin(pin: &mut PinConfiguration, key: &str, value: &str) -> Result<(),
             Ok(())
         }
         "operating_mode" => {
-            if !matches!(value, "servo" | "rtu_relay") {
+            if crate::storage::parse_operating_mode(value).is_none() {
                 return Err(PathError::InvalidValue);
             }
             pin.operating_mode = String::from(value);
+            Ok(())
+        }
+        "modbus_baud" => {
+            let v = parse_u32_max(value, 3_000_000)?;
+            if v != 0 && v < 1200 {
+                return Err(PathError::InvalidValue);
+            }
+            pin.modbus_baud = if v == 0 { 115_200 } else { v };
             Ok(())
         }
         _ => Err(PathError::UnknownKey),

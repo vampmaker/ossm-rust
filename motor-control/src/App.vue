@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { setLocale, type AppLocale } from './i18n'
 import { SerialModbusClient } from './lib/serial-port'
 import { WebSocketModbusClient } from './lib/websocket-modbus'
+import { WebSocketRs485Client } from './lib/websocket-rs485'
 import type { ModbusTransport } from './lib/transport'
 import { buildReadHoldingRegisters } from './lib/modbus-rtu'
 import { parseRegistersToState, type DriveState } from './lib/registers'
@@ -22,8 +23,9 @@ const { t, locale } = useI18n()
 
 const serialClient = new SerialModbusClient()
 const wsClient = new WebSocketModbusClient()
+const rs485Client = new WebSocketRs485Client()
 
-const connectionType = ref<'serial' | 'websocket'>('serial')
+const connectionType = ref<'serial' | 'websocket' | 'rs485'>('serial')
 const client = ref<ModbusTransport>(serialClient)
 
 const isConnected = ref(false)
@@ -45,7 +47,25 @@ const webSerialSupported = computed(() => 'serial' in navigator)
 
 watch(connectionType, (next) => {
   if (isConnected.value) return
-  client.value = next === 'websocket' ? wsClient : serialClient
+  if (next === 'websocket') {
+    client.value = wsClient
+    if (wsUrl.value.includes('/ws/rs485')) {
+      wsUrl.value = 'ws://ossm.lan/ws/modbus'
+    }
+  } else if (next === 'rs485') {
+    client.value = rs485Client
+    if (wsUrl.value.includes('/ws/modbus')) {
+      wsUrl.value = 'ws://ossm.lan/ws/rs485'
+    }
+  } else {
+    client.value = serialClient
+  }
+})
+
+watch(baudRate, (baud) => {
+  if (isConnected.value && connectionType.value === 'rs485') {
+    rs485Client.setBaudRate(baud)
+  }
 })
 
 function switchLocale(next: AppLocale) {
@@ -83,9 +103,14 @@ async function toggleConnection() {
       errorMsg.value = ''
       clampDeviceAddress()
       scanTickCounter.value = 0
-      client.value = connectionType.value === 'websocket' ? wsClient : serialClient
-      if (connectionType.value === 'websocket') {
-        await client.value.connect({ url: wsUrl.value })
+      client.value =
+        connectionType.value === 'websocket'
+          ? wsClient
+          : connectionType.value === 'rs485'
+            ? rs485Client
+            : serialClient
+      if (connectionType.value === 'websocket' || connectionType.value === 'rs485') {
+        await client.value.connect({ url: wsUrl.value, baudRate: baudRate.value })
       } else {
         await client.value.connect({ baudRate: baudRate.value })
       }

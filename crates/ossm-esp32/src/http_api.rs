@@ -27,7 +27,8 @@ use crate::modbus_relay;
 use crate::modbus_rtu::{self, InjectJunkMode};
 use crate::motion::MotorControllerConfig;
 use crate::rpc::{self, RpcAction};
-use crate::storage::{NetworkConfiguration, PinConfiguration};
+use crate::rs485;
+use crate::storage::{parse_operating_mode, NetworkConfiguration, PinConfiguration};
 
 pub use ossm_core::{PausedControl, RpcRequest, SubscribeParams, WaypointsInput};
 
@@ -47,6 +48,7 @@ const TCP_POOL_SIZE: usize = 10;
 const Q_ACCEPTORS: usize = 4;
 const WS_MAX: usize = 3;
 const MODBUS_WS_MAX: usize = 2;
+const RS485_WS_MAX: usize = 2;
 const MODBUS_TCP_POOL: usize = 2;
 const MODBUS_TCP_BUFFER_SIZE: usize = 512;
 const MAX_BODY_LEN: usize = 1024;
@@ -88,13 +90,17 @@ static REST_GATE: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 static WS_SLOTS: GreedySemaphore<CriticalSectionRawMutex> = GreedySemaphore::new(WS_MAX);
 static MODBUS_WS_SLOTS: GreedySemaphore<CriticalSectionRawMutex> =
     GreedySemaphore::new(MODBUS_WS_MAX);
+static RS485_WS_CH: Channel<CriticalSectionRawMutex, (SyncTcpSocket, usize), RS485_WS_MAX> =
+    Channel::new();
+static RS485_WS_SLOTS: GreedySemaphore<CriticalSectionRawMutex> =
+    GreedySemaphore::new(RS485_WS_MAX);
 static ACCEPT_SIGNALS: [Signal<CriticalSectionRawMutex, ()>; Q_ACCEPTORS] =
     [const { Signal::new() }; Q_ACCEPTORS];
 /// Signalled once the HTTP listener is bound and accept loops are about to run.
 static HTTP_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-fn is_relay_mode(ctx: AppContext) -> bool {
-    modbus_relay::is_active() || ctx.storage.pin().is_rtu_relay()
+fn motion_blocked(ctx: AppContext) -> bool {
+    !ctx.storage.pin().is_servo()
 }
 
 fn normalize_path(path: &str) -> &str {
@@ -263,8 +269,8 @@ async fn post_config(
     ctx: AppContext,
     body: Vec<u8>,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    if is_relay_mode(ctx) {
-        return send_json(conn, 409, "Conflict", "rtu_relay mode").await;
+    if motion_blocked(ctx) {
+        return send_json(conn, 409, "Conflict", "not servo mode").await;
     }
     if body.len() > 1024 {
         return send_json(conn, 400, "Bad Request", "Request too large").await;
@@ -296,8 +302,8 @@ async fn post_paused(
     ctx: AppContext,
     body: Vec<u8>,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    if is_relay_mode(ctx) {
-        return send_json(conn, 409, "Conflict", "rtu_relay mode").await;
+    if motion_blocked(ctx) {
+        return send_json(conn, 409, "Conflict", "not servo mode").await;
     }
     if body.len() > MAX_BODY_LEN {
         return send_json(conn, 400, "Bad Request", "Request too large").await;
@@ -347,6 +353,7 @@ async fn post_pin_config(
             if config.modbus_timeout_ms > 1000
                 || config.modbus_scan_delay_us > 200_000
                 || config.modbus_inter_frame_delay_us > 200_000
+                || parse_operating_mode(&config.operating_mode).is_none()
             {
                 return send_json(conn, 400, "Bad Request", "Invalid pin config").await;
             }
@@ -546,13 +553,14 @@ async fn process_connection(socket: TcpSocket<'static>, acceptor_id: usize, ctx:
     let is_ws = conn.is_ws_upgrade_request().unwrap_or(false);
     let is_command_ws = is_ws && ws_path == Some("/ws/command");
     let is_modbus_ws = is_ws && ws_path == Some("/ws/modbus");
+    let is_rs485_ws = is_ws && ws_path == Some("/ws/rs485");
 
     if is_modbus_ws {
-        if !is_relay_mode(ctx) {
+        if !ctx.storage.pin().is_rtu_relay() && !modbus_relay::is_active() {
             let _ = conn
                 .initiate_response(
-                    403,
-                    Some("Forbidden"),
+                    404,
+                    Some("Not Found"),
                     &[("Connection", "close"), ("Content-Type", "text/plain")],
                 )
                 .await;
@@ -592,6 +600,58 @@ async fn process_connection(socket: TcpSocket<'static>, acceptor_id: usize, ctx:
             Ok(()) => {}
             Err(embassy_sync::channel::TrySendError::Full((wrapped, _))) => {
                 MODBUS_WS_SLOTS.release(1);
+                let mut socket = wrapped.into_inner();
+                let _ = socket.close(Close::Both).await;
+            }
+        }
+        return;
+    }
+
+    if is_rs485_ws {
+        if !ctx.storage.pin().is_rs485() && !rs485::is_active() {
+            let _ = conn
+                .initiate_response(
+                    404,
+                    Some("Not Found"),
+                    &[("Connection", "close"), ("Content-Type", "text/plain")],
+                )
+                .await;
+            finish_connection(&mut conn).await;
+            return;
+        }
+        if RS485_WS_SLOTS.try_acquire(1).is_none() {
+            let _ = conn
+                .initiate_response(
+                    503,
+                    Some("Service Unavailable"),
+                    &[("Connection", "close"), ("Content-Type", "text/plain")],
+                )
+                .await;
+            finish_connection(&mut conn).await;
+            return;
+        }
+
+        let mut key_buf = [0u8; edge_http::ws::MAX_BASE64_KEY_RESPONSE_LEN];
+        if conn
+            .initiate_ws_upgrade_response(&mut key_buf)
+            .await
+            .is_err()
+        {
+            RS485_WS_SLOTS.release(1);
+            finish_connection(&mut conn).await;
+            return;
+        }
+        if conn.complete().await.is_err() {
+            RS485_WS_SLOTS.release(1);
+            finish_connection(&mut conn).await;
+            return;
+        }
+        let _ = conn.unbind();
+        let socket = extract_unbound_socket(conn);
+        match RS485_WS_CH.try_send((SyncTcpSocket::new(socket), acceptor_id)) {
+            Ok(()) => {}
+            Err(embassy_sync::channel::TrySendError::Full((wrapped, _))) => {
+                RS485_WS_SLOTS.release(1);
                 let mut socket = wrapped.into_inner();
                 let _ = socket.close(Close::Both).await;
             }
@@ -851,6 +911,78 @@ async fn run_modbus_ws_session(mut socket: TcpSocket<'static>) {
 }
 
 #[embassy_executor::task(pool_size = 2)]
+async fn rs485_ws_session_task() {
+    loop {
+        let (wrapped, _acceptor_id) = RS485_WS_CH.receive().await;
+        run_rs485_ws_session(wrapped.into_inner()).await;
+        RS485_WS_SLOTS.release(1);
+    }
+}
+
+async fn run_rs485_ws_session(mut socket: TcpSocket<'static>) {
+    let Some(slot) = rs485::claim_rx_slot() else {
+        drop(socket);
+        return;
+    };
+    let (mut rx, mut tx) = socket.split();
+    let mut buf = [0u8; HTTP_BUFFER_SIZE];
+    loop {
+        match select(ws_recv(&mut rx, &mut buf), rs485::recv_rx(slot)).await {
+            embassy_futures::select::Either::First(Ok((frame_type, len))) => match frame_type {
+                FrameType::Binary(_) | FrameType::Text(_) => {
+                    if let Some((typ, payload)) = rs485::decode_packet(&buf[..len]) {
+                        match typ {
+                            rs485::PKT_TX => {
+                                if rs485::try_send_tx(payload).is_err() {
+                                    break;
+                                }
+                            }
+                            rs485::PKT_CFG => {
+                                if let Ok(baud) = rs485::apply_cfg_json(payload) {
+                                    let json = alloc::format!("{{\"baud\":{}}}", baud);
+                                    let pkt = rs485::encode_packet(rs485::PKT_CFG, json.as_bytes());
+                                    if ws_send(&mut tx, FrameType::Binary(false), None, &pkt)
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                FrameType::Ping
+                    if ws_send(&mut tx, FrameType::Pong, None, &buf[..len])
+                        .await
+                        .is_err() =>
+                {
+                    break;
+                }
+                FrameType::Close => break,
+                _ => {}
+            },
+            embassy_futures::select::Either::First(Err(_)) => break,
+            embassy_futures::select::Either::Second(chunk) => {
+                let pkt = rs485::encode_packet(rs485::PKT_RX, &chunk);
+                if ws_send(&mut tx, FrameType::Binary(false), None, &pkt)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+        if !rs485::is_active() {
+            break;
+        }
+    }
+    rs485::release_rx_slot(slot);
+    drop(socket);
+}
+
+#[embassy_executor::task(pool_size = 2)]
 async fn modbus_ws_session_task() {
     loop {
         let (wrapped, _acceptor_id) = MODBUS_WS_CH.receive().await;
@@ -1059,17 +1191,17 @@ pub async fn run_server(
     stack: &'static Stack<'static>,
     app_context: AppContext,
     spawner: &Spawner,
-    rtu_relay: bool,
 ) {
     for _ in 0..WS_MAX {
         spawner.spawn(ws_session_task(app_context).unwrap());
     }
-    if rtu_relay {
-        for _ in 0..MODBUS_WS_MAX {
-            spawner.spawn(modbus_ws_session_task().unwrap());
-        }
-        spawner.spawn(modbus_tcp_server_task(stack).unwrap());
+    for _ in 0..MODBUS_WS_MAX {
+        spawner.spawn(modbus_ws_session_task().unwrap());
     }
+    for _ in 0..RS485_WS_MAX {
+        spawner.spawn(rs485_ws_session_task().unwrap());
+    }
+    spawner.spawn(modbus_tcp_server_task(stack).unwrap());
     spawner.spawn(http_server_task(stack, app_context).unwrap());
     // Wait until bind + accept priming completes so BLE is not started while the
     // HTTP socket set is still mid-setup (and so the log message is accurate).

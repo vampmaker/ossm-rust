@@ -12,6 +12,7 @@ use rmodbus::{client::ModbusRequest, guess_response_frame_len, ModbusProto};
 
 use crate::context::AppContext;
 use crate::error::{FirmwareError, Result};
+use crate::uart_owner;
 use crate::modbus_rtu::{
     apply_capture_inject, classify_modbus_rx_miss, classify_recovered, find_modbus_response,
     get_inject_junk, InjectJunkMode,
@@ -713,6 +714,9 @@ impl<'d> Modbus57AIM30Motor<'d> {
         let mut position = self.read_position().await?;
         Timer::after_millis(100).await;
         while start_time.elapsed() < timeout {
+            if uart_owner::stop_requested() {
+                return Err(FirmwareError::Modbus("stopped"));
+            }
             let new_position = self.read_position().await?;
             if (new_position - position).abs() < 0.002 {
                 return Ok(new_position);
@@ -740,6 +744,9 @@ impl<'d> Modbus57AIM30Motor<'d> {
 
             let delay_us = Self::modbus_t3_5_us(baud_rate).max(self.scan_delay_us);
             for device_id in 1..=247u8 {
+                if uart_owner::stop_requested() {
+                    return Err(FirmwareError::Modbus("stopped"));
+                }
                 // full address space for modbus device id (0 is for broadcast, 248-255 are reserved)
                 self.client.device_id = device_id;
                 Timer::after_micros(delay_us as u64).await;
@@ -841,19 +848,25 @@ impl<'d> Motor for Modbus57AIM30Motor<'d> {
         self.reset_position().await?;
         log::info!("Writing position to -100.0");
         self.write_position(-100.0, 0.0).await?;
-        Timer::after_millis(5000).await;
+        if uart_owner::sleep_or_stop(5000).await {
+            return Err(FirmwareError::Modbus("stopped"));
+        }
         self.pos_min = self.wait_stable_position(5000).await? + 0.1;
         log::info!("pos_min: {}", self.pos_min);
 
         log::info!("Writing position to 100.0");
         self.write_position(100.0, 0.0).await?;
-        Timer::after_millis(5000).await;
+        if uart_owner::sleep_or_stop(5000).await {
+            return Err(FirmwareError::Modbus("stopped"));
+        }
         self.pos_max = self.wait_stable_position(5000).await? - 0.1;
         log::info!("pos_max: {}", self.pos_max);
 
         self.write_position((self.pos_min + self.pos_max) / 2.0, 0.0)
             .await?;
-        Timer::after_millis(5000).await;
+        if uart_owner::sleep_or_stop(5000).await {
+            return Err(FirmwareError::Modbus("stopped"));
+        }
         self.wait_stable_position(5000).await?;
         Ok(())
     }
@@ -897,8 +910,13 @@ pub(crate) fn init_uart_and_modbus(
         (pin_config.modbus_rx_timeout_us / 87).clamp(2, 127) as u8
     };
     let rx_config = esp_hal::uart::RxConfig::default().with_timeout(timeout_symbols);
+    let baud = if pin_config.modbus_baud == 0 {
+        TARGET_BAUD_RATE
+    } else {
+        pin_config.modbus_baud
+    };
     let uart_config = Config::default()
-        .with_baudrate(TARGET_BAUD_RATE)
+        .with_baudrate(baud)
         .with_rx(rx_config);
     let uart = Uart::new(uart_periph, uart_config)
         .map_err(|_| FirmwareError::Uart("init"))?
@@ -937,7 +955,7 @@ pub(crate) fn init_uart_and_modbus(
         pin_config.modbus_timeout_ms,
         pin_config.modbus_rx_timeout_us,
         pin_config.modbus_inter_frame_delay_us,
-        TARGET_BAUD_RATE,
+        baud,
         timeout_symbols,
         pin_config.modbus_debug,
     ))
@@ -1007,26 +1025,16 @@ fn bytes_to_base64(data: &[u8], max_bytes: usize) -> alloc::string::String {
 
 pub async fn run_motor(
     app_context: AppContext,
-    mut motion_consumer: crate::motion::CommandConsumer,
-    uart_periph: esp_hal::peripherals::UART1<'static>,
-    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
-    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
-    pin_config: PinConfiguration,
+    motion_consumer: &mut crate::motion::CommandConsumer,
+    engine: &mut Engine,
+    mut motor: Modbus57AIM30Motor<'_>,
 ) -> Result<()> {
-    let motor_config = app_context.storage.motor_config();
     log::info!("Using motor config from storage cache");
 
-    let mut engine = Engine::new(motor_config);
-    engine.flush_snapshot();
-    app_context.update_snapshot(engine.snapshot());
-
     log::info!("Waiting 3s for WiFi/BLE initialization to settle before scanning motor...");
-    Timer::after_millis(3000).await;
-
-    let mut motor = Modbus57AIM30Motor::new(
-        init_uart_and_modbus(uart_periph, uhci_periph, dma_channel, &pin_config)?,
-        pin_config.modbus_scan_delay_us,
-    );
+    if uart_owner::sleep_or_stop(3000).await {
+        return Ok(());
+    }
 
     #[cfg(feature = "esp32c6")]
     unsafe {
@@ -1041,12 +1049,17 @@ pub async fn run_motor(
 
     let mut modbus_ok = false;
     for init_attempt in 1..=2 {
+        if uart_owner::stop_requested() {
+            return Ok(());
+        }
         if init_attempt > 1 {
             log::info!(
                 "Retrying motor initialization (attempt {}/2)...",
                 init_attempt
             );
-            Timer::after_millis(1000).await;
+            if uart_owner::sleep_or_stop(1000).await {
+                return Ok(());
+            }
         }
         match motor.enable_modbus_communication().await {
             Ok(()) => {
@@ -1061,6 +1074,9 @@ pub async fn run_motor(
                 );
                 let mut scan_result = Err(FirmwareError::Modbus("scan not attempted"));
                 for attempt in 1..=3 {
+                    if uart_owner::stop_requested() {
+                        return Ok(());
+                    }
                     match motor.modbus_scan().await {
                         Ok(result) => {
                             scan_result = Ok(result);
@@ -1100,8 +1116,11 @@ pub async fn run_motor(
             "Modbus motor not detected after retries, running in disconnected telemetry mode"
         );
         loop {
+            if uart_owner::stop_requested() {
+                return Ok(());
+            }
             Timer::after_millis(10).await;
-            drain_motion(&mut engine, &mut motion_consumer);
+            drain_motion(engine, motion_consumer);
             engine.apply(Command::SetMotorConnected(false));
             let _ = engine.tick(now_us());
             app_context.update_snapshot(engine.snapshot());
@@ -1109,7 +1128,14 @@ pub async fn run_motor(
     }
 
     motor.enable_modbus_communication().await?;
-    motor.homing().await?;
+    match motor.homing().await {
+        Ok(()) => {}
+        Err(e) if uart_owner::stop_requested() => {
+            log::info!("Homing interrupted by mode switch: {}", e);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    }
 
     let current_position = motor.read_position().await.unwrap_or(0.0);
     engine.apply(Command::SetMotorConnected(true));
@@ -1136,9 +1162,22 @@ pub async fn run_motor(
     let mut pending_stats: Option<LoopStats> = None;
 
     loop {
+        if uart_owner::stop_requested() {
+            engine.apply(Command::SetPaused {
+                paused: true,
+                position: None,
+            });
+            drain_motion(engine, motion_consumer);
+            let out = engine.tick(now_us());
+            let _ = motor.write_position(out.position, out.speed).await;
+            app_context.update_snapshot(engine.snapshot());
+            log::info!("Motor loop stopped for UART1 role switch");
+            return Ok(());
+        }
+
         let log_stats = Instant::now().duration_since(last_stats_log) >= Duration::from_secs(5);
 
-        drain_motion(&mut engine, &mut motion_consumer);
+        drain_motion(engine, motion_consumer);
 
         let modbus_stats = motor.get_stats();
         engine.apply(Command::SetModbusStats(modbus_stats));
@@ -1200,78 +1239,44 @@ fn core1_executor() -> &'static mut esp_rtos::embassy::Executor {
 }
 
 #[cfg(feature = "esp32s3")]
-pub fn run_motor_blocking(
+pub fn run_uart_owner_blocking(
     app_context: AppContext,
     motion_consumer: crate::motion::CommandConsumer,
     uart_periph: esp_hal::peripherals::UART1<'static>,
     uhci_periph: esp_hal::peripherals::UHCI0<'static>,
     dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
-    pin_config: PinConfiguration,
 ) {
     let executor = core1_executor();
     executor.run(|spawner| {
-        spawner.spawn(
-            core1_motor_task(
-                app_context,
-                motion_consumer,
-                uart_periph,
-                uhci_periph,
-                dma_channel,
-                pin_config,
-            )
-            .unwrap(),
-        );
-    });
-}
-
-#[cfg(feature = "esp32s3")]
-pub fn run_relay_on_core1(
-    uart_periph: esp_hal::peripherals::UART1<'static>,
-    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
-    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
-    pin_config: PinConfiguration,
-) {
-    let executor = core1_executor();
-    executor.run(|spawner| {
-        spawner.spawn(core1_relay_task(uart_periph, uhci_periph, dma_channel, pin_config).unwrap());
+        spawner
+            .spawn(
+                core1_uart_owner_task(
+                    app_context,
+                    motion_consumer,
+                    uart_periph,
+                    uhci_periph,
+                    dma_channel,
+                )
+                .unwrap(),
+            );
     });
 }
 
 #[cfg(feature = "esp32s3")]
 #[embassy_executor::task]
-async fn core1_motor_task(
+async fn core1_uart_owner_task(
     app_context: AppContext,
     motion_consumer: crate::motion::CommandConsumer,
     uart_periph: esp_hal::peripherals::UART1<'static>,
     uhci_periph: esp_hal::peripherals::UHCI0<'static>,
     dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
-    pin_config: PinConfiguration,
 ) {
-    if let Err(e) = run_motor(
+    crate::uart_owner::run_uart_owner(
         app_context,
         motion_consumer,
         uart_periph,
         uhci_periph,
         dma_channel,
-        pin_config,
     )
-    .await
-    {
-        log::error!("Motor task on Core 1 failed: {}", e);
-    }
-}
-
-#[cfg(feature = "esp32s3")]
-#[embassy_executor::task]
-async fn core1_relay_task(
-    uart_periph: esp_hal::peripherals::UART1<'static>,
-    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
-    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
-    pin_config: PinConfiguration,
-) {
-    if let Err(e) =
-        crate::modbus_relay::run_relay(uart_periph, uhci_periph, dma_channel, pin_config).await
-    {
-        log::error!("Modbus relay on Core 1 failed: {}", e);
-    }
+    .await;
 }

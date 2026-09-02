@@ -4,7 +4,6 @@ use serde::Serialize;
 
 use crate::context::AppContext;
 use crate::http_api::{RpcRequest, SubscribeParams, WaypointsInput};
-use crate::modbus_relay;
 use crate::motion::{MotionCommand, MotorControllerConfig};
 use crate::storage::NetworkConfiguration;
 
@@ -56,7 +55,7 @@ async fn respond<T: Serialize + ?Sized>(id: &serde_json::Value, result: &T) -> R
 
 pub async fn dispatch_rpc(request: &RpcRequest, app_context: AppContext) -> RpcAction {
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
-    let relay = modbus_relay::is_active() || app_context.storage.pin().is_rtu_relay();
+    let blocked = !app_context.storage.pin().is_servo();
 
     match request.cmd.as_str() {
         "ping" => respond(&id, "pong").await,
@@ -69,8 +68,8 @@ pub async fn dispatch_rpc(request: &RpcRequest, app_context: AppContext) -> RpcA
             respond(&id, &*state).await
         }
         "set-config" | "set_config" => {
-            if relay {
-                return err_response(&id, -32001, "rtu_relay mode").await;
+            if blocked {
+                return err_response(&id, -32001, "not servo mode").await;
             }
             if let Ok(config) = request.parse_params::<MotorControllerConfig>() {
                 match app_context.try_enqueue_config(config).await {
@@ -84,8 +83,8 @@ pub async fn dispatch_rpc(request: &RpcRequest, app_context: AppContext) -> RpcA
             err_response(&id, -32602, "Invalid params").await
         }
         "subscribe-state" | "subscribe_state" => {
-            if relay {
-                return err_response(&id, -32001, "rtu_relay mode").await;
+            if blocked {
+                return err_response(&id, -32001, "not servo mode").await;
             }
             let params = request
                 .parse_params::<SubscribeParams>()
@@ -97,8 +96,8 @@ pub async fn dispatch_rpc(request: &RpcRequest, app_context: AppContext) -> RpcA
         }
         "unsubscribe-state" | "unsubscribe_state" => RpcAction::Unsubscribe,
         "append-waypoints" | "append_waypoints" => {
-            if relay {
-                return err_response(&id, -32001, "rtu_relay mode").await;
+            if blocked {
+                return err_response(&id, -32001, "not servo mode").await;
             }
             if let Ok(input) = request.parse_params::<WaypointsInput>() {
                 let (waypoints, _) = input.into_parts();
@@ -112,8 +111,8 @@ pub async fn dispatch_rpc(request: &RpcRequest, app_context: AppContext) -> RpcA
             err_response(&id, -32602, "Invalid params").await
         }
         "set-waypoints" | "set_waypoints" => {
-            if relay {
-                return err_response(&id, -32001, "rtu_relay mode").await;
+            if blocked {
+                return err_response(&id, -32001, "not servo mode").await;
             }
             if let Ok(input) = request.parse_params::<WaypointsInput>() {
                 let (waypoints, reset_timestamp) = input.into_parts();
@@ -130,8 +129,8 @@ pub async fn dispatch_rpc(request: &RpcRequest, app_context: AppContext) -> RpcA
             err_response(&id, -32602, "Invalid params").await
         }
         "reset-timestamp" | "reset_timestamp" => {
-            if relay {
-                return err_response(&id, -32001, "rtu_relay mode").await;
+            if blocked {
+                return err_response(&id, -32001, "not servo mode").await;
             }
             let _ = app_context
                 .enqueue_motion(MotionCommand::ResetTimestamp)

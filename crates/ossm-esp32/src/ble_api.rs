@@ -452,6 +452,8 @@ async fn handle_gatt_events<C: Controller>(
                             if config.modbus_timeout_ms <= 1000
                                 && config.modbus_scan_delay_us <= 200_000
                                 && config.modbus_inter_frame_delay_us <= 200_000
+                                && crate::storage::parse_operating_mode(&config.operating_mode)
+                                    .is_some()
                             {
                                 app_context.storage.set_pin(config.clone());
                                 if let Ok(json) = serde_json_core::to_string::<_, 512>(&config) {

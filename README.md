@@ -1,120 +1,148 @@
-# OSSM-Rust Firmware
+# OSSM-Rust
 
-This repository contains the firmware for an OSSM controller, written in Rust. It's designed to run on ESP32-C6 or ESP32-S3 microcontrollers and control a 57AIM30 integrated servo motor.
+The same 57AIM30 motion Engine runs on **two independent paths**. Pick **one** — they do not share a controller:
 
-This guide is designed to be friendly for everyone, even if you have no technical or engineering background! Please follow these step-by-step instructions to get your hardware wired and running smoothly.
+| | **Path A — `ossm-std`** | **Path B — `ossm-esp32`** |
+| --- | --- | --- |
+| **What it is** | Linux desktop process. The PC *is* the device. | Firmware on ESP32-C6 / ESP32-S3. WiFi / BLE / USB CLI. |
+| **Hardware** | PC + USB-RS485 dongle (automatic DE/RE). **No microcontroller.** | ESP32 DevKit + TTL MAX3485 (DI / RO / DE+RE). |
+| **Wiring** | Dongle A/B/GND to the motor. 24 V shaft power + 5 V logic. | ESP32 GPIOs to MAX3485; ESP32 5 V / GND to motor logic. |
+| **Config** | `--serial` / `--bind` / `--config` (or `.env`). HTTP on `127.0.0.1:8080`. | NVS `pin.*` / `net.*` via flasher, web UI, or USB CLI. |
+| **UI** | `http://127.0.0.1:8080` (set `DEVICE_IP=127.0.0.1:8080` for scripts) | Device WiFi IP or `http://ossm.local` |
 
-## Part 1: Required Hardware
+Both paths use the same motor connectors and 24 V supply.
 
-Here is a list of components you will need to build the controller.
+> [!TIP]
+> **Motor plugs (both paths)**
+> • **Front 6-pin (power):** green **KF2EDGK-3.81 6P** — 24 V.
+> • **Back 10-pin (comm / logic):** white **PHB2.0 2×5P** — 5 V + RS-485. Never put 24 V on the back connector.
+
+---
+
+## Path A: Desktop (`ossm-std`) — no microcontroller
+
+### A.1 Hardware
+
+| Component | Notes |
+| --- | --- |
+| **Linux PC** | Runs `ossm-std` (stable Rust). |
+| **USB-RS485 adapter** | **Automatic DE/RE** on the dongle. TX-loopback and host-driven DE/RE are unsupported (ossm-std does not strip TX echoes). Typical device `/dev/ttyUSB0`. |
+| **Motor** | `57AIM30` (not `57AIM30H`). |
+| **24 V DC supply** | Shaft power to the front terminal. |
+| **5 V USB charger** | Motor logic 5 V / COM on the back terminal (or a 5 V pin on the adapter if it can supply the load). |
+| **Cables** | DC 5.5×2.1/2.5 mm jack, **KF2EDGK-3.81 6P**, **PHB2.0 2×5P**. |
+
+### A.2 Wiring
+
+<div align="center">
+  <img src="./assets/wiring_diagram_std.svg" alt="ossm-std USB-RS485 wiring (no ESP32)" width="100%"/>
+</div>
+
+| Motor | --> | Host side |
+| --- | --- | --- |
+| Front **+V** / **GND** | --> | 24 V adapter `+` / `−` |
+| Back **10: 5V** / **6: COM** | --> | 5 V charger 5 V / GND |
+| Back **2: 485A** / **3: 485B** | --> | USB-RS485 **A** / **B** |
+| Back **COM** | --> | USB-RS485 **GND** (signal reference) |
+
+> [!CAUTION]
+> Check 24 V polarity before plugging in. Do not feed 24 V into the back 10-pin connector.
+
+### A.3 Configuration
+
+CLI flags override environment (`.env` aliases `DEVICE_PORT`, `DEVICE_BAUD`); then defaults. Motor JSON is `--config` (default `ossm-config.json`). There are no `pin.*` / `net.*` settings.
+
+```bash
+# UI only, no motor:
+cargo +stable run -p ossm-std -- --mock --bind 127.0.0.1:8080
+
+# USB-RS485 (always homes):
+cargo +stable run -p ossm-std -- --serial /dev/ttyUSB0 --baud 115200 \
+  --bind 127.0.0.1:8080 --config ossm-config.json
+```
+
+Open `http://127.0.0.1:8080`. Scripts: `DEVICE_IP=127.0.0.1:8080`.
+
+`--mode servo` (default) is the RTU master. `--mode rtu-relay` serves Modbus TCP `--modbus-bind` (default `127.0.0.1:502`) and `/ws/modbus` instead of owning motion. `--mock` uses a virtual `0..100` range.
+
+---
+
+## Path B: ESP32 firmware (`ossm-esp32`)
+
+### B.1 Hardware
 
 | Component | Description | Notes |
 | --- | --- | --- |
-| **Microcontroller** | ESP32-C6 or ESP32-S3 Development Board | Any ESP32-C6 or ESP32-S3 board with a USB-C connector will work.<br><br>**Important Note on USB Ports:** Many development boards have **two** USB-C ports (often labeled "USB" / "Native" / "JTAG" vs "UART" / "COM"). Please always use the **Native JTAG / USB port** instead of the USB-to-UART converter port! The native JTAG port connects directly to the processor for faster, hassle-free flashing without needing external driver chips. |
-| **Motor** | 57AIM30 Integrated Servo Motor | **Important:** Make sure to get the `57AIM30` model, not the `57AIM30H`. The `57AIM30` has a rated speed of 1500 RPM and 0.96 Nm of torque, which is ideal for this application. |
-| **RS485 Transceiver**| MAX3485 Module | This small board translates signals between the ESP32 microcontroller and the motor. |
-| **Power Supply (Motor)** | 24V DC Power Adapter | To power the servo motor. Make sure it can supply enough current for your mechanical load. |
-| **Power Supply (ESP32)**| 5V USB Charger | Any standard USB phone charger with a USB-C cable will work to power the controller once everything is set up. |
-| **Cables & Connectors** | - DC 5.5×2.1/2.5mm female jack<br>- **KF2EDGK-3.81 6P** terminal plug<br>- **PHB2.0 2×5P** cable / connector<br>- Jumper (DuPont) wires | **Important Note on Motor Connectors:** Check the box your 57AIM30 motor arrived in. If the matching green and white plugs were not included, you will need to buy them separately:<br>• **For Motor Power (front 6-pin socket):** buy a **KF2EDGK-3.81 6P** pluggable terminal block.<br>• **For Communication & Logic (back 10-pin socket):** buy a **PHB2.0 2×5P** (2.0mm pitch, 2x5 pin) connector or pre-crimped cable.<br>The DC female jack connects your 24V power adapter to the green KF2EDGK power terminal. |
+| **Microcontroller** | ESP32-C6 or ESP32-S3 DevKit with USB-C | **Two USB-C ports** on many boards:<br>• **USB / Native / JTAG** — USB Serial/JTAG. Flash and the firmware CLI (`/dev/ttyACM*` on Linux).<br>• **UART / COM** — USB-UART to UART0 (C6: GPIO16 TX / GPIO17 RX). Console logs only. Not the motor bus; not the browser flasher. |
+| **Motor** | 57AIM30 (not `57AIM30H`) | 1500 RPM, 0.96 N·m. |
+| **RS-485 transceiver** | MAX3485 TTL module | Between ESP32 UART and the motor. |
+| **24 V DC supply** | Motor shaft power | Size for your mechanical load. |
+| **5 V USB charger** | Powers the ESP32 after setup | USB-C. Motor logic 5 V comes from the ESP32 5 V pin. |
+| **Cables** | DC jack, **KF2EDGK-3.81 6P**, **PHB2.0 2×5P**, DuPont jumpers | Same motor plugs as Path A. |
 
-## Part 2: Wiring & Hardware Assembly
-
-Connecting the components correctly is crucial. Don't worry if you're new to this—just take it step by step! Please double-check all connections before plugging in any power supplies.
-
-### Complete Hardware Wiring Diagram
-Below is the complete visual system diagram illustrating the connections between your power adapters, ESP32 development board, MAX3485 transceiver, and the 57AIM30 servo motor's front and back terminals:
+### B.2 Wiring
 
 <div align="center">
-  <img src="./assets/wiring_diagram.svg" alt="OSSM Hardware Wiring Diagram" width="100%"/>
+  <img src="./assets/wiring_diagram.svg" alt="ossm-esp32 ESP32 + MAX3485 wiring" width="100%"/>
 </div>
 
-> [!TIP]
-> **Which connector goes where?**
-> Your 57AIM30 motor has two sockets:
-> • **Front 6-Pin Socket (Power):** Uses the green **KF2EDGK-3.81 6P** connector for the 24V heavy-duty motor power.
-> • **Back 10-Pin Socket (Communication):** Uses the white **PHB2.0 2×5P** connector for 5V logic power and RS-485 signal wires.
-
-### Step 1: Motor Power Connection (Front 6-Pin Terminal)
-
-This terminal supplies the 24V power needed to drive the motor shaft. Use your green **KF2EDGK-3.81 6P** connector here.
+**Motor 24 V (front 6-pin)**
 
 | Motor Terminal (+V) | --> | 24V Power Supply (Positive `+`) |
 | --- | --- | --- |
 | Motor Terminal (GND) | --> | 24V Power Supply (Negative `-`) |
 
-> [!CAUTION]
-> **Check Polarity!** Double-check that positive (`+`) and negative (`-`) wires are not reversed before plugging in your 24V power adapter!
+**RS-485 + logic (back 10-pin and ESP32)**
 
-### Step 2: Communication & Logic Power (Back 2×5-Pin Terminal & ESP32)
-
-This back terminal uses the **PHB2.0 2×5P** connector. It powers the motor's internal smart controller (5V) and sends control commands back and forth using the RS-485 transceiver board (MAX3485).
-
-First, connect the motor's communication wires to the MAX3485 RS-485 module:
-
-| Motor Terminal (485A) | --> | MAX3485 Module (A) |
+| Motor (485A) | --> | MAX3485 **A** |
 | --- | --- | --- |
-| Motor Terminal (485B) | --> | MAX3485 Module (B) |
-
-Next, connect your ESP32 development board to the MAX3485 module and the motor's logic power pins:
+| Motor (485B) | --> | MAX3485 **B** |
 
 | ESP32 Pin | --> | Component Pin | Purpose |
 | --- | --- | --- | --- |
-| 5V (or VBUS/VIN) | --> | Motor Terminal (5V) | Powers the motor's internal logic chip |
-| GND (Ground) | --> | Motor Terminal (COM / GND) | Common ground for signal stability |
-| 3.3V (or 3V3) | --> | MAX3485 Module (VCC / 3.3V) | Powers the RS-485 module |
-| GND (Ground) | --> | MAX3485 Module (GND) | Ground for the RS-485 module |
-| GPIO 18 (TX) | --> | MAX3485 Module (DI / TX) | Sends data to motor |
-| GPIO 19 (RX) | --> | MAX3485 Module (RO / RX) | Receives data from motor |
-| GPIO 20 | --> | MAX3485 Module (DE / RE) | Controls data transmission direction |
+| 5V (or VBUS/VIN) | --> | Motor Terminal (5V) | Motor logic |
+| GND | --> | Motor Terminal (COM / GND) | Logic ground |
+| 3.3V | --> | MAX3485 VCC | Transceiver power |
+| GND | --> | MAX3485 GND | Transceiver ground |
+| GPIO 18 (UART **TX**) | --> | MAX3485 **DI** | MCU transmits |
+| GPIO 19 (UART **RX**) | --> | MAX3485 **RO** | MCU receives |
+| GPIO 20 | --> | MAX3485 **DE** and **RE** (tie together) | Direction |
 
-> [!NOTE]
-> **About GPIO pins**: GPIO 18, 19, and 20 are the default Modbus pins in firmware NVS (same defaults on both chips). On ESP32-S3 boards, pins 19 and 20 are often reserved for USB Serial/JTAG — wire Modbus TX/RX/DE-RE to free GPIOs and set them via the web UI, serial CLI (`set pin.modbus_tx`, etc.), or the flasher config panel. There is **no automatic GPIO pin detection**; only Modbus baud rate / slave ID scanning runs at boot when the motor does not respond at `115200`.
+> [!WARNING]
+> UART is **crossed**: ESP32 **TX → DI**, ESP32 **RX → RO**. Modules labeled TXD/RXD often have **TXD = RO** and **RXD = DI** — do not wire MCU TX to TXD.
+>
+> NVS defaults: `pin.modbus_tx=18`, `pin.modbus_rx=19`, `pin.modbus_de_re=20`. Change them if your board differs (ESP32-S3 19/20 are often USB D−/D+). No GPIO auto-detect; boot only scans Modbus baud / slave ID if the motor does not answer at `115200`.
 
-### Step 3: Powering the ESP32 Board
-
-Finally, connect your ESP32 board to a standard 5V USB charger or your computer using a USB-C cable:
-
-| ESP32 Type-C Port | --> | 5V USB Charger / Computer |
-| --- | --- | --- |
-
-> [!IMPORTANT]
-> Remember: If your ESP32 board has two USB-C ports, always plug your cable into the **Native JTAG / USB port** (not the UART/COM port)!
+Power the ESP32 from USB-C on **USB / Native / JTAG** (flash / CLI). **UART / COM** is UART0 console only.
 
 ### Building from Source (Optional for Developers)
 
-You don't need to build the code yourself—pre-compiled firmware is provided in Part 3! But if you are a developer and wish to compile from source:
+Pre-compiled firmware is in Part 3 (flash). To compile:
 
-The firmware is built on **`esp-hal`** (bare-metal) with **Embassy** async and **`esp-rtos`** for task scheduling, targeting `no_std`. Both targets are supported via cargo aliases defined in `.cargo/config.toml`:
+The firmware is **`esp-hal`** + Embassy + **`esp-rtos`**, `no_std`. Cargo aliases in `.cargo/config.toml`:
 
 ```bash
-# Both targets use the Espressif `esp` channel pinned in rust-toolchain.toml
 cargo b-c6 --release   # ESP32-C6 (RISC-V)
 cargo b-s3 --release   # ESP32-S3 (Xtensa)
-
-# Desktop shell (stable Rust; mock HTTP/WS without a motor):
-cargo +stable run -p ossm-std -- --mock --bind 127.0.0.1:8080
-# Flags override env (.env aliases: DEVICE_PORT, DEVICE_BAUD). Point scripts at:
-#   DEVICE_IP=127.0.0.1:8080
-# Real RS-485 dongle: --serial /dev/ttyUSB0 --baud 115200
-# Config is atomic JSON (`--config ossm-config.json`).
 ```
 
-Install the toolchain with [espup](https://github.com/esp-rs/espup): `espup install --targets esp32c6,esp32s3` (then `source ~/export-esp.sh` if your shell does not pick up `esp` automatically).
+Path A (`ossm-std`) uses **stable** Rust: `cargo +stable run -p ossm-std` (see **A.3**).
 
-To build everything (frontend, flasher, both firmware targets) and produce merged flash images:
+Install the Espressif toolchain with [espup](https://github.com/esp-rs/espup): `espup install --targets esp32c6,esp32s3` (then `source ~/export-esp.sh` if needed).
+
 ```bash
 ./scripts/release.sh
 ```
 
-Chip selection is via Cargo features / aliases (`esp32c6` / `esp32s3`). Default Modbus GPIO numbers are the same for both; change them in NVS if your board wiring differs.
+builds frontend, flasher, both firmware images. Chip features: `esp32c6` / `esp32s3`.
 
-## Part 3: Flashing the Firmware
+## Part 3: Flashing the Firmware (`ossm-esp32` only)
 
 You don't need to build from source. Pre-compiled **merged** flash images (`ossm-esp32c6.bin` / `ossm-esp32s3.bin`) are in the repository **Releases**, along with a standalone browser flasher (`flasher.html`) that uses the [Web Serial API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API) — no command-line tools required.
 
 > [!IMPORTANT]
-> **Use the Native USB / JTAG Port!**
-> If your ESP32 board has **two** USB-C ports (often labeled "USB", "Native", or "JTAG" vs "UART", "COM", or "CP2102"), **always plug into the Native JTAG / USB port**. That port talks to the chip directly and works with Chrome / Edge without extra USB–UART drivers.
+> **Use the USB / Native / JTAG port to flash!**
+> If the board has **two** USB-C ports, plug the flasher into **USB / Native / JTAG**, not **UART / COM**. Native USB talks to the chip directly (Chrome / Edge, no extra USB–UART drivers). UART/COM is only the UART0 console.
 
 ### What the flasher looks like
 
@@ -160,7 +188,7 @@ Stay on the same `flasher.html` page after flashing. Fill in **Device Configurat
 | Section | What to set |
 | --- | --- |
 | **WiFi** | Toggle **Enable WiFi**. When enabled, enter SSID and password. Disable WiFi if you will use BLE / USB-only. |
-| **GPIO Pins** | Modbus **TX**, **RX**, and **DE/RE** (defaults `18` / `19` / `20`). Change these if your wiring differs (especially on ESP32-S3 where 19/20 may be USB). |
+| **GPIO Pins** | Modbus **TX** (UART TX → MAX3485 DI), **RX** (UART RX → RO), **DE/RE** (defaults `18` / `19` / `20`). Change these if your wiring differs (especially on ESP32-S3 where 19/20 may be USB). |
 | **Motor / Modbus** | Optional timing: read timeout (ms), RX inter-byte (µs), inter-frame quiet (µs), scan delay (µs). Leave at `0` for firmware auto defaults (at 115200: **10 ms** frame timeout, **750 µs** inter-byte, **350 µs** inter-frame). Baud rate `115200` and device ID `1` are fixed in the UI. |
 | **BLE** | **Enable Bluetooth Low Energy (BLE)** — leave on unless you want BLE off. |
 
@@ -223,7 +251,8 @@ pin.modbus_rx_timeout_us                          0..200000 (0 = auto)
 pin.modbus_scan_delay_us                          0..200000 (0 = t3.5)
 pin.modbus_inter_frame_delay_us                   0..200000 (0 = auto)
 pin.ble_enabled / pin.modbus_debug                true|false (debug: reboot)
-pin.operating_mode                                servo|rtu_relay (reboot)
+pin.operating_mode                                servo|rtu_relay|rs485
+pin.modbus_baud                                   1200..3000000 (default 115200)
 net.wifi_enabled / net.dhcp_enabled               true|false
 net.ssid / net.password / net.hostname          string
 net.static_ip / static_mask / static_gateway / static_dns   IPv4
@@ -256,6 +285,7 @@ Live-hardware scripts in `scripts/` (run with `uv run`); set `DEVICE_IP` in `.en
 | `./scripts/test_console.py` | USB CLI late-attach, motor `ups` (ACM closed/open), probe-rs RTT, CLI under `MODBUS_DBG` flood |
 | `./scripts/test_modbus_debug_device.py` | Modbus CRC resync / inject via **probe-rs RTT** (avoids USB ACM stalls) |
 | `./scripts/test_modbus_resync.py` | Host-only CRC/resync mirror (no hardware) |
+| `./scripts/test_rs485_transceiver.py` | Live `operating_mode=rs485` (no reboot); USB + `/ws/rs485` via ossm-std |
 | `./scripts/stress_dt_max.py` | HTTP+WebSocket load; asserts `dt_max_ms` < 4.5 ms |
 
 ### Multi-Mode Control CLI (`ossm.py`)
@@ -491,24 +521,36 @@ A **macro** is a shareable JSON sequence of timestamped control instructions (`s
 *   `modbus_inter_frame_delay_us` (number): Modbus inter-frame quiet interval ($t_{3.5}$) in microseconds (`0` = auto based on baud rate: 350µs @ 115200 baud, enabling <3ms total end-to-end request-response cycle time for >300 Hz position updates).
 *   `ble_enabled` (boolean): Enable Bluetooth Low Energy GATT server.
 *   `modbus_debug` (boolean): Diagnostic Modbus RX mode — **5 ms** RX deadline (same **256 B** UHCI DMA buffers as production), classifies each reply (`empty` / `short` / `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`), and prints `MODBUS_DBG` TX/RX hex lines on the USB console. **Restart required.** Increases USB log volume; steady-state motor `ups` is typically only a few percent below non-debug (~310 vs ~320 Hz on ESP32-C6). Serial CLI stays responsive under the flood via console **TX/RX fairness** (`CLI_OUT_CH`, separate CLI/log USB rings). Verify with `./scripts/test_console.py --only fairness`; disable after diagnosis. Also via CLI `set pin.modbus_debug`, flasher, or `ossm.py pins --modbus-debug`.
-*   `operating_mode` (string): `"servo"` (default OSSM motion controller) or `"rtu_relay"` (Modbus RTU bridge). **Restart required.**
+*   `operating_mode` (string): `"servo"` (OSSM motion), `"rtu_relay"` (framed Modbus TCP `:502` + `/ws/modbus`), or `"rs485"` (raw UART1 pipe on USB ACM + `/ws/rs485`). **Live switch — no reboot.** USB CLI is unavailable while `rs485` is active (leave via HTTP/BLE).
+*   `modbus_baud` (number): UART1 boot baud (default `115200`). In `rs485` mode, live baud follows USB `SET_LINE_CODING` (ESP32-C6) and `/ws/rs485` CFG packets.
 
 #### `POST /pin-config`
 
 *   **Method:** `POST`
-*   **Description:** Updates the GPIO pin configuration and Modbus timing settings. You must restart the microcontroller for pin assignment / `operating_mode` changes to take effect.
+*   **Description:** Updates the GPIO pin configuration and Modbus timing settings. `operating_mode` and UART pin remux apply immediately (UART1 owner restarts the current role). WiFi/SSID still need a restart.
 *   **Request Body:** A JSON object with the same structure as the `GET /pin-config` response.
 *   **Response Body:** The updated configuration as a JSON object.
 
 ### RTU Relay Mode
 
-When `operating_mode` is `"rtu_relay"` (Settings UI, `POST /pin-config`, or CLI `set pin.operating_mode rtu_relay`, then restart), the firmware does not run the motor controller. Instead it bridges RS-485 Modbus RTU:
+When `operating_mode` is `"rtu_relay"` (Settings UI, `POST /pin-config`, or CLI `set pin.operating_mode rtu_relay`; **no reboot**), the firmware does not run the motor controller. Instead it bridges RS-485 Modbus RTU:
 
 * **Modbus TCP** on port **502** (standard MBAP)
 * **WebSocket** `ws://<device>/ws/modbus` — binary full RTU frames (with CRC)
 * Embedded UI shows a relay banner and hides motor controls
 * `release/motor-control.html` supports **Remote WebSocket** connection mode
 * Tests: `./scripts/test_modbus_relay.py --switch-mode`, `./scripts/test_modbus_tcp.py`
+
+### RS-485 transceiver mode
+
+When `operating_mode` is `"rs485"`, UART1 is a raw byte pipe (host owns RTU timing):
+
+* USB ACM is a data plane (no CLI / USB logs). UART0/RTT logs stay. Leave via HTTP/BLE `operating_mode`.
+* WebSocket `ws://<device>/ws/rs485` — packets `u8 type | u16le len | payload` (`0` TX, `1` RX, `2` CFG JSON `{"baud":115200}`)
+* ESP32-C6 applies USB `SET_LINE_CODING` `dwDTERate` to UART1
+* Firmware drives DE/RE for the pipe. Host `--serial` USB-RS485 adapters must also auto-switch direction (ossm-std does not strip TX echoes; loopback adapters are unsupported).
+* `ossm-std --mode rtu-relay --serial …` or `--rs485-ws ws://HOST/ws/rs485` serves Modbus TCP for motor-control
+* Tests: `./scripts/test_rs485_transceiver.py`
 
 #### `POST /restart`
 

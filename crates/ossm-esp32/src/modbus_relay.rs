@@ -10,8 +10,8 @@ use embassy_sync::mutex::Mutex;
 use heapless::Vec as HVec;
 
 use crate::error::{FirmwareError, Result};
-use crate::motor_57aim30::init_uart_and_modbus;
-use crate::storage::PinConfiguration;
+use crate::motor_57aim30::ModbusRTUMaster;
+use crate::uart_owner;
 
 const FRAME_CAP: usize = 256;
 
@@ -83,41 +83,40 @@ pub async fn exchange_modbus_tcp(unit_id: u8, pdu: &[u8]) -> Result<HVec<u8, FRA
     Ok(out)
 }
 
-pub async fn run_relay(
-    uart_periph: esp_hal::peripherals::UART1<'static>,
-    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
-    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
-    pin_config: PinConfiguration,
-) -> Result<()> {
+pub async fn run_relay(mut master: ModbusRTUMaster<'static>) -> Result<()> {
     log::info!("Starting Modbus RTU relay (operating_mode=rtu_relay)");
-    let mut master = init_uart_and_modbus(uart_periph, uhci_periph, dma_channel, &pin_config)?;
+    while REQ_CH.try_receive().is_ok() {}
     mark_active(true);
     log::info!("Modbus RTU relay bus ready");
 
     loop {
-        let req = REQ_CH.receive().await;
-        let mut resp_buf = [0u8; FRAME_CAP];
-        let result = match master.modbus_request(&req, &mut resp_buf).await {
-            Ok(len) => {
-                let mut out = HVec::new();
-                if out.extend_from_slice(&resp_buf[..len]).is_ok() {
-                    Ok(out)
-                } else {
-                    Err(FirmwareError::Modbus("resp too large"))
-                }
+        if uart_owner::stop_requested() {
+            break;
+        }
+        match embassy_futures::select::select(REQ_CH.receive(), uart_owner::wait_stop()).await {
+            embassy_futures::select::Either::First(req) => {
+                let mut resp_buf = [0u8; FRAME_CAP];
+                let result = match master.modbus_request(&req, &mut resp_buf).await {
+                    Ok(len) => {
+                        let mut out = HVec::new();
+                        if out.extend_from_slice(&resp_buf[..len]).is_ok() {
+                            Ok(out)
+                        } else {
+                            Err(FirmwareError::Modbus("resp too large"))
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                RESP_CH.send(result).await;
             }
-            Err(e) => Err(e),
-        };
-        RESP_CH.send(result).await;
+            embassy_futures::select::Either::Second(()) => break,
+        }
     }
-}
 
-#[cfg(feature = "esp32s3")]
-pub fn run_relay_blocking(
-    uart_periph: esp_hal::peripherals::UART1<'static>,
-    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
-    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
-    pin_config: PinConfiguration,
-) {
-    crate::motor_57aim30::run_relay_on_core1(uart_periph, uhci_periph, dma_channel, pin_config);
+    mark_active(false);
+    while let Ok(_) = REQ_CH.try_receive() {
+        let _ = RESP_CH.try_send(Err(FirmwareError::Modbus("relay inactive")));
+    }
+    log::info!("Modbus RTU relay stopped");
+    Ok(())
 }

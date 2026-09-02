@@ -5,8 +5,9 @@ use ossm_core::rpc::RpcAction;
 use ossm_core::{Command, CoreError, Engine, MotorControllerConfig, StateResponse};
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::bus::ModbusBus;
 use crate::persist::{persistent_motor_changed, Persist, SavedConfig};
-use crate::serial::SerialPort;
+use crate::usb_pll::FramePll;
 
 pub enum EngineMsg {
     TrySetConfig {
@@ -39,8 +40,7 @@ pub struct EngineTaskOpts {
     pub persist: Persist,
     pub saved: SavedConfig,
     pub mock: bool,
-    pub no_homing: bool,
-    pub serial: Option<SerialPort>,
+    pub serial: Option<crate::bus::ModbusBus>,
 }
 
 pub async fn run_engine_task(
@@ -52,18 +52,30 @@ pub async fn run_engine_task(
 
     let _ = snap_tx.send(engine.snapshot().clone());
 
-    let mut write_serial = false;
-    if opts.no_homing || opts.mock {
+    let mut write_bus = false;
+    if opts.mock {
         engine.apply(Command::HomingComplete {
             pos_min: 0.0,
             pos_max: 100.0,
             position: 50.0,
         });
         engine.flush_snapshot();
-        write_serial = opts.serial.is_some() && !opts.mock;
     } else if let Some(port) = opts.serial.as_mut() {
-        if let Err(e) = port.enable_modbus().await {
-            tracing::warn!("enable modbus: {e}");
+        let mut enabled = false;
+        for attempt in 1..=12 {
+            match port.enable_modbus().await {
+                Ok(()) => {
+                    enabled = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("enable modbus ({attempt}/12): {e}");
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+            }
+        }
+        if !enabled {
+            tracing::warn!("enable modbus: giving up after retries");
         }
         let home = tokio::select! {
             r = port.homing() => r,
@@ -88,7 +100,7 @@ pub async fn run_engine_task(
                 if let Err(e) = port.apply_run_gains().await {
                     tracing::warn!("run gains: {e}");
                 }
-                write_serial = true;
+                write_bus = true;
             }
             Err(e) => {
                 tracing::error!("homing failed: {e}");
@@ -100,24 +112,77 @@ pub async fn run_engine_task(
 
     let mut last_saved_motor = engine.snapshot().config.clone();
     let mut last_persist = Instant::now();
-    let mut interval = tokio::time::interval(Duration::from_millis(3));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     let _ = snap_tx.send(engine.snapshot().clone());
 
+    run_motion_loop(
+        &mut rx,
+        &mut engine,
+        &mut opts,
+        &snap_tx,
+        &mut last_saved_motor,
+        &mut last_persist,
+        write_bus,
+    )
+    .await;
+}
+
+async fn run_motion_loop(
+    rx: &mut mpsc::Receiver<EngineMsg>,
+    engine: &mut Engine,
+    opts: &mut EngineTaskOpts,
+    snap_tx: &watch::Sender<StateResponse>,
+    last_saved_motor: &mut MotorControllerConfig,
+    last_persist: &mut Instant,
+    write_bus: bool,
+) {
+    let mut pll = FramePll::new();
+    let use_pll = write_bus && matches!(&opts.serial, Some(ModbusBus::Serial(_)));
+    let mut last_pll_log = Instant::now();
     loop {
         tokio::select! {
             msg = rx.recv() => {
                 let Some(msg) = msg else { break; };
-                handle_msg(&mut engine, msg, &opts.persist);
+                handle_msg(engine, msg, &opts.persist);
             }
-            _ = interval.tick() => {
+            _ = wait_next_tx(use_pll, &mut pll) => {
                 let now = micros_now();
                 let out = engine.tick(now);
-                if write_serial {
-                    if let Some(port) = opts.serial.as_mut() {
+                if write_bus && travel_homed(engine) {
+                    if use_pll {
+                        let Some(port) = opts.serial.as_mut().and_then(|b| b.as_serial_mut()) else {
+                            break;
+                        };
+                        match port.write_position_radians(out.position).await {
+                            Ok(timing) => {
+                                engine.apply(Command::SetMotorConnected(true));
+                                pll.on_done(timing.t_tx, timing.t_rx);
+                            }
+                            Err(e) => {
+                                tracing::debug!("serial write: {e}");
+                                engine.apply(Command::SetMotorConnected(false));
+                                pll.on_done(Instant::now(), None);
+                            }
+                        }
+                        if last_pll_log.elapsed() >= Duration::from_secs(1) {
+                            last_pll_log = Instant::now();
+                            let snap = engine.snapshot();
+                            tracing::info!(
+                                psi = pll.psi_us(),
+                                phase_mag = pll.phase_mag(),
+                                period = pll.period_us(),
+                                e = pll.last_err_us(),
+                                i = pll.integral_us(),
+                                write_lead = pll.write_lead_us(),
+                                rtt_ewma = pll.rtt_ewma_us(),
+                                ups = snap.ups,
+                                dt_avg_ms = snap.dt_avg_ms,
+                                dt_max_ms = snap.dt_max_ms,
+                                "pll"
+                            );
+                        }
+                    } else if let Some(port) = opts.serial.as_mut() {
                         if let Err(e) = port.write_position_radians(out.position).await {
-                            tracing::debug!("serial write: {e}");
+                            tracing::debug!("bus write: {e}");
                             engine.apply(Command::SetMotorConnected(false));
                         } else {
                             engine.apply(Command::SetMotorConnected(true));
@@ -126,19 +191,42 @@ pub async fn run_engine_task(
                 } else {
                     engine.apply(Command::SetMotorConnected(opts.mock));
                 }
-                let _ = snap_tx.send(engine.snapshot().clone());
+                after_tick(engine, opts, snap_tx, last_saved_motor, last_persist);
+            }
+        }
+    }
+}
 
-                if last_persist.elapsed() >= Duration::from_secs(2) {
-                    last_persist = Instant::now();
-                    let cfg = engine.snapshot().config.clone();
-                    if persistent_motor_changed(&last_saved_motor, &cfg) {
-                        last_saved_motor = cfg.clone();
-                        let saved = SavedConfig { motor: cfg };
-                        if let Err(e) = opts.persist.save(&saved) {
-                            tracing::warn!("persist motor: {e}");
-                        }
-                    }
-                }
+async fn wait_next_tx(use_pll: bool, pll: &mut FramePll) {
+    if use_pll {
+        pll.wait_tx().await;
+    } else {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn travel_homed(engine: &Engine) -> bool {
+    let snap = engine.snapshot();
+    snap.pos_min != snap.pos_max
+}
+
+fn after_tick(
+    engine: &mut Engine,
+    opts: &EngineTaskOpts,
+    snap_tx: &watch::Sender<StateResponse>,
+    last_saved_motor: &mut MotorControllerConfig,
+    last_persist: &mut Instant,
+) {
+    let _ = snap_tx.send(engine.snapshot().clone());
+
+    if last_persist.elapsed() >= Duration::from_secs(2) {
+        *last_persist = Instant::now();
+        let cfg = engine.snapshot().config.clone();
+        if persistent_motor_changed(last_saved_motor, &cfg) {
+            *last_saved_motor = cfg.clone();
+            let saved = SavedConfig { motor: cfg };
+            if let Err(e) = opts.persist.save(&saved) {
+                tracing::warn!("persist motor: {e}");
             }
         }
     }

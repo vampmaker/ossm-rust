@@ -31,14 +31,14 @@ mod motion;
 mod motor;
 mod motor_57aim30;
 mod rpc;
+mod uart_owner;
+mod rs485;
 mod storage;
 mod wifi;
 
 use context::AppContext;
 #[cfg(feature = "esp32c6")]
 use motion::CommandConsumer;
-#[cfg(feature = "esp32c6")]
-use storage::PinConfiguration;
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -70,13 +70,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let pin_config = app_context.storage.pin();
     let ble_enabled = pin_config.ble_enabled;
-    let rtu_relay = pin_config.is_rtu_relay();
-
-    if rtu_relay {
-        log::info!("Boot mode: rtu_relay (Modbus bridge; motor controller disabled)");
-    } else {
-        log::info!("Boot mode: servo (motor controller)");
-    }
+    log::info!("Boot UART1 mode: {:?}", pin_config.mode());
 
     #[cfg(feature = "esp32c6")]
     {
@@ -85,32 +79,16 @@ async fn main(spawner: Spawner) -> ! {
             let exec = MOTOR_EXEC.init(InterruptExecutor::new(sw_interrupt.software_interrupt1));
             exec.start(Priority::Priority3)
         };
-        if rtu_relay {
-            motor_spawner.spawn(
-                relay_task(
-                    peripherals.UART1,
-                    peripherals.UHCI0,
-                    peripherals.DMA_CH0,
-                    pin_config,
-                )
-                .unwrap(),
-            );
-            // Keep the unused motion consumer alive for AppContext lifetime.
-            #[allow(clippy::forget_non_drop)]
-            core::mem::forget(motion_consumer);
-        } else {
-            motor_spawner.spawn(
-                motor_task(
-                    app_context,
-                    motion_consumer,
-                    peripherals.UART1,
-                    peripherals.UHCI0,
-                    peripherals.DMA_CH0,
-                    pin_config,
-                )
-                .unwrap(),
-            );
-        }
+        motor_spawner.spawn(
+            uart_owner_task(
+                app_context,
+                motion_consumer,
+                peripherals.UART1,
+                peripherals.UHCI0,
+                peripherals.DMA_CH0,
+            )
+            .unwrap(),
+        );
     }
 
     #[cfg(feature = "esp32s3")]
@@ -122,39 +100,24 @@ async fn main(spawner: Spawner) -> ! {
         let uart = peripherals.UART1;
         let uhci = peripherals.UHCI0;
         let dma_ch = peripherals.DMA_CH0;
-        if rtu_relay {
-            core::mem::forget(motion_consumer);
-            esp_rtos::start_second_core(
-                peripherals.CPU_CTRL,
-                sw_interrupt.software_interrupt1,
-                stack,
-                move || {
-                    modbus_relay::run_relay_blocking(uart, uhci, dma_ch, pin_config);
-                },
-            );
-        } else {
-            esp_rtos::start_second_core(
-                peripherals.CPU_CTRL,
-                sw_interrupt.software_interrupt1,
-                stack,
-                move || {
-                    motor_57aim30::run_motor_blocking(
-                        app_context,
-                        motion_consumer,
-                        uart,
-                        uhci,
-                        dma_ch,
-                        pin_config,
-                    );
-                },
-            );
-        }
+        esp_rtos::start_second_core(
+            peripherals.CPU_CTRL,
+            sw_interrupt.software_interrupt1,
+            stack,
+            move || {
+                motor_57aim30::run_uart_owner_blocking(
+                    app_context,
+                    motion_consumer,
+                    uart,
+                    uhci,
+                    dma_ch,
+                );
+            },
+        );
     }
 
     spawner.spawn(cli_task(app_context).unwrap());
-    if !rtu_relay {
-        spawner.spawn(nvs_saver_task(app_context).unwrap());
-    }
+    spawner.spawn(nvs_saver_task(app_context).unwrap());
 
     // Hold BT until after WiFi/HTTP are up so association and TCP listen are
     // established before BLE radio contention begins.
@@ -167,12 +130,9 @@ async fn main(spawner: Spawner) -> ! {
     let net_config = app_context.storage.net();
     if net_config.wifi_enabled {
         let stack = wifi::start_wifi(peripherals.WIFI, app_context, &spawner).await;
-        http_api::run_server(stack, app_context, &spawner, rtu_relay).await;
+        http_api::run_server(stack, app_context, &spawner).await;
     } else {
         log::info!("WiFi is disabled in NetworkConfiguration.");
-        if rtu_relay {
-            log::warn!("RTU relay network endpoints require WiFi to be enabled.");
-        }
     }
 
     if let Some(bt) = bt_for_later {
@@ -196,32 +156,14 @@ async fn console_task(
 
 #[cfg(feature = "esp32c6")]
 #[embassy_executor::task]
-async fn motor_task(
+async fn uart_owner_task(
     app_context: AppContext,
     motion_consumer: CommandConsumer,
     uart: esp_hal::peripherals::UART1<'static>,
     uhci: esp_hal::peripherals::UHCI0<'static>,
     dma_ch: esp_hal::peripherals::DMA_CH0<'static>,
-    pin_config: PinConfiguration,
 ) {
-    if let Err(e) =
-        motor_57aim30::run_motor(app_context, motion_consumer, uart, uhci, dma_ch, pin_config).await
-    {
-        log::error!("Motor task failed: {}", e);
-    }
-}
-
-#[cfg(feature = "esp32c6")]
-#[embassy_executor::task]
-async fn relay_task(
-    uart: esp_hal::peripherals::UART1<'static>,
-    uhci: esp_hal::peripherals::UHCI0<'static>,
-    dma_ch: esp_hal::peripherals::DMA_CH0<'static>,
-    pin_config: PinConfiguration,
-) {
-    if let Err(e) = modbus_relay::run_relay(uart, uhci, dma_ch, pin_config).await {
-        log::error!("Modbus relay task failed: {}", e);
-    }
+    uart_owner::run_uart_owner(app_context, motion_consumer, uart, uhci, dma_ch).await;
 }
 
 #[embassy_executor::task]
@@ -242,6 +184,9 @@ async fn nvs_saver_task(app_context: AppContext) {
         // Longer debounce: flash erase during an active BLE/WiFi session
         // starves the RF controller and drops connections.
         Timer::after(Duration::from_millis(2000)).await;
+        if !app_context.storage.pin().is_servo() {
+            continue;
+        }
         let config = app_context.load_snapshot().config.clone();
         let should_save = match &last_saved {
             None => {

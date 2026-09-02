@@ -43,6 +43,7 @@ DEFAULT_PIN: dict[str, Any] = {
     "ble_enabled": True,
     "modbus_debug": False,
     "operating_mode": "servo",
+    "modbus_baud": 115200,
 }
 
 DEFAULT_NET: dict[str, Any] = {

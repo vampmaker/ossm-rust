@@ -737,6 +737,12 @@ async def run_wifi_frontend_tests(page, *, ws_messages: list, ws_connections: li
     await page.wait_for_selector("text=Motor Update Rate Telemetry", timeout=5000)
     print("✓ Unified Device Settings panel opened and telemetry card verified")
 
+    mode_sel = page.locator("#pin-operating-mode")
+    await mode_sel.wait_for(state="visible", timeout=5000)
+    mode_values = await mode_sel.locator("option").evaluate_all("els => els.map(e => e.value)")
+    assert mode_values == ["servo", "rtu_relay", "rs485"], mode_values
+    print("✓ Operating mode select includes servo, rtu_relay, and rs485")
+
     await page.locator("text=updates/sec (Hz)").wait_for(state="visible", timeout=5000)
     ble_chk = page.locator("#ble-enabled")
     wifi_chk = page.locator("#wifi-enabled")
@@ -1146,6 +1152,11 @@ async def test_motor_control():
         await page.wait_for_selector("#mc-ws-url", state="visible", timeout=5000)
         assert await page.locator("#mc-baud").count() == 0, "Baud select should hide in WebSocket mode"
         print("✓ Remote WebSocket mode shows URL field and hides baud")
+
+        await conn_type.select_option("rs485")
+        await page.wait_for_selector("#mc-ws-url", state="visible", timeout=5000)
+        await page.wait_for_selector("#mc-baud", state="visible", timeout=5000)
+        print("✓ RS-485 WebSocket mode shows URL field and baud")
 
         await conn_type.select_option("serial")
         await page.wait_for_selector("#mc-baud", state="visible", timeout=5000)
@@ -1600,6 +1611,11 @@ async def main():
         help="Run only the Web Flasher E2E test (requires a physical ESP32 on DEVICE_PORT)",
     )
     parser.add_argument(
+        "--only-motor-control",
+        action="store_true",
+        help="Run only the motor-control.html Playwright suite (no hardware)",
+    )
+    parser.add_argument(
         "--skip-flasher",
         action="store_true",
         help="Skip Web Flasher E2E test (requires a physical ESP32 on DEVICE_PORT)",
@@ -1617,6 +1633,13 @@ async def main():
         await test_flasher()
         print(f"\n============================================================")
         print(f"✓ Web Flasher E2E test PASSED")
+        print(f"============================================================")
+        return
+
+    if args.only_motor_control:
+        await test_motor_control()
+        print(f"\n============================================================")
+        print(f"✓ Motor-control Playwright E2E PASSED")
         print(f"============================================================")
         return
 

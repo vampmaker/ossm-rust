@@ -1,10 +1,13 @@
 mod args;
+mod bus;
 mod cli;
 mod engine_task;
 mod http;
 mod modbus_rx;
 mod persist;
+mod relay_server;
 mod serial;
+mod usb_pll;
 
 use std::sync::Arc;
 
@@ -23,6 +26,7 @@ async fn main() {
     let args = Args::parse_from_env();
     tracing::info!(
         mock = args.is_mock(),
+        mode = ?args.mode,
         bind = %args.bind_addr(),
         config = %args.config_path().display(),
         "starting ossm-std"
@@ -31,19 +35,23 @@ async fn main() {
     let persist = Persist::new(args.config_path());
     let saved = persist.load();
 
-    let serial = if args.is_mock() {
-        None
-    } else if let Some(path) = args.serial.as_ref() {
-        match serial::SerialPort::open(&path.to_string_lossy(), args.baud(), args.slave_id()) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::error!("open serial {}: {e}", path.display());
-                None
-            }
+    let bus = open_bus(&args).await;
+
+    if args.is_rtu_relay() {
+        let Some(bus) = bus else {
+            tracing::error!(
+                "--mode rtu-relay requires --serial, --relay-tcp, --relay-ws, or --rs485-ws"
+            );
+            std::process::exit(2);
+        };
+        if let Err(e) =
+            relay_server::run_relay_servers(bus, args.bind_addr(), args.modbus_bind_addr()).await
+        {
+            tracing::error!("{e}");
+            std::process::exit(1);
         }
-    } else {
-        None
-    };
+        return;
+    }
 
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (snap_tx, snap_rx) = watch::channel(ossm_core::StateResponse::default());
@@ -55,9 +63,8 @@ async fn main() {
     let opts = EngineTaskOpts {
         persist,
         saved,
-        mock: args.is_mock() || serial.is_none(),
-        no_homing: args.no_homing,
-        serial,
+        mock: args.is_mock() || bus.is_none(),
+        serial: bus,
     };
     tokio::spawn(run_engine_task(cmd_rx, snap_tx, opts));
 
@@ -93,6 +100,50 @@ async fn main() {
     }
 }
 
+async fn open_bus(args: &Args) -> Option<bus::ModbusBus> {
+    if args.is_mock() && !args.has_remote_bus() && args.serial.is_none() {
+        return None;
+    }
+    if let Some(url) = args.rs485_ws.as_ref() {
+        return match bus::ModbusBus::rs485_ws(url, args.baud()).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::error!("open --rs485-ws {url}: {e}");
+                None
+            }
+        };
+    }
+    if let Some(url) = args.relay_ws.as_ref() {
+        return match bus::ModbusBus::relay_ws(url).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::error!("open --relay-ws {url}: {e}");
+                None
+            }
+        };
+    }
+    if let Some(host) = args.relay_tcp.as_ref() {
+        return match bus::ModbusBus::relay_tcp(host).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::error!("open --relay-tcp {host}: {e}");
+                None
+            }
+        };
+    }
+    if let Some(path) = args.serial.as_ref() {
+        return match serial::SerialPort::open(&path.to_string_lossy(), args.baud(), args.slave_id())
+        {
+            Ok(p) => Some(bus::ModbusBus::serial(p)),
+            Err(e) => {
+                tracing::error!("open serial {}: {e}", path.display());
+                None
+            }
+        };
+    }
+    None
+}
+
 #[cfg(test)]
 mod http_tests {
     use super::*;
@@ -124,7 +175,6 @@ mod http_tests {
                 persist,
                 saved: persist::SavedConfig::default(),
                 mock: true,
-                no_homing: true,
                 serial: None,
             },
         ));

@@ -130,7 +130,9 @@ export interface PinConfiguration {
   ble_enabled: boolean
   /** Diagnostic Modbus RX capture; requires reboot. Collapses UPS while on. */
   modbus_debug?: boolean
-  operating_mode?: 'servo' | 'rtu_relay'
+  operating_mode?: 'servo' | 'rtu_relay' | 'rs485'
+  /** UART1 boot baud; live baud in rs485 may follow CDC / /ws/rs485 CFG. */
+  modbus_baud?: number
 }
 
 export interface NetworkConfiguration {

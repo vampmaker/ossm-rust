@@ -1,6 +1,6 @@
 //! Non-realtime Modbus RTU RX: accumulate USB-serial chunks, extract by sliding CRC.
 
-use ossm_core::modbus::find_modbus_response;
+use ossm_core::modbus::{classify_rtu_prefix, find_modbus_frame, find_modbus_response, RtuPrefix};
 
 const CAP: usize = 256;
 
@@ -46,13 +46,29 @@ impl RxAccumulator {
         self.len += data.len();
     }
 
-    /// Drop a leading copy of the TX frame (USB-RS485 echo).
-    pub fn skip_echo(&mut self, request: &[u8]) {
-        if request.is_empty() || self.len < request.len() {
-            return;
-        }
-        if &self.buf[..request.len()] == request {
-            self.drain_prefix(request.len());
+    /// Next CRC-valid RTU frame from the stream. Keeps leftover bytes after the frame.
+    /// Waits (`None`) when a header guess is short. A junk prefix that wants more
+    /// bytes must not hide a CRC-valid frame that already sits later in the buffer
+    /// (FC06 ACK after a 5-byte USB fragment is the homing case).
+    pub fn pop_frame(&mut self) -> Option<Vec<u8>> {
+        loop {
+            if let Some((off, frame_len)) = find_modbus_frame(&self.buf[..self.len]) {
+                if off > 0 {
+                    self.drain_prefix(off);
+                }
+                let frame = self.buf[..frame_len].to_vec();
+                self.drain_prefix(frame_len);
+                return Some(frame);
+            }
+            match classify_rtu_prefix(&self.buf[..self.len]) {
+                RtuPrefix::Invalid => {
+                    if self.len == 0 {
+                        return None;
+                    }
+                    self.drain_prefix(1);
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -139,6 +155,10 @@ mod tests {
         with_crc(&[
             0x01, 0x10, 0x00, 0x16, 0x00, 0x02, 0x04, 0x00, 0x01, 0x00, 0x00,
         ])
+    }
+
+    fn fc06_ack() -> Vec<u8> {
+        with_crc(&[0x01, 0x06, 0x00, 0x18, 0x00, 0x3c])
     }
 
     fn exception_ack() -> Vec<u8> {
@@ -235,17 +255,6 @@ mod tests {
     }
 
     #[test]
-    fn echo_then_ack() {
-        let req = fc16_request();
-        let ack = fc16_ack();
-        let mut rx = RxAccumulator::new();
-        rx.push(&req);
-        rx.push(&ack);
-        rx.skip_echo(&req);
-        assert_eq!(rx.extract(1, 8, 0x10).unwrap(), ack.as_slice());
-    }
-
-    #[test]
     fn overflow_clears_then_accepts_new() {
         let mut rx = RxAccumulator::new();
         rx.push(&[0x11; 200]);
@@ -269,6 +278,61 @@ mod tests {
         rx.clear();
         assert_eq!(rx.len(), 0);
         rx.push(&[0x33; 300]);
+        assert_eq!(rx.len(), 0);
+    }
+
+    #[test]
+    fn pop_frame_split_ack_emits_when_crc_completes() {
+        let ack = fc16_ack();
+        let mut rx = RxAccumulator::new();
+        rx.push(&ack[..4]);
+        assert!(rx.pop_frame().is_none());
+        rx.push(&ack[4..]);
+        assert_eq!(rx.pop_frame().as_deref(), Some(ack.as_slice()));
+        assert_eq!(rx.len(), 0);
+    }
+
+    #[test]
+    fn pop_frame_keeps_leftover() {
+        let ack = fc16_ack();
+        let mut raw = ack.clone();
+        raw.extend_from_slice(&[0xAA, 0xBB]);
+        let mut rx = RxAccumulator::new();
+        rx.push(&raw);
+        assert_eq!(rx.pop_frame().as_deref(), Some(ack.as_slice()));
+        assert_eq!(rx.len(), 2);
+        assert_eq!(&rx.buf[..2], &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn pop_frame_two_in_one_push() {
+        let a = fc16_ack();
+        let b = exception_ack();
+        let mut raw = a.clone();
+        raw.extend_from_slice(&b);
+        let mut rx = RxAccumulator::new();
+        rx.push(&raw);
+        assert_eq!(rx.pop_frame().as_deref(), Some(a.as_slice()));
+        assert_eq!(rx.pop_frame().as_deref(), Some(b.as_slice()));
+        assert_eq!(rx.len(), 0);
+    }
+
+    #[test]
+    fn pop_frame_short_header_waits() {
+        let mut rx = RxAccumulator::new();
+        rx.push(&[0x01]);
+        assert!(rx.pop_frame().is_none());
+        assert_eq!(rx.len(), 1);
+    }
+
+    #[test]
+    fn pop_frame_fc06_behind_fc01_leftover() {
+        let ack = fc06_ack();
+        let mut rx = RxAccumulator::new();
+        rx.push(&[0xc0, 0x00, 0x01, 0x48, 0x0a]);
+        assert!(rx.pop_frame().is_none());
+        rx.push(&ack);
+        assert_eq!(rx.pop_frame().as_deref(), Some(ack.as_slice()));
         assert_eq!(rx.len(), 0);
     }
 }

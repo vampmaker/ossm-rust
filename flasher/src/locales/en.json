@@ -58,6 +58,13 @@
       "modbusRx": "Modbus RX",
       "modbusDeRe": "Modbus DE/RE"
     },
+    "operatingMode": {
+      "legend": "Operating mode",
+      "servo": "Servo (OSSM motion)",
+      "rtuRelay": "RTU relay (TCP :502 + /ws/modbus)",
+      "rs485": "RS-485 transceiver (USB + /ws/rs485)",
+      "hint": "Applied live after Send Configuration (no extra reboot for mode). USB CLI is unavailable while RS-485 transceiver is active."
+    },
     "modbus": {
       "legend": "Motor / Modbus",
       "baudRate": "Baud Rate",

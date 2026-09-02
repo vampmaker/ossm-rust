@@ -12,11 +12,12 @@
 
 use core::cell::UnsafeCell;
 use core::fmt::Write as FmtWrite;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
 use esp_hal::gpio::{AnyPin, Input, InputConfig, Output, OutputConfig, Pull};
@@ -66,6 +67,152 @@ static CLI_OUT_CH: Channel<CriticalSectionRawMutex, OutChunk, CLI_OUT_QUEUE> = C
 static IN_CH: Channel<CriticalSectionRawMutex, u8, IN_QUEUE> = Channel::new();
 /// False while USB IN is stalled: ChannelLogger returns before formatting.
 static LOG_LIVE: AtomicBool = AtomicBool::new(true);
+const USB_MUX_CLI: u8 = 0;
+const USB_MUX_PIPE: u8 = 1;
+static USB_MUX: AtomicU8 = AtomicU8::new(USB_MUX_CLI);
+static CDC_BAUD: AtomicU32 = AtomicU32::new(0);
+const PIPE_CAP: usize = 512;
+
+struct PipeRing {
+    buf: UnsafeCell<[u8; PIPE_CAP]>,
+    head: AtomicUsize,
+    len: AtomicUsize,
+}
+
+unsafe impl Sync for PipeRing {}
+
+static PIPE_HOST: PipeRing = PipeRing {
+    buf: UnsafeCell::new([0; PIPE_CAP]),
+    head: AtomicUsize::new(0),
+    len: AtomicUsize::new(0),
+};
+static PIPE_BUS: PipeRing = PipeRing {
+    buf: UnsafeCell::new([0; PIPE_CAP]),
+    head: AtomicUsize::new(0),
+    len: AtomicUsize::new(0),
+};
+static HOST_PIPE_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+fn pipe_push(ring: &PipeRing, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    critical_section::with(|_| {
+        let len = ring.len.load(Ordering::Relaxed);
+        let n = data.len().min(PIPE_CAP.saturating_sub(len));
+        if n == 0 {
+            return;
+        }
+        let head = ring.head.load(Ordering::Relaxed);
+        let buf = unsafe { &mut *ring.buf.get() };
+        for (i, &b) in data.iter().take(n).enumerate() {
+            buf[(head + len + i) % PIPE_CAP] = b;
+        }
+        ring.len.store(len + n, Ordering::Relaxed);
+    });
+}
+
+fn pipe_pop(ring: &PipeRing, dst: &mut [u8]) -> usize {
+    critical_section::with(|_| {
+        let len = ring.len.load(Ordering::Relaxed);
+        let n = dst.len().min(len);
+        if n == 0 {
+            return 0;
+        }
+        let head = ring.head.load(Ordering::Relaxed);
+        let buf = unsafe { &*ring.buf.get() };
+        for (i, slot) in dst.iter_mut().take(n).enumerate() {
+            *slot = buf[(head + i) % PIPE_CAP];
+        }
+        ring.head.store((head + n) % PIPE_CAP, Ordering::Relaxed);
+        ring.len.store(len - n, Ordering::Relaxed);
+        n
+    })
+}
+
+fn pipe_clear(ring: &PipeRing) {
+    critical_section::with(|_| {
+        ring.head.store(0, Ordering::Relaxed);
+        ring.len.store(0, Ordering::Relaxed);
+    });
+}
+
+pub fn usb_mux_is_pipe() -> bool {
+    USB_MUX.load(Ordering::Relaxed) == USB_MUX_PIPE
+}
+
+pub fn set_usb_mux_pipe(pipe: bool) {
+    if pipe {
+        USB_MUX.store(USB_MUX_PIPE, Ordering::Release);
+        pipe_clear(&PIPE_HOST);
+        pipe_clear(&PIPE_BUS);
+        while IN_CH.try_receive().is_ok() {}
+    } else {
+        USB_MUX.store(USB_MUX_CLI, Ordering::Release);
+        pipe_clear(&PIPE_HOST);
+        pipe_clear(&PIPE_BUS);
+    }
+}
+
+pub fn pipe_push_host(data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    pipe_push(&PIPE_HOST, data);
+    HOST_PIPE_SIG.signal(());
+}
+
+pub fn pipe_pop_host(dst: &mut [u8]) -> usize {
+    pipe_pop(&PIPE_HOST, dst)
+}
+
+pub fn pipe_host_pending() -> bool {
+    PIPE_HOST.len.load(Ordering::Relaxed) > 0
+}
+
+pub async fn wait_host_pipe() {
+    if pipe_host_pending() {
+        return;
+    }
+    HOST_PIPE_SIG.wait().await;
+}
+
+pub fn pipe_push_bus(data: &[u8]) {
+    pipe_push(&PIPE_BUS, data);
+}
+
+pub fn pipe_pop_bus(dst: &mut [u8]) -> usize {
+    pipe_pop(&PIPE_BUS, dst)
+}
+
+fn pipe_bus_pending() -> bool {
+    PIPE_BUS.len.load(Ordering::Relaxed) > 0
+}
+
+pub fn take_cdc_baud() -> u32 {
+    CDC_BAUD.swap(0, Ordering::AcqRel)
+}
+
+#[cfg(feature = "esp32c6")]
+fn poll_cdc_baud() {
+    let usb = esp_hal::peripherals::USB_DEVICE::regs();
+    let baud = usb.set_line_code_w0().read().dw_dte_rate().bits();
+    if (1200..=3_000_000).contains(&baud) {
+        static LAST: AtomicU32 = AtomicU32::new(0);
+        let prev = LAST.load(Ordering::Relaxed);
+        if baud != prev {
+            LAST.store(baud, Ordering::Relaxed);
+            CDC_BAUD.store(baud, Ordering::Relaxed);
+            if usb.int_st().read().set_line_code().bit_is_set() {
+                usb.int_clr()
+                    .write(|w| w.set_line_code().clear_bit_by_one());
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "esp32c6"))]
+fn poll_cdc_baud() {}
 
 struct LogByteRing {
     buf: UnsafeCell<[u8; LOG_RING_CAP]>,
@@ -296,12 +443,33 @@ fn try_push_in(b: u8) {
 }
 
 fn push_in_slice(data: &[u8]) {
+    if usb_mux_is_pipe() {
+        pipe_push_host(data);
+        return;
+    }
     for &b in data {
         try_push_in(b);
     }
 }
 
 fn poll_usb_rx_nb(usb_rx: &mut UsbSerialJtagRx<'_, Async>) {
+    if usb_mux_is_pipe() {
+        let mut tmp = [0u8; 64];
+        let mut n = 0usize;
+        while n < tmp.len() {
+            match usb_rx.read_byte() {
+                Ok(b) => {
+                    tmp[n] = b;
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        if n > 0 {
+            pipe_push_host(&tmp[..n]);
+        }
+        return;
+    }
     while let Ok(b) = usb_rx.read_byte() {
         try_push_in(b);
     }
@@ -528,6 +696,10 @@ impl ConsoleSinks<'_, '_> {
     }
 
     fn maybe_emit_banner(&mut self) {
+        if usb_mux_is_pipe() {
+            self.need_banner = false;
+            return;
+        }
         if !self.need_banner || self.usb_tx_state != UsbTxState::Idle {
             return;
         }
@@ -651,6 +823,32 @@ async fn tx_step(sinks: &mut ConsoleSinks<'_, '_>) {
         }
     }
 
+    if usb_mux_is_pipe() {
+        let mut buf = [0u8; USB_EP_SIZE];
+        let n = pipe_pop_bus(&mut buf);
+        if n > 0 {
+            let mut off = 0usize;
+            let _ = push_into(sinks.usb_tx_cli, &buf[..n], &mut off);
+        }
+        if !sinks.usb_tx_cli.is_empty() && sinks.usb_tx_state != UsbTxState::Stalled {
+            drain_usb(
+                sinks.usb_tx,
+                sinks.usb_tx_cli,
+                None,
+                &mut sinks.usb_tx_state,
+            )
+            .await;
+            if sinks.usb_tx_state == UsbTxState::Stalled {
+                sinks.enter_stall();
+                return;
+            }
+        }
+        let _ = drain_cli_out_batch(sinks).await;
+        let tx_deadline = Instant::now() + Duration::from_millis(LOOP_TX_BUDGET_MS);
+        let _ = drain_out_batch(sinks, tx_deadline).await;
+        return;
+    }
+
     let _ = drain_cli_out_batch(sinks).await;
     if sinks.usb_tx_state == UsbTxState::Stalled {
         return;
@@ -664,6 +862,14 @@ async fn tx_step(sinks: &mut ConsoleSinks<'_, '_>) {
 /// waiting on UART0/RTT stalls — those are best-effort only.
 async fn accept_out(sinks: &mut ConsoleSinks<'_, '_>, is_log: bool, data: &[u8]) {
     if data.is_empty() {
+        return;
+    }
+    if usb_mux_is_pipe() {
+        let mut uart_off = 0usize;
+        let mut rtt_off = 0usize;
+        let _ = push_into(sinks.uart_tx, data, &mut uart_off);
+        let _ = push_into(sinks.rtt_tx, data, &mut rtt_off);
+        drain_side_sinks(sinks).await;
         return;
     }
     if is_log && sinks.usb_tx_state == UsbTxState::Stalled {
@@ -811,6 +1017,9 @@ fn cli_tx_pending(sinks: &ConsoleSinks<'_, '_>) -> bool {
 }
 
 fn tx_pending(sinks: &ConsoleSinks<'_, '_>) -> bool {
+    if usb_mux_is_pipe() && (pipe_bus_pending() || !sinks.usb_tx_cli.is_empty()) {
+        return true;
+    }
     if sinks.usb_tx_state == UsbTxState::Stalled {
         return cli_tx_pending(sinks);
     }
@@ -873,6 +1082,7 @@ pub async fn run(
     accept_out(&mut sinks, true, CONSOLE_BANNER).await;
 
     loop {
+        poll_cdc_baud();
         poll_usb_rx_nb(&mut usb_rx);
         poll_uart_rx_nb(sinks.uart);
 

@@ -68,8 +68,8 @@ A file belongs in a crate only if it serves that crate's intent. The tables belo
 **Invariants**
 
 - Heap **96 KiB**. Snapshot publish is in-place `Arc` (`copy_from` / `make_mut`). Never `Arc::new` every motor cycle.
-- Boot: `esp_hal::init` → heap → `esp_rtos::start` → `console::init_logger` → `console_task` → CLI / motor-or-relay / storage → WiFi/HTTP (`HTTP_READY`) → BLE.
-- `servo` vs `rtu_relay` is exclusive (same UHCI/UART1).
+- Boot: `esp_hal::init` → heap → `esp_rtos::start` → `console::init_logger` → `console_task` → CLI / UART1 owner / storage → WiFi/HTTP (`HTTP_READY`) → BLE.
+- `servo` vs `rtu_relay` vs `rs485` is exclusive (same UART1). Roles switch at runtime via a stoppable UART1 owner (no reboot). Live switch **into** `servo` always re-homes (`run_motor` → travel homing); no cached `pos_min`/`pos_max`.
 - C6: motor on `InterruptExecutor`. S3: motor on Core 1. Observed `dt_max_ms` **< 4.5** under HTTP+WS.
 - Pin/net types and NVS live in `storage.rs`. RAM inject lives in `modbus_rtu.rs`.
 - Soft-reset only for explicit `restart` / CLI `reset`. BLE runner failure must recover in-process.
@@ -83,7 +83,9 @@ A file belongs in a crate only if it serves that crate's intent. The tables belo
 | `context.rs` | `AppContext` handles (queue + snapshot + storage) — not one big mutex; `storage_task` is the sole flash I/O actor |
 | `motion.rs` | Firmware SPSC aliases (`MotionCommand`, capacity 3) — not motion math |
 | `motor.rs` | `Motor` trait |
-| `motor_57aim30.rs` | UHCI GDMA master, homing, motor loop; owns `Engine` |
+| `motor_57aim30.rs` | UHCI GDMA master, homing, stoppable motor loop |
+| `uart_owner.rs` | UART1 supervisor: servo / rtu_relay / rs485 until stop, then re-init |
+| `rs485.rs` | Raw UART1 + DE/RE pipe; USB mux + `/ws/rs485` TX/RX/CFG |
 | `modbus_relay.rs` | RTU ↔ TCP `:502` + `/ws/modbus` |
 | `modbus_rtu.rs` | Re-export core CRC/find/aim30; own inject atomics |
 | `storage.rs` | NVS + `PinConfiguration` + `NetworkConfiguration` |
@@ -105,12 +107,15 @@ Two RPC dispatchers is deliberate: core is sync (`&mut Engine`); firmware cannot
 
 **Invariants**
 
-- CLI > env > defaults (`--serial` / `OSSM_SERIAL` / `DEVICE_PORT`, `--baud`, `--bind` default `127.0.0.1:8080`, `--config`, `--mock`).
+- CLI > env > defaults (`--serial` / `OSSM_SERIAL` / `DEVICE_PORT`, `--baud`, `--bind` default `127.0.0.1:8080`, `--mode servo|rtu-relay`, `--relay-tcp` / `--relay-ws` / `--rs485-ws`, `--modbus-bind` default `127.0.0.1:502`, `--config`, `--mock`).
 - Persist `{ motor }` JSON (temp + fsync + rename). Legacy `pin`/`net` keys ignored.
 - No BLE, GPIO, WiFi STA, `/pin-config`, `/network-config`, or `/modbus-inject`.
 - Stdin REPL is motor + motion actions. `reset` exits the process; `quit` leaves REPL.
-- PC USB-serial cannot use RTU t1.5/t3.5; RX lives in `modbus_rx.rs` (accumulate + CRC). Homing uses core `aim30` literals.
-- One engine actor (`mpsc`); HTTP/REPL send messages — no shared `Mutex<Engine>`.
+- PC USB-serial cannot use RTU t1.5/t3.5; RX is an unbounded stream in `modbus_rx.rs` (header length + CRC, leftover kept). Homing uses core `aim30` literals.
+- `--serial` USB-RS485 requires **automatic direction control**. TX-loopback adapters and host-driven DE/RE are unsupported. The ESP32 `rs485` pipe already drives DE in firmware. ossm-std does not strip TX echoes (FC06 ACKs are a copy of the request).
+- Real `--serial` / relay bus always homes; `--mock` only uses a virtual `0..100` range. There is no `--no-homing`.
+- Motor TX is next-available (USB 1 ms poll wake, or immediately after the previous ACK on TCP/WS), not a 3 ms interval.
+- One bus owner: Engine (`--mode servo`) **or** RTU relay server (`--mode rtu-relay` serves `:502` + `/ws/modbus`). Never both on the same bus.
 
 **Files (all hold)**
 
@@ -122,8 +127,11 @@ Two RPC dispatchers is deliberate: core is sync (`&mut Engine`); firmware cannot
 | `http.rs` | axum `/config` `/state` `/paused` `/restart` `/ws/command` |
 | `cli.rs` | Stdin REPL (`ossm_core::paths`) |
 | `persist.rs` | `{ motor }` atomic JSON |
-| `serial.rs` | tokio-serial FC03/06/16 + homing |
-| `modbus_rx.rs` | Host RX accumulator |
+| `serial.rs` | tokio-serial FC03/06/16 + homing; DTR/RTS off |
+| `bus.rs` | Pluggable RTU bus: serial, TCP 502, `/ws/modbus`, `/ws/rs485` |
+| `relay_server.rs` | `--mode rtu-relay` Modbus TCP + `/ws/modbus` |
+| `modbus_rx.rs` | Host RX accumulator (stream parse) |
+| `usb_pll.rs` | f32 PID lock to host USB 1 ms poll phase for `--serial` |
 
 Scripts against desktop: `DEVICE_IP=127.0.0.1:8080`.
 
@@ -281,6 +289,16 @@ USB Serial/JTAG CLI, motor-loop `ups`, and probe-rs RTT against a live device (`
 - **`late-attach`**: ACM closed ~12 s, then CLI `set pin.ble_enabled true` expects `pin.ble_enabled set to` within 2 s.
 - **`fairness`**: enables `modbus_debug` (reboot), `POST /modbus-inject` trailing/leading flood, `get inject` over a held-open ACM, `ups` ≥ 100; disables debug on exit.
 
+### RS-485 transceiver live tests (`scripts/test_rs485_transceiver.py`)
+Live-switch `operating_mode=rs485` **without reboot**, then exercise USB ACM and `/ws/rs485` via `ossm-std --mode rtu-relay`:
+```bash
+./scripts/test_rs485_transceiver.py
+```
+- HTTP `set pin.operating_mode rs485` (no restart); wait until `/ws/rs485` accepts.
+- USB path: `ossm-std --mode rtu-relay --serial $DEVICE_PORT` (DTR=0/RTS=0) serving Modbus TCP; FC03 unit 1.
+- WS path: `ossm-std --mode rtu-relay --rs485-ws ws://$DEVICE_IP/ws/rs485`; CFG baud then FC03.
+- Restore `operating_mode=servo` (no restart) and assert `/state` `ups` recovers.
+
 ---
 
 ## 5. Web Applications Architecture (`/frontend`, `/flasher`, `/motor-control`)
@@ -311,7 +329,7 @@ The flasher is a standalone, browser-based tool (`flasher/dist/index.html` -> `r
 
 ### 57AIM30 Modbus PC Control (`/motor-control`)
 Standalone browser tool (`motor-control/dist/index.html` → `release/motor-control.html`) that mimics the vendor **YZ_AIM** VB6 form (`assets/57aim30_pc_control.frm`): Chinese groupbox captions, light-gray/Win32-ish chrome via shared `GroupBox.vue`, thin title bar (`YZ_AIM` / 57AIM30 PC Control) — not the embedded OSSM frontend.
-- **Transport** (`lib/transport.ts`): `SerialModbusClient` (Web Serial) or `WebSocketModbusClient` (OSSM RTU relay at `/ws/modbus`). Keep both in the connection panel; baud is shown only for Local Serial.
+- **Transport** (`lib/transport.ts`): `SerialModbusClient` (Web Serial), `WebSocketModbusClient` (`/ws/modbus`), or `WebSocketRs485Client` (`/ws/rs485` TX/RX/CFG). Baud is shown for Local Serial and RS-485 WebSocket.
 - **Layout** (`App.vue`): desktop CSS grid — top `波形显示` | `modbus控制参数` (+ `参数保存` → write reg 20=1); bottom five cells `电机运行参数`, `驱动器设置参数`, `modbus读取`, `驱动器运行状态` (+ connect), `modbus发送`; strip `发送数据` (last TX echo from `onLog`); optional collapsed `通信日志`.
 - **Waveform** (`WaveformChart.vue`): X = sample index **0..100** (clear/wrap like VB `plot_line.Index`); Y grid **±8**; plot **raw signed** holding values **`/32768`** into mid-scale (match `Pic1.Line`); channels current / PWM / speed / voltage (`DriveState.*Raw` from `registers.ts`).
 - **Panels**: `ParamListPanel`, `TelemetryPanel`, `DriverSettingsPanel`, `ModbusReadPanel` (addr / 开始读取 / 地址扫描 / poll radios 20–200 ms), `StatusConnectPanel` (`#motor-control-connection`, `#mc-connection-type`, `#mc-baud`, `#mc-ws-url`), `ModbusSendPanel` (`send-options.ts`; raw hex under **高级**), `SendEchoStrip`, `CommLog`.
@@ -383,7 +401,7 @@ When interacting over USB serial (`115200` baud, `\r\n` terminated), configurati
 
 **Sections (firmware):** `get pin` | `get net` | `get motor` (full JSON); scalars: `get pin.modbus_tx`, `get net.wifi_enabled`, `get motor.bpm`, etc.
 
-**Pin paths:** `pin.modbus_tx` / `modbus_rx` / `modbus_de_re` (GPIO 0..48); `pin.modbus_timeout_ms` (0..1000, 0=default); `pin.modbus_rx_timeout_us` / `modbus_scan_delay_us` / `modbus_inter_frame_delay_us` (0..200000, 0=auto); `pin.ble_enabled` / `pin.modbus_debug` (true|false, debug needs reboot); `pin.operating_mode` (servo|rtu_relay, reboot).
+**Pin paths:** `pin.modbus_tx` / `modbus_rx` / `modbus_de_re` (GPIO 0..48); `pin.modbus_timeout_ms` (0..1000, 0=default); `pin.modbus_rx_timeout_us` / `modbus_scan_delay_us` / `modbus_inter_frame_delay_us` (0..200000, 0=auto); `pin.modbus_baud` (1200..3000000, default 115200); `pin.ble_enabled` / `pin.modbus_debug` (true|false, debug needs reboot); `pin.operating_mode` (servo|rtu_relay|rs485, live).
 
 **Net paths:** `net.wifi_enabled` / `net.dhcp_enabled` (true|false); `net.ssid` / `password` / `hostname` (string); `net.static_ip` / `static_mask` / `static_gateway` / `static_dns` (IPv4).
 
@@ -420,10 +438,10 @@ Firmware (`ossm-esp32`) unless a subsection says otherwise. `ossm-core` has no I
 
 ### 7.3 Task placement and cores
 
-- **ESP32-C6:** `motor_task` (or `modbus_relay`) on `esp_rtos::embassy::InterruptExecutor` at elevated priority. Console, CLI, network, BLE on the main Embassy executor.
-- **ESP32-S3:** motor/relay on **Core 1** via `esp_rtos::start_second_core(...)` → `run_motor_blocking(...)`. WiFi/HTTP on Core 0. Console + CLI stay on Core 0.
-- Boot: `esp_hal::init()` → `esp_alloc` (**96 KiB** heap; S3 also places a ~**24 KiB** Core-1 motor/relay stack in RWDATA) → `esp_rtos::start()` → `console::init_logger()` → spawn `console_task` → CLI / motor-or-relay / storage → WiFi/HTTP (`HTTP_READY`) → then BLE.
-- `servo` and `rtu_relay` are exclusive (same UART1/UHCI). Never spawn both.
+- **ESP32-C6:** UART1 owner (`uart_owner_task`) on `esp_rtos::embassy::InterruptExecutor` at elevated priority. Console, CLI, network, BLE on the main Embassy executor.
+- **ESP32-S3:** UART1 owner on **Core 1** via `esp_rtos::start_second_core(...)` → `run_uart_owner_blocking(...)`. WiFi/HTTP on Core 0. Console + CLI stay on Core 0.
+- Boot: `esp_hal::init()` → `esp_alloc` (**96 KiB** heap; S3 also places a ~**24 KiB** Core-1 motor/relay stack in RWDATA) → `esp_rtos::start()` → `console::init_logger()` → spawn `console_task` → CLI / UART1 owner / storage → WiFi/HTTP (`HTTP_READY`) → then BLE.
+- `servo`, `rtu_relay`, and `rs485` are exclusive (same UART1). The owner task stops the current role and re-inits; never spawn two UART1 roles at once.
 
 ### 7.4 Firmware Modbus (GDMA, timing, debug)
 
@@ -434,15 +452,15 @@ Firmware (`ossm-esp32`) unless a subsection says otherwise. `ossm-core` has no I
 - **Inter-frame quiet ($t_{3.5}$):** default `350 µs` at `115200` (`get_default_inter_frame_delay`). Subtract `hardware_silence_us` (~174 µs of `timeout_symbols`) from the wait so the bus is not silenced twice. End-to-end RTU cycle **< 3 ms** for **> 330 Hz** `ups`.
 - **`modbus_debug`:** keep DMA at **`dma_buffers!(256, 256)`** and `pkt_thres` at expected frame length. Do **not** raise `pkt_thres` to capture capacity (false `empty` after cancel). Debug only: 5 ms software RX deadline, CRC-resync (`exact` / `long` / `long_resync` / `leading_junk` / `parse_fail` in `ossm-core` `find_modbus_response`), `MODBUS_DBG` logs (`skip`/`trim`; throttle `exact` when inject off). Raises USB log volume; `ups` modestly lower; leave off in production.
 - RAM inject (firmware `modbus_rtu.rs`, not the bus): `set inject` or **`POST /modbus-inject`** `{"mode":"leading|trailing|both|off","nbytes":N}`. Host: `scripts/test_modbus_resync.py`. Live C6: `scripts/test_modbus_debug_device.py`. Console fairness: `scripts/test_console.py`.
-- `ossm-std` cannot use t1.5/t3.5 on PC USB-serial; its RX is `modbus_rx.rs` (accumulate + CRC). Same `aim30` literals as firmware.
+- `ossm-std` cannot use t1.5/t3.5 on PC USB-serial; its RX is `modbus_rx.rs` (unbounded stream, emit on header+CRC). Same `aim30` literals as firmware.
 
 ### 7.5 HTTP and WebSocket
 
 - `edge-http`: 4 signal-gated acceptors, socket queue, up to 3 concurrent WebSocket sessions. Embassy net **`StackResources<20>`** (DHCP + HTTP + Modbus TCP `:502` + concurrent TCP).
 - **`REST_GATE` serializes mutating POSTs only.** GETs, `/state`, and `/restart` must not hold the gate for the whole request (starves acceptors; port 80 looks dead under burst).
 - JSON REST: `"Connection": "close"`. Gzip HTML `/` does not need it. WebSocket: `FrameType::Text(false)` (final text). End WS sessions with **`drop(socket)`**, not `close(Both).await` (smoltcp Load-fault after peer/WiFi teardown). REST may still `finish_connection` → `close(Both)`.
-- Prefer **`GET/POST /modbus-inject`** over serial `set inject` when `MODBUS_DBG` floods USB. `rtu_relay` also serves `/ws/modbus` and Modbus TCP `:502`.
-- `ossm-std` HTTP is axum: `/config` `/state` `/paused` `/restart` `/ws/command` only (no pin/net/inject). `restart` exits the process.
+- Prefer **`GET/POST /modbus-inject`** over serial `set inject` when `MODBUS_DBG` floods USB. `rtu_relay` serves `/ws/modbus` and Modbus TCP `:502`. `rs485` serves `/ws/rs485` (binary `u8 type | u16le len | payload`: 0 TX, 1 RX, 2 CFG). Wrong-mode WS paths return 404.
+- `ossm-std` HTTP is axum: `--mode servo` → `/config` `/state` `/paused` `/restart` `/ws/command`; `--mode rtu-relay` → `/ws/modbus` + Modbus TCP `--modbus-bind`. `restart` exits the process.
 
 ### 7.6 BLE (`trouble-host`)
 
@@ -493,14 +511,14 @@ When adding a command or configuration property, update the crate that owns it, 
 - **Firmware BLE:** `ble_api.rs`.
 - **Firmware async RPC adapter:** `crates/ossm-esp32/src/rpc.rs` (enqueue; still handles get/set-network-config on storage).
 - **Firmware CLI:** `command.rs` + `hw_paths.rs` (pin/net/inject). Motor paths stay in `ossm_core::paths`.
-- **Desktop shell:** `ossm-std` `http.rs` / `cli.rs` / `engine_task.rs` (motor + motion RPC only).
+- **Desktop shell:** `ossm-std` `http.rs` / `cli.rs` / `engine_task.rs` / `bus.rs` / `relay_server.rs` (motor + motion RPC, or `--mode rtu-relay`).
 - **Frontend:** `types.ts`, `api.ts`, `mapper.ts`, `macro.ts`, `connectionStateMachine.ts`.
 - **57AIM30 PC tool:** `motor-control/src/lib/registers.ts`, `send-options.ts`, panels; rebuild `release/motor-control.html`.
-- **Scripts:** `ossm.py`, `test_websocket.py`, `test_frontend.py`, `test_ble.py`, `test_modbus_debug_device.py`, `test_console.py`, `setup_device.py`.
+- **Scripts:** `ossm.py`, `test_websocket.py`, `test_frontend.py`, `test_ble.py`, `test_modbus_debug_device.py`, `test_console.py`, `test_rs485_transceiver.py`, `setup_device.py`.
 - **Docs:** `README.md`, `README.zh.md`.
 
 ### 7.11 Frontend embed and wiring diagrams
 
 - After `frontend/` changes, **`npm run build`** (or `./scripts/release.sh`) before compiling/flashing firmware — otherwise ROM still has the old `index.html.gz`.
 - `motor-control/` is **not** embedded; rebuild and copy to `release/motor-control.html`.
-- **Never** hand-author SVG wiring diagrams. Design HTML/CSS in `assets/wiring_diagram.html` and `wiring_diagram_zh.html` (bright theme, CSS Grid, JS midpoint routing). Export SVG with headless Chromium (Playwright + `html-to-image`).
+- **Never** hand-author SVG wiring diagrams. Design HTML/CSS in `assets/wiring_diagram.html` / `wiring_diagram_zh.html` (Path B ESP32) and `wiring_diagram_std.html` / `wiring_diagram_std_zh.html` (Path A USB-RS485). Bright theme, CSS Grid, JS midpoint routing. Export with `scripts/export_wiring_svg.py` (Playwright + `html-to-image`).

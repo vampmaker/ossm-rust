@@ -134,8 +134,13 @@ impl StorageHandle {
     pub fn set_pin(&self, config: PinConfiguration) {
         let mut config = config;
         config.normalize_operating_mode();
+        let old = self.caches.lock(|c| c.borrow().pin.clone());
+        let restart = old.uart_needs_restart(&config);
         self.caches.lock(|c| c.borrow_mut().pin = config.clone());
         let _ = self.cmd.try_send(StoragePersist::Pin(config));
+        if restart {
+            crate::uart_owner::request_restart();
+        }
     }
 
     pub fn set_net(&self, config: NetworkConfiguration) {

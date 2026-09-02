@@ -196,6 +196,7 @@ class PinConfiguration(BaseModel):
     ble_enabled: bool = True
     modbus_debug: bool = False
     operating_mode: str = "servo"
+    modbus_baud: int = 115200
 
 
 class NetworkConfiguration(BaseModel):
@@ -666,6 +667,7 @@ class DeviceBackend:
                 "modbus_rx_timeout_us": "pin.modbus_rx_timeout_us",
                 "modbus_scan_delay_us": "pin.modbus_scan_delay_us",
                 "modbus_inter_frame_delay_us": "pin.modbus_inter_frame_delay_us",
+                "modbus_baud": "pin.modbus_baud",
             }
             for field, path in pin_keys.items():
                 if field in pin_dict:
@@ -1156,7 +1158,7 @@ def pins(
     operating_mode: Optional[str] = typer.Option(
         None,
         "--operating-mode",
-        help="Device operating mode: servo or rtu_relay (restart required)",
+        help="Device operating mode: servo, rtu_relay, or rs485 (live switch)",
     ),
     mode: Optional[str] = typer.Option(
         None, "--mode", "-m", help="Override mode: wifi, ble, or serial"
@@ -1181,9 +1183,9 @@ def pins(
     if modbus_debug is not None:
         changes["modbus_debug"] = modbus_debug
     if operating_mode is not None:
-        if operating_mode not in ("servo", "rtu_relay"):
+        if operating_mode not in ("servo", "rtu_relay", "rs485"):
             console.print(
-                "[bold red]operating_mode must be 'servo' or 'rtu_relay'[/bold red]"
+                "[bold red]operating_mode must be 'servo', 'rtu_relay', or 'rs485'[/bold red]"
             )
             raise typer.Exit(1)
         changes["operating_mode"] = operating_mode
@@ -1193,7 +1195,7 @@ def pins(
             pin_cfg.update(changes)
             pin_cfg = asyncio.run(backend.set_pin_config(pin_cfg))
         console.print(
-            "[bold green]✓ Pin Configuration Updated (Reboot required to apply hardware changes):[/bold green]"
+            "[bold green]✓ Pin Configuration Updated (UART pins and operating_mode apply live; modbus_debug still needs reboot):[/bold green]"
         )
 
     console.print_json(data=pin_cfg)

@@ -19,6 +19,7 @@ const emit = defineEmits<{
   (e: 'save'): void
   (e: 'reset'): void
   (e: 'restart'): void
+  (e: 'apply-operating-mode', mode: PinConfiguration['operating_mode']): void
 }>()
 
 const { t } = useI18n()
@@ -28,6 +29,12 @@ function updatePinField<K extends keyof PinConfiguration>(
   value: PinConfiguration[K],
 ) {
   emit('update:pinConfig', { ...props.pinConfig, [key]: value })
+}
+
+function onOperatingModeChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value as PinConfiguration['operating_mode']
+  emit('update:pinConfig', { ...props.pinConfig, operating_mode: value })
+  emit('apply-operating-mode', value)
 }
 
 function updateNetField<K extends keyof NetworkConfiguration>(
@@ -89,13 +96,15 @@ const averageUpdateRate = computed(() => {
       <div class="rounded-lg border border-gray-200 bg-white p-4 space-y-2">
         <label class="block text-sm font-semibold text-gray-700">{{ t('settings.operatingMode') }}</label>
         <select
+          id="pin-operating-mode"
           class="w-full border border-gray-300 rounded px-3 py-2 text-sm"
           :value="pinConfig.operating_mode ?? 'servo'"
           :disabled="!connected"
-          @change="updatePinField('operating_mode', ($event.target as HTMLSelectElement).value as PinConfiguration['operating_mode'])"
+          @change="onOperatingModeChange"
         >
           <option value="servo">{{ t('settings.modeServo') }}</option>
           <option value="rtu_relay">{{ t('settings.modeRtuRelay') }}</option>
+          <option value="rs485">{{ t('settings.modeRs485') }}</option>
         </select>
         <p class="text-xs text-gray-500">
           {{ t('settings.modeHint') }}
@@ -105,7 +114,7 @@ const averageUpdateRate = computed(() => {
       <!-- Motor Telemetry Card -->
       <div class="rounded-lg border border-gray-200 bg-gray-50 p-4">
         <div
-          v-if="(pinConfig.operating_mode ?? 'servo') === 'rtu_relay'"
+          v-if="(pinConfig.operating_mode ?? 'servo') !== 'servo'"
           class="text-sm text-gray-600"
         >
           {{ t('settings.relayTelemetryUnavailable') }}

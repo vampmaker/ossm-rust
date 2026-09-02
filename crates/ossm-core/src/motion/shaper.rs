@@ -145,9 +145,26 @@ impl PositionGenerator {
     }
 
     pub fn generate(&self, y: f32, speed_y: f32) -> (f32, f32) {
+        let y = y.clamp(0.0, 1.0);
         let pos_range = self.pos_max - self.pos_min;
         let position = y * pos_range + self.pos_min;
         let speed = speed_y * pos_range;
         (position, speed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PositionGenerator;
+
+    #[test]
+    fn generate_clamps_y_to_homed_bounds() {
+        let gen = PositionGenerator::new(10.0, 20.0);
+        let (lo, _) = gen.generate(-1.0, 0.0);
+        let (hi, _) = gen.generate(2.0, 0.0);
+        assert!((lo - 10.0).abs() < 1e-5, "lo={lo}");
+        assert!((hi - 20.0).abs() < 1e-5, "hi={hi}");
+        let (mid, _) = gen.generate(0.5, 0.0);
+        assert!((mid - 15.0).abs() < 1e-5, "mid={mid}");
     }
 }

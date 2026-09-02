@@ -10,8 +10,16 @@ use crate::motion::MotorControllerConfig;
 
 pub const OPERATING_MODE_SERVO: &str = "servo";
 pub const OPERATING_MODE_RTU_RELAY: &str = "rtu_relay";
+pub const OPERATING_MODE_RS485: &str = "rs485";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatingMode {
+    Servo,
+    RtuRelay,
+    Rs485,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PinConfiguration {
     pub modbus_tx: u32,
     pub modbus_rx: u32,
@@ -24,6 +32,8 @@ pub struct PinConfiguration {
     pub modbus_scan_delay_us: u32,
     #[serde(default)]
     pub modbus_inter_frame_delay_us: u32,
+    #[serde(default = "default_modbus_baud")]
+    pub modbus_baud: u32,
     #[serde(default = "default_ble_enabled")]
     pub ble_enabled: bool,
     /// Diagnostic Modbus RX mode (5 ms deadline + MODBUS_DBG class/base64; 256 B DMA). Requires reboot.
@@ -41,18 +51,62 @@ fn default_operating_mode() -> String {
     String::from(OPERATING_MODE_SERVO)
 }
 
+fn default_modbus_baud() -> u32 {
+    115_200
+}
+
+pub fn parse_operating_mode(value: &str) -> Option<OperatingMode> {
+    if value.eq_ignore_ascii_case(OPERATING_MODE_SERVO) {
+        Some(OperatingMode::Servo)
+    } else if value.eq_ignore_ascii_case(OPERATING_MODE_RTU_RELAY)
+        || value.eq_ignore_ascii_case("rtu-relay")
+    {
+        Some(OperatingMode::RtuRelay)
+    } else if value.eq_ignore_ascii_case(OPERATING_MODE_RS485) {
+        Some(OperatingMode::Rs485)
+    } else {
+        None
+    }
+}
+
 impl PinConfiguration {
+    pub fn mode(&self) -> OperatingMode {
+        parse_operating_mode(&self.operating_mode).unwrap_or(OperatingMode::Servo)
+    }
+
+    pub fn is_servo(&self) -> bool {
+        self.mode() == OperatingMode::Servo
+    }
+
     pub fn is_rtu_relay(&self) -> bool {
-        self.operating_mode
-            .eq_ignore_ascii_case(OPERATING_MODE_RTU_RELAY)
+        self.mode() == OperatingMode::RtuRelay
+    }
+
+    pub fn is_rs485(&self) -> bool {
+        self.mode() == OperatingMode::Rs485
     }
 
     pub fn normalize_operating_mode(&mut self) {
-        if self.is_rtu_relay() {
-            self.operating_mode = String::from(OPERATING_MODE_RTU_RELAY);
-        } else {
-            self.operating_mode = String::from(OPERATING_MODE_SERVO);
+        self.operating_mode = String::from(match self.mode() {
+            OperatingMode::Servo => OPERATING_MODE_SERVO,
+            OperatingMode::RtuRelay => OPERATING_MODE_RTU_RELAY,
+            OperatingMode::Rs485 => OPERATING_MODE_RS485,
+        });
+        if self.modbus_baud == 0 {
+            self.modbus_baud = default_modbus_baud();
         }
+    }
+
+    pub fn uart_needs_restart(&self, other: &Self) -> bool {
+        self.mode() != other.mode()
+            || self.modbus_tx != other.modbus_tx
+            || self.modbus_rx != other.modbus_rx
+            || self.modbus_de_re != other.modbus_de_re
+            || self.modbus_timeout_ms != other.modbus_timeout_ms
+            || self.modbus_rx_timeout_us != other.modbus_rx_timeout_us
+            || self.modbus_scan_delay_us != other.modbus_scan_delay_us
+            || self.modbus_inter_frame_delay_us != other.modbus_inter_frame_delay_us
+            || self.modbus_baud != other.modbus_baud
     }
 }
 
@@ -68,6 +122,7 @@ impl Default for PinConfiguration {
             modbus_inter_frame_delay_us: 0,
             ble_enabled: true,
             modbus_debug: false,
+            modbus_baud: default_modbus_baud(),
             operating_mode: default_operating_mode(),
         }
     }

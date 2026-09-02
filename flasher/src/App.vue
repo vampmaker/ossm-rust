@@ -38,6 +38,7 @@ const modbusScanDelayUs = ref(0)
 const wifiEnabled = ref(true)
 const bleEnabled = ref(true)
 const modbusDebug = ref(false)
+const operatingMode = ref<'servo' | 'rtu_relay' | 'rs485'>('servo')
 
 const DEVICE_CONFIG_STORAGE_KEY = 'ossm-flasher-device-config-v1'
 const DEFAULT_DEVICE_CONFIG = {
@@ -53,6 +54,7 @@ const DEFAULT_DEVICE_CONFIG = {
   modbusScanDelayUs: 0,
   bleEnabled: true,
   modbusDebug: false,
+  operatingMode: 'servo' as 'servo' | 'rtu_relay' | 'rs485',
   flashAddress: '0x0',
 } as const
 
@@ -69,6 +71,7 @@ function applyDeviceConfig(config: Partial<typeof DEFAULT_DEVICE_CONFIG>) {
   modbusScanDelayUs.value = config.modbusScanDelayUs ?? DEFAULT_DEVICE_CONFIG.modbusScanDelayUs
   bleEnabled.value = config.bleEnabled ?? DEFAULT_DEVICE_CONFIG.bleEnabled
   modbusDebug.value = config.modbusDebug ?? DEFAULT_DEVICE_CONFIG.modbusDebug
+  operatingMode.value = config.operatingMode ?? DEFAULT_DEVICE_CONFIG.operatingMode
   flashAddress.value = config.flashAddress ?? DEFAULT_DEVICE_CONFIG.flashAddress
 }
 
@@ -100,6 +103,7 @@ function persistDeviceConfig() {
       modbusScanDelayUs: modbusScanDelayUs.value,
       bleEnabled: bleEnabled.value,
       modbusDebug: modbusDebug.value,
+      operatingMode: operatingMode.value,
       flashAddress: flashAddress.value,
     }
     localStorage.setItem(DEVICE_CONFIG_STORAGE_KEY, JSON.stringify(payload))
@@ -245,7 +249,7 @@ onMounted(() => {
 })
 
 watch(
-  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusRxTimeoutUs, modbusInterFrameDelayUs, modbusScanDelayUs, bleEnabled, modbusDebug, flashAddress],
+  [wifiSsid, wifiPassword, pinModbusTx, pinModbusRx, pinModbusDeRe, modbusTimeoutMs, modbusRxTimeoutUs, modbusInterFrameDelayUs, modbusScanDelayUs, bleEnabled, modbusDebug, operatingMode, flashAddress],
   () => {
     persistDeviceConfig()
   },
@@ -782,6 +786,10 @@ async function sendConfig() {
       cmd: `set pin.modbus_debug ${modbusDebug.value}`,
       ack: ['pin.modbus_debug set to'],
     })
+    commands.push({
+      cmd: `set pin.operating_mode ${operatingMode.value}`,
+      ack: ['pin.operating_mode set to'],
+    })
 
     const encoder = new TextEncoder()
     for (const item of commands) {
@@ -1079,6 +1087,20 @@ function switchLocale(next: AppLocale) {
                 />
               </div>
             </div>
+          </fieldset>
+
+          <!-- Operating mode -->
+          <fieldset class="space-y-2">
+            <legend class="text-sm font-medium text-gray-700">{{ t('config.operatingMode.legend') }}</legend>
+            <select
+              v-model="operatingMode"
+              class="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
+            >
+              <option value="servo">{{ t('config.operatingMode.servo') }}</option>
+              <option value="rtu_relay">{{ t('config.operatingMode.rtuRelay') }}</option>
+              <option value="rs485">{{ t('config.operatingMode.rs485') }}</option>
+            </select>
+            <p class="text-xs text-gray-500">{{ t('config.operatingMode.hint') }}</p>
           </fieldset>
 
           <!-- GPIO Pins -->

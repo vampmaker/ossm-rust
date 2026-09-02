@@ -58,6 +58,13 @@
       "modbusRx": "Modbus RX",
       "modbusDeRe": "Modbus DE/RE"
     },
+    "operatingMode": {
+      "legend": "工作模式",
+      "servo": "伺服（OSSM 运动）",
+      "rtuRelay": "RTU 中继（TCP :502 + /ws/modbus）",
+      "rs485": "RS-485 收发（USB + /ws/rs485）",
+      "hint": "发送配置后立即生效，模式切换无需额外重启。RS-485 收发激活时 USB 无 CLI。"
+    },
     "modbus": {
       "legend": "电机 / Modbus",
       "baudRate": "波特率",

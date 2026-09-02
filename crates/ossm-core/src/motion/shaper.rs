@@ -1,171 +1,132 @@
 use super::source::TRANSITION_THRESHOLD;
 
 // ===== Layer 2: Shaper =====
-// Transforms y ∈ [0, 1] → y ∈ [0, 1] with depth, direction, and reversal
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum DepthDirection {
-    Top,    // [0, depth]
-    Bottom, // [1-depth, 1]
-}
+// Transforms y ∈ [0, 1] → y ∈ [0, 1] with depth, top/bottom anchor, and reversal.
+//
+// Invariant: `reversed` is an involution of the waveform map that preserves the
+// current shaped position (controller rematches `y := 1-y` and snaps reverse).
+// `depth` and `anchor` lerp so a window re-anchor never teleports.
 
 #[derive(Clone)]
 pub struct Shaper {
-    target_depth: f32,  // Target depth
-    current_depth: f32, // Current depth (transitions smoothly to target)
-    direction: DepthDirection,
-    target_reversed: bool,
-    current_reversal: f32, // 0.0 = normal, 1.0 = reversed (transitions smoothly)
-
-    // Transition state
-    pub(crate) transitioning: bool,
+    target_depth: f32,
+    current_depth: f32,
+    /// 0 = bottom window [1-d, 1], 1 = top window [0, d]
+    target_anchor: f32,
+    current_anchor: f32,
+    reversed: bool,
+    transitioning: bool,
 }
 
-const TRANSITION_SPEED: f32 = 0.1; // Depth units per second
-const REVERSAL_SPEED: f32 = 0.5; // Reversal units per second (faster)
+pub(crate) const TRANSITION_SPEED: f32 = 0.1; // Depth / anchor units per second
+
+fn approach(current: f32, target: f32, step: f32) -> f32 {
+    let diff = target - current;
+    if diff.abs() <= step || diff.abs() < TRANSITION_THRESHOLD {
+        target
+    } else if diff > 0.0 {
+        current + step
+    } else {
+        current - step
+    }
+}
+
+fn anchor_from_top(depth_top: bool) -> f32 {
+    if depth_top {
+        1.0
+    } else {
+        0.0
+    }
+}
 
 impl Shaper {
-    pub fn new(depth: f32, direction: DepthDirection, reversed: bool) -> Self {
+    pub fn new(depth: f32, depth_top: bool, reversed: bool) -> Self {
+        let anchor = anchor_from_top(depth_top);
         Self {
             target_depth: depth,
             current_depth: depth,
-            direction,
-            target_reversed: reversed,
-            current_reversal: if reversed { 1.0 } else { 0.0 },
-            transitioning: true,
+            target_anchor: anchor,
+            current_anchor: anchor,
+            reversed,
+            transitioning: false,
         }
     }
 
-    pub fn set_params(
-        &mut self,
-        new_depth: f32,
-        new_direction: DepthDirection,
-        new_reversed: bool,
-    ) {
-        // Check if depth or reversal changed significantly
+    pub fn set_params(&mut self, new_depth: f32, depth_top: bool, new_reversed: bool) {
+        let new_anchor = anchor_from_top(depth_top);
         let depth_changed = (self.target_depth - new_depth).abs() > TRANSITION_THRESHOLD;
-        let reversal_changed = self.target_reversed != new_reversed;
+        let anchor_changed = (self.target_anchor - new_anchor).abs() > TRANSITION_THRESHOLD;
 
-        if depth_changed || reversal_changed {
+        if depth_changed || anchor_changed {
             self.transitioning = true;
         }
 
-        // Update target parameters
         self.target_depth = new_depth;
-        self.direction = new_direction;
-        self.target_reversed = new_reversed;
+        self.target_anchor = new_anchor;
+        // Reverse snaps; controller rematches waveform y so shaped_y is unchanged.
+        self.reversed = new_reversed;
+    }
+
+    /// Inclusive window of shaped_y for the current depth/anchor.
+    pub fn window(&self) -> (f32, f32) {
+        let lo = (1.0 - self.current_depth) * (1.0 - self.current_anchor);
+        (lo, lo + self.current_depth)
+    }
+
+    pub fn slew_toward(current: f32, target: f32, dt: f32) -> f32 {
+        approach(current, target, TRANSITION_SPEED * dt)
+    }
+
+    fn apply_map(&self, y_in: f32, speed_in: f32) -> (f32, f32) {
+        let y = if self.reversed { 1.0 - y_in } else { y_in };
+        let speed = if self.reversed { -speed_in } else { speed_in };
+        let offset = (1.0 - self.current_depth) * (1.0 - self.current_anchor);
+        let shaped_y = y * self.current_depth + offset;
+        let shaped_speed = speed * self.current_depth;
+        (shaped_y, shaped_speed)
     }
 
     pub fn shape(&mut self, y_in: f32, speed_in: f32, dt: f32) -> (f32, f32) {
-        // Update transitions if needed
         if self.transitioning {
-            let mut depth_done = false;
-            let mut reversal_done = false;
-
-            // Update depth
-            let depth_diff = self.target_depth - self.current_depth;
-            if depth_diff.abs() < TRANSITION_THRESHOLD {
+            self.current_depth =
+                approach(self.current_depth, self.target_depth, TRANSITION_SPEED * dt);
+            self.current_anchor = approach(
+                self.current_anchor,
+                self.target_anchor,
+                TRANSITION_SPEED * dt,
+            );
+            let depth_done = (self.current_depth - self.target_depth).abs() < TRANSITION_THRESHOLD;
+            let anchor_done =
+                (self.current_anchor - self.target_anchor).abs() < TRANSITION_THRESHOLD;
+            if depth_done && anchor_done {
                 self.current_depth = self.target_depth;
-                depth_done = true;
-            } else {
-                let step = TRANSITION_SPEED * dt;
-                if depth_diff > 0.0 {
-                    self.current_depth = (self.current_depth + step).min(self.target_depth);
-                } else {
-                    self.current_depth = (self.current_depth - step).max(self.target_depth);
-                }
-            }
-
-            // Update reversal
-            let target_reversal = if self.target_reversed { 1.0 } else { 0.0 };
-            let reversal_diff = target_reversal - self.current_reversal;
-            if reversal_diff.abs() < TRANSITION_THRESHOLD {
-                self.current_reversal = target_reversal;
-                reversal_done = true;
-            } else {
-                let step = REVERSAL_SPEED * dt;
-                if reversal_diff > 0.0 {
-                    self.current_reversal = (self.current_reversal + step).min(target_reversal);
-                } else {
-                    self.current_reversal = (self.current_reversal - step).max(target_reversal);
-                }
-            }
-
-            // Clear transitioning flag when both are done
-            if depth_done && reversal_done {
+                self.current_anchor = self.target_anchor;
                 self.transitioning = false;
             }
         }
 
-        // Apply smooth reversal: lerp between y_in and (1 - y_in)
-        let r = self.current_reversal;
-        let y = y_in * (1.0 - r) + (1.0 - y_in) * r;
-        // Simplified: y = y_in * (1 - 2r) + r
-
-        // Chain rule for speed: dy/dt = (∂y/∂y_in) * (dy_in/dt)
-        // ∂y/∂y_in = 1 - 2r
-        let speed = speed_in * (1.0 - 2.0 * r);
-
-        // Then apply depth and direction
-        match self.direction {
-            DepthDirection::Top => {
-                // Map [0, 1] → [0, current_depth]
-                let shaped_y = y * self.current_depth;
-                let shaped_speed = speed * self.current_depth;
-                (shaped_y, shaped_speed)
-            }
-            DepthDirection::Bottom => {
-                // Map [0, 1] → [1-current_depth, 1]
-                let shaped_y = y * self.current_depth + (1.0 - self.current_depth);
-                let shaped_speed = speed * self.current_depth;
-                (shaped_y, shaped_speed)
-            }
-        }
+        self.apply_map(y_in, speed_in)
     }
 
-    // Reverse the shaping transformation to get unshaped y from shaped y
-    // Returns None if currently transitioning or if reversal makes inversion ambiguous
+    /// Inverse of [`Self::apply_map`]. `None` if depth is ~0 or `y_shaped` is
+    /// outside the current window (before clamp).
     pub fn unshape(&self, y_shaped: f32) -> Option<f32> {
-        // Can't reliably unshape during transitions
-        if self.transitioning {
+        if self.current_depth < TRANSITION_THRESHOLD {
             return None;
         }
-
-        // First, reverse depth and direction transformation
-        let y_after_reversal = match self.direction {
-            DepthDirection::Top => {
-                // shaped = y * current_depth
-                // y = shaped / current_depth
-                if self.current_depth < TRANSITION_THRESHOLD {
-                    return None; // Can't divide by near-zero depth
-                }
-                y_shaped / self.current_depth
-            }
-            DepthDirection::Bottom => {
-                // shaped = y * current_depth + (1 - current_depth)
-                // y = (shaped - (1 - current_depth)) / current_depth
-                if self.current_depth < TRANSITION_THRESHOLD {
-                    return None; // Can't divide by near-zero depth
-                }
-                (y_shaped - (1.0 - self.current_depth)) / self.current_depth
-            }
-        };
-
-        // Then, reverse the reversal transformation
-        // Forward: y = y_in * (1 - r) + (1 - y_in) * r
-        // Simplify: y = y_in * (1 - 2r) + r
-        // Solve for y_in: y_in = (y - r) / (1 - 2r)
-        let r = self.current_reversal;
-        let denominator = 1.0 - 2.0 * r;
-
-        // When r ≈ 0.5, the transformation loses information (everything maps to 0.5)
-        if denominator.abs() < TRANSITION_THRESHOLD {
+        let (lo, hi) = self.window();
+        if y_shaped < lo - TRANSITION_THRESHOLD || y_shaped > hi + TRANSITION_THRESHOLD {
             return None;
         }
-
-        let y_in = (y_after_reversal - r) / denominator;
-
-        // Clamp to valid range
+        let y_rev = (y_shaped - lo) / self.current_depth;
+        if !(0.0..=1.0).contains(&y_rev) {
+            let clamped = y_rev.clamp(0.0, 1.0);
+            if (clamped - y_rev).abs() > TRANSITION_THRESHOLD {
+                return None;
+            }
+        }
+        let y_rev = y_rev.clamp(0.0, 1.0);
+        let y_in = if self.reversed { 1.0 - y_rev } else { y_rev };
         Some(y_in.clamp(0.0, 1.0))
     }
 }

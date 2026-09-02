@@ -67,6 +67,12 @@ impl PausedMotionSource {
             target_y,
         }
     }
+
+    /// Keep the same physical pose after a reverse rematch (`y := 1-y`).
+    pub(crate) fn invert_y(&mut self) {
+        self.current_y = 1.0 - self.current_y;
+        self.target_y = 1.0 - self.target_y;
+    }
 }
 
 impl MotionSource for PausedMotionSource {

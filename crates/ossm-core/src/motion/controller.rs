@@ -4,7 +4,7 @@ use crate::config::MotorControllerConfig;
 use crate::state::{LoopStats, ModbusStats, MotionCommand, StateResponse};
 use crate::time::{dt_seconds, Micros};
 
-use super::shaper::{DepthDirection, PositionGenerator, Shaper};
+use super::shaper::{PositionGenerator, Shaper};
 use super::source::{
     MotionSource, PausedMotionSource, StreamingMotionSource, WaveformMotionSource,
 };
@@ -43,6 +43,9 @@ pub struct MotorController {
     position_history: Vec<f32>,
     snapshot: StateResponse,
     snapshot_config_version: u32,
+    /// When homed pose is outside the depth window, command this shaped_y
+    /// (slewed toward the window) instead of `follow(0.5)`.
+    held_shaped: Option<f32>,
 }
 
 impl MotorController {
@@ -60,13 +63,7 @@ impl MotorController {
             MotionMode::Waveform
         };
 
-        let direction = if config.depth_top {
-            DepthDirection::Top
-        } else {
-            DepthDirection::Bottom
-        };
-
-        let shaper = Shaper::new(config.depth, direction, config.reversed);
+        let shaper = Shaper::new(config.depth, config.depth_top, config.reversed);
         let position_gen = PositionGenerator::new(0.0, 0.0);
         let default_config = config.clone();
         Self {
@@ -98,6 +95,7 @@ impl MotorController {
                 ..StateResponse::default()
             },
             snapshot_config_version: 0,
+            held_shaped: None,
         }
     }
 
@@ -164,7 +162,11 @@ impl MotorController {
     pub fn sync_to_position(&mut self, pos_min: f32, pos_max: f32, position: f32) {
         self.position_gen = PositionGenerator::new(pos_min, pos_max);
 
-        let pos_normalized = (position - pos_min) / (pos_max - pos_min);
+        let pos_normalized = if (pos_max - pos_min).abs() < f32::EPSILON {
+            0.5
+        } else {
+            ((position - pos_min) / (pos_max - pos_min)).clamp(0.0, 1.0)
+        };
         let now = self.last_now;
 
         match self.shaper.unshape(pos_normalized) {
@@ -173,12 +175,11 @@ impl MotorController {
                 self.active_source_mut().follow(waveform_y, 0.0, now);
                 self.last_y = waveform_y;
                 self.last_speed = 0.0;
+                self.held_shaped = None;
             }
             None => {
-                log::info!("Current position is outside depth range, starting transition");
-                self.shaper.transitioning = true;
-                self.active_source_mut().follow(0.5, 0.0, now);
-                self.last_y = 0.5;
+                log::info!("Current position is outside depth range, holding pose");
+                self.held_shaped = Some(pos_normalized);
                 self.last_speed = 0.0;
             }
         }
@@ -199,20 +200,28 @@ impl MotorController {
         self.config = config;
     }
 
-    pub fn set_config(&mut self, config: MotorControllerConfig) {
+    pub fn set_config(&mut self, mut config: MotorControllerConfig) {
         let wave_changed = self.config.wave_func != config.wave_func
             || self.config.spline_points != config.spline_points;
         let sharpness_changed = (self.config.sharpness - config.sharpness).abs() > 0.001;
         let bpm_changed = (self.config.bpm - config.bpm).abs() > 0.001;
         let spline_changed = self.config.spline_points != config.spline_points;
+        let reverse_changed = self.config.reversed != config.reversed;
 
-        let direction = if config.depth_top {
-            DepthDirection::Top
-        } else {
-            DepthDirection::Bottom
-        };
+        let now = self.last_now;
+        if reverse_changed {
+            self.last_y = 1.0 - self.last_y;
+            self.last_speed = -self.last_speed;
+            config.paused_position = 1.0 - config.paused_position;
+            self.paused_source.invert_y();
+            self.waveform_source
+                .follow(self.last_y, self.last_speed, now);
+            self.streaming_source
+                .follow(self.last_y, self.last_speed, now);
+        }
+
         self.shaper
-            .set_params(config.depth, direction, config.reversed);
+            .set_params(config.depth, config.depth_top, config.reversed);
 
         let target_mode = if config.paused {
             MotionMode::Paused
@@ -221,8 +230,6 @@ impl MotorController {
         } else {
             MotionMode::Waveform
         };
-
-        let now = self.last_now;
 
         if target_mode == MotionMode::Paused
             && (self.active_mode != MotionMode::Paused
@@ -304,10 +311,36 @@ impl MotorController {
         let dt_clamped = dt.min(0.012);
 
         let (y_wave, speed_wave) = self.active_source_mut().update(dt_clamped, now);
-        self.last_y = y_wave;
-        self.last_speed = speed_wave;
 
-        let (shaped_y, shaped_speed) = self.shaper.shape(y_wave, speed_wave, dt_clamped);
+        let (shaped_y, shaped_speed, y_out) = if let Some(hold) = self.held_shaped {
+            // Advance depth/anchor lerp without using the source sample for pose.
+            let _ = self.shaper.shape(self.last_y, 0.0, dt_clamped);
+            let (lo, hi) = self.shaper.window();
+            if let Some(waveform_y) = self.shaper.unshape(hold) {
+                self.active_source_mut().follow(waveform_y, 0.0, now);
+                self.last_y = waveform_y;
+                self.last_speed = 0.0;
+                self.held_shaped = None;
+                if self.active_mode == MotionMode::Paused {
+                    self.config.paused_position = waveform_y;
+                    self.paused_source = PausedMotionSource::new(waveform_y, waveform_y);
+                }
+                let (s, sp) = self.shaper.shape(waveform_y, 0.0, 0.0);
+                (s, sp, waveform_y)
+            } else {
+                let target = hold.clamp(lo, hi);
+                let new_hold = Shaper::slew_toward(hold, target, dt_clamped);
+                self.held_shaped = Some(new_hold);
+                self.last_speed = 0.0;
+                (new_hold, 0.0, self.last_y)
+            }
+        } else {
+            self.last_y = y_wave;
+            self.last_speed = speed_wave;
+            let (s, sp) = self.shaper.shape(y_wave, speed_wave, dt_clamped);
+            (s, sp, y_wave)
+        };
+
         let (position, speed) = self.position_gen.generate(shaped_y, shaped_speed);
 
         self.current_window_updates += 1;
@@ -351,7 +384,7 @@ impl MotorController {
             self.last_window_time = now;
         }
 
-        self.refresh_snapshot(position, speed, shaped_y, y_wave);
+        self.refresh_snapshot(position, speed, shaped_y, y_out);
         (position, speed)
     }
 }

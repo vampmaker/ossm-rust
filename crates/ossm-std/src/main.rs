@@ -1,6 +1,8 @@
 mod args;
+mod cli;
 mod engine_task;
 mod http;
+mod modbus_rx;
 mod persist;
 mod serial;
 
@@ -67,6 +69,8 @@ async fn main() {
             .unwrap_or_else(args::default_static_dir),
         restart: Arc::new(|| std::process::exit(0)),
     };
+    let repl_engine = state.engine.clone();
+    let repl_restart = state.restart.clone();
     let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(args.bind_addr())
         .await
@@ -77,7 +81,16 @@ async fn main() {
         args.bind_addr().port(),
         args.bind_addr()
     );
-    axum::serve(listener, app).await.expect("serve");
+    let http = axum::serve(listener, app);
+    if args.want_repl() {
+        tracing::info!("stdin REPL enabled (help, get/set, paths)");
+        tokio::select! {
+            r = http => r.expect("serve"),
+            _ = cli::run(repl_engine, repl_restart) => {}
+        }
+    } else {
+        http.await.expect("serve");
+    }
 }
 
 #[cfg(test)]

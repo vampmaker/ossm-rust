@@ -7,13 +7,9 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ossm_core::modbus::InjectJunkMode;
 use ossm_core::rpc::RpcAction;
-use ossm_core::{
-    CoreError, MotorControllerConfig, NetworkConfiguration, PausedControl, PinConfiguration,
-    StateResponse, WsMessage,
-};
-use serde::{Deserialize, Serialize};
+use ossm_core::{CoreError, MotorControllerConfig, PausedControl, RpcRequest, StateResponse};
+use serde::Serialize;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
@@ -38,10 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/config", get(get_config).post(post_config))
         .route("/state", get(get_state))
         .route("/paused", post(post_paused))
-        .route("/pin-config", get(get_pin).post(post_pin))
-        .route("/network-config", get(get_net).post(post_net))
         .route("/restart", post(post_restart))
-        .route("/modbus-inject", get(get_inject).post(post_inject))
         .route("/ws/command", get(ws_upgrade))
         .fallback_service(ServeDir::new(static_dir))
         .layer(cors)
@@ -91,7 +84,6 @@ async fn post_config(State(state): State<AppState>, body: axum::body::Bytes) -> 
         Err(CoreError::StaleVersion) => {
             json_with_cors(StatusCode::CONFLICT, "Stale causal version")
         }
-        Err(CoreError::RelayMode) => json_with_cors(StatusCode::CONFLICT, "rtu_relay mode"),
         Err(_) => json_with_cors(StatusCode::BAD_REQUEST, "Invalid config"),
     }
 }
@@ -123,59 +115,6 @@ async fn post_paused(State(state): State<AppState>, body: axum::body::Bytes) -> 
     }
 }
 
-async fn get_pin(State(state): State<AppState>) -> Response {
-    let (tx, rx) = oneshot::channel();
-    if state
-        .engine
-        .tx
-        .send(EngineMsg::GetPin { reply: tx })
-        .await
-        .is_err()
-    {
-        return json_with_cors(StatusCode::SERVICE_UNAVAILABLE, "engine gone");
-    }
-    match rx.await {
-        Ok(pin) => json_with_cors(StatusCode::OK, pin),
-        Err(_) => json_with_cors(StatusCode::SERVICE_UNAVAILABLE, "engine gone"),
-    }
-}
-
-async fn post_pin(State(state): State<AppState>, Json(pin): Json<PinConfiguration>) -> Response {
-    if pin.modbus_timeout_ms > 1000
-        || pin.modbus_scan_delay_us > 200_000
-        || pin.modbus_inter_frame_delay_us > 200_000
-    {
-        return json_with_cors(StatusCode::BAD_REQUEST, "Invalid pin config");
-    }
-    let _ = state.engine.tx.send(EngineMsg::SetPin(pin.clone())).await;
-    json_with_cors(StatusCode::OK, pin)
-}
-
-async fn get_net(State(state): State<AppState>) -> Response {
-    let (tx, rx) = oneshot::channel();
-    if state
-        .engine
-        .tx
-        .send(EngineMsg::GetNet { reply: tx })
-        .await
-        .is_err()
-    {
-        return json_with_cors(StatusCode::SERVICE_UNAVAILABLE, "engine gone");
-    }
-    match rx.await {
-        Ok(net) => json_with_cors(StatusCode::OK, net),
-        Err(_) => json_with_cors(StatusCode::SERVICE_UNAVAILABLE, "engine gone"),
-    }
-}
-
-async fn post_net(
-    State(state): State<AppState>,
-    Json(net): Json<NetworkConfiguration>,
-) -> Response {
-    let _ = state.engine.tx.send(EngineMsg::SetNet(net.clone())).await;
-    json_with_cors(StatusCode::OK, net)
-}
-
 async fn post_restart(State(state): State<AppState>) -> Response {
     let restart = state.restart.clone();
     tokio::spawn(async move {
@@ -183,86 +122,6 @@ async fn post_restart(State(state): State<AppState>) -> Response {
         restart();
     });
     json_with_cors(StatusCode::OK, serde_json::json!({"ok": true}))
-}
-
-#[derive(Deserialize)]
-struct InjectBody {
-    mode: String,
-    #[serde(default)]
-    nbytes: u8,
-}
-
-#[derive(Serialize)]
-struct InjectResp {
-    mode: &'static str,
-    nbytes: u8,
-}
-
-async fn pin_debug_enabled(state: &AppState) -> bool {
-    let (tx, rx) = oneshot::channel();
-    if state
-        .engine
-        .tx
-        .send(EngineMsg::GetPin { reply: tx })
-        .await
-        .is_err()
-    {
-        return false;
-    }
-    rx.await.map(|p| p.modbus_debug).unwrap_or(false)
-}
-
-async fn get_inject(State(state): State<AppState>) -> Response {
-    if !pin_debug_enabled(&state).await {
-        return json_with_cors(StatusCode::CONFLICT, "modbus_debug disabled");
-    }
-    let (tx, rx) = oneshot::channel();
-    let _ = state
-        .engine
-        .tx
-        .send(EngineMsg::GetInject { reply: tx })
-        .await;
-    match rx.await {
-        Ok((mode, nbytes)) => json_with_cors(
-            StatusCode::OK,
-            InjectResp {
-                mode: mode.as_str(),
-                nbytes,
-            },
-        ),
-        Err(_) => json_with_cors(StatusCode::SERVICE_UNAVAILABLE, "engine gone"),
-    }
-}
-
-async fn post_inject(State(state): State<AppState>, Json(body): Json<InjectBody>) -> Response {
-    if !pin_debug_enabled(&state).await {
-        return json_with_cors(StatusCode::CONFLICT, "modbus_debug disabled");
-    }
-    let mode = match body.mode.as_str() {
-        "off" => InjectJunkMode::Off,
-        "leading" => InjectJunkMode::Leading,
-        "trailing" => InjectJunkMode::Trailing,
-        "both" => InjectJunkMode::Both,
-        _ => return json_with_cors(StatusCode::BAD_REQUEST, "bad mode"),
-    };
-    if body.nbytes > 64 {
-        return json_with_cors(StatusCode::BAD_REQUEST, "nbytes too large");
-    }
-    let _ = state
-        .engine
-        .tx
-        .send(EngineMsg::SetInject {
-            mode,
-            nbytes: body.nbytes,
-        })
-        .await;
-    json_with_cors(
-        StatusCode::OK,
-        InjectResp {
-            mode: mode.as_str(),
-            nbytes: body.nbytes,
-        },
-    )
 }
 
 async fn try_set(
@@ -303,7 +162,7 @@ async fn run_ws(mut socket: WebSocket, state: AppState) {
                     Message::Close(_) => break,
                     _ => continue,
                 };
-                let parsed = match serde_json::from_slice::<WsMessage>(&data) {
+                let parsed = match serde_json::from_slice::<RpcRequest>(&data) {
                     Ok(p) => p,
                     Err(_) => continue,
                 };

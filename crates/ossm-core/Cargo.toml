@@ -10,7 +10,6 @@ serde = { version = "1.0", default-features = false, features = ["derive", "allo
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 rmodbus = { version = "0.9", default-features = false, features = ["fixedvec"] }
 fixedvec = "0.2"
-portable-atomic = "1.6"
 libm = "0.2"
 log = "0.4"
 serde-json-core = "0.6"

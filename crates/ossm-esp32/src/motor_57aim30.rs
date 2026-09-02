@@ -1,4 +1,3 @@
-use core::f32::consts::PI;
 use core::sync::atomic::Ordering;
 
 use embassy_time::{with_timeout, Duration, Instant, Timer};
@@ -20,6 +19,7 @@ use crate::modbus_rtu::{
 use crate::motion::{CommandConsumer, LoopStats, ModbusStats, TimingWindowStats};
 use crate::motor::Motor;
 use crate::storage::PinConfiguration;
+use ossm_core::modbus::aim30;
 use ossm_core::{Command, Engine, Micros};
 
 pub const TARGET_BAUD_RATE: u32 = 115200;
@@ -701,9 +701,9 @@ impl<'d> Modbus57AIM30Motor<'d> {
     }
 
     async fn write_position_raw(&mut self, position: i32) -> Result<()> {
-        let data = ossm_core::modbus::aim30::pack_position_i32(position);
+        let data = aim30::pack_position_i32(position);
         self.client
-            .write_holding_registers(ossm_core::modbus::aim30::REG_POSITION, &data)
+            .write_holding_registers(aim30::REG_POSITION, &data)
             .await
     }
 
@@ -743,7 +743,12 @@ impl<'d> Modbus57AIM30Motor<'d> {
                 // full address space for modbus device id (0 is for broadcast, 248-255 are reserved)
                 self.client.device_id = device_id;
                 Timer::after_micros(delay_us as u64).await;
-                if self.client.write_holding_register(0x00, 0x01).await.is_ok() {
+                if self
+                    .client
+                    .write_holding_register(aim30::REG_ENABLE, aim30::ENABLE_MODBUS)
+                    .await
+                    .is_ok()
+                {
                     return Ok(ModbusScanResult {
                         baud_rate,
                         device_id,
@@ -767,7 +772,9 @@ impl<'d> Modbus57AIM30Motor<'d> {
             115200 => 803,
             _ => return Err(FirmwareError::Modbus("invalid baud rate")),
         };
-        self.client.write_holding_register(0x00, 1).await?;
+        self.client
+            .write_holding_register(aim30::REG_ENABLE, aim30::ENABLE_MODBUS)
+            .await?;
         self.client
             .write_holding_register(0x03, baud_rate_code)
             .await?;
@@ -777,7 +784,9 @@ impl<'d> Modbus57AIM30Motor<'d> {
     }
 
     pub async fn enable_modbus_communication(&mut self) -> Result<()> {
-        self.client.write_holding_register(0x00, 0x01).await
+        self.client
+            .write_holding_register(aim30::REG_ENABLE, aim30::ENABLE_MODBUS)
+            .await
     }
 }
 
@@ -785,35 +794,39 @@ impl<'d> Motor for Modbus57AIM30Motor<'d> {
     async fn read_position(&mut self) -> Result<f32> {
         let mut rsp = [0u16; 2];
         self.client
-            .read_holding_registers(ossm_core::modbus::aim30::REG_POSITION, 2, &mut rsp)
+            .read_holding_registers(aim30::REG_POSITION, 2, &mut rsp)
             .await?;
-        let position = ossm_core::modbus::aim30::unpack_position_i32(rsp);
-        Ok(ossm_core::modbus::aim30::counts_to_radians(position))
+        let position = aim30::unpack_position_i32(rsp);
+        Ok(aim30::counts_to_radians(position))
     }
 
     async fn write_position(&mut self, position: f32, _speed: f32) -> Result<()> {
-        let position_i32 = ossm_core::modbus::aim30::write_counts_for_radians(position);
+        let position_i32 = aim30::write_counts_for_radians(position);
         self.write_position_raw(position_i32).await
     }
 
     async fn set_max_power(&mut self, power: f32) -> Result<()> {
-        let power_val = (power * 60.0) as u16 * 10;
-        self.client.write_holding_register(0x18, power_val).await
+        self.client
+            .write_holding_register(aim30::REG_POWER, aim30::encode_max_power(power))
+            .await
     }
 
     async fn set_acceleration(&mut self, acceleration: f32) -> Result<()> {
-        let acceleration_val = (acceleration * 60.0 / (2.0 * PI)) as u16;
         self.client
-            .write_holding_register(0x03, acceleration_val)
+            .write_holding_register(aim30::REG_ACCEL, aim30::encode_acceleration(acceleration))
             .await
     }
 
     async fn set_position_ring_ratio(&mut self, ratio: f32) -> Result<()> {
-        self.client.write_holding_register(0x07, ratio as u16).await
+        self.client
+            .write_holding_register(aim30::REG_POS_RING, ratio as u16)
+            .await
     }
 
     async fn set_speed_ring_ratio(&mut self, ratio: f32) -> Result<()> {
-        self.client.write_holding_register(0x05, ratio as u16).await
+        self.client
+            .write_holding_register(aim30::REG_SPEED_RING, ratio as u16)
+            .await
     }
 
     async fn homing(&mut self) -> Result<()> {
@@ -823,8 +836,8 @@ impl<'d> Motor for Modbus57AIM30Motor<'d> {
         );
 
         log::info!("Homing motor");
-        self.set_max_power(0.1).await?;
-        self.set_acceleration(1000.0).await?;
+        self.set_max_power(aim30::POWER_HOMING).await?;
+        self.set_acceleration(aim30::ACCEL_HOMING).await?;
         self.reset_position().await?;
         log::info!("Writing position to -100.0");
         self.write_position(-100.0, 0.0).await?;
@@ -1109,10 +1122,14 @@ pub async fn run_motor(
     engine.reset_cycle_clock(now_us());
     app_context.update_snapshot(engine.snapshot());
 
-    let _ = motor.set_max_power(0.6).await;
-    let _ = motor.set_acceleration(4000.0).await;
-    let _ = motor.set_position_ring_ratio(3000.0).await;
-    let _ = motor.set_speed_ring_ratio(3000.0).await;
+    let _ = motor.set_max_power(aim30::POWER_RUN).await;
+    let _ = motor.set_acceleration(aim30::ACCEL_RUN).await;
+    let _ = motor
+        .set_position_ring_ratio(aim30::RING_RATIO_RUN as f32)
+        .await;
+    let _ = motor
+        .set_speed_ring_ratio(aim30::RING_RATIO_RUN as f32)
+        .await;
 
     let mut last_stats_log = Instant::now();
     let mut last_error_log = Instant::now() - Duration::from_secs(1);

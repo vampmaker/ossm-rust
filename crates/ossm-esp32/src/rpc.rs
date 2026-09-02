@@ -3,7 +3,7 @@ use alloc::string::String;
 use serde::Serialize;
 
 use crate::context::AppContext;
-use crate::http_api::{SubscribeParams, WaypointsInput, WsMessage};
+use crate::http_api::{RpcRequest, SubscribeParams, WaypointsInput};
 use crate::modbus_relay;
 use crate::motion::{MotionCommand, MotorControllerConfig};
 use crate::storage::NetworkConfiguration;
@@ -54,7 +54,7 @@ async fn respond<T: Serialize + ?Sized>(id: &serde_json::Value, result: &T) -> R
     }
 }
 
-pub async fn dispatch_rpc(request: &WsMessage, app_context: AppContext) -> RpcAction {
+pub async fn dispatch_rpc(request: &RpcRequest, app_context: AppContext) -> RpcAction {
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
     let relay = modbus_relay::is_active() || app_context.storage.pin().is_rtu_relay();
 

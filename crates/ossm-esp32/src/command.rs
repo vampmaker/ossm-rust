@@ -14,6 +14,7 @@ use ossm_core::paths::{self, PathError};
 use crate::console;
 use crate::context::AppContext;
 use crate::http_api::WaypointsInput;
+use crate::hw_paths;
 use crate::motion::{MotionCommand, MotorControllerConfig};
 
 static CLI_CHANNEL: Channel<CriticalSectionRawMutex, CliCommand, 4> = Channel::new();
@@ -128,6 +129,9 @@ fn log_get(path: &str, value: &str) {
 
 fn print_paths_catalog() {
     for line in paths::PATHS_CATALOG.split('\n') {
+        console::write_line(line);
+    }
+    for line in hw_paths::HW_PATHS_CATALOG.split('\n') {
         console::write_line(line);
     }
 }
@@ -245,7 +249,7 @@ async fn execute_get(app_context: AppContext, path: &str) {
                 })
                 .await;
             }
-            Some(k) => match paths::pin_field(&app_context.storage.pin(), k) {
+            Some(k) => match hw_paths::pin_field(&app_context.storage.pin(), k) {
                 Ok(v) => log_get(&format!("pin.{}", k), v.as_str()),
                 Err(e) => log_path_err(&format!("pin.{}", k), e),
             },
@@ -258,7 +262,7 @@ async fn execute_get(app_context: AppContext, path: &str) {
                 })
                 .await;
             }
-            Some(k) => match paths::net_field(&app_context.storage.net(), k) {
+            Some(k) => match hw_paths::net_field(&app_context.storage.net(), k) {
                 Ok(v) => log_get(&format!("net.{}", k), v.as_str()),
                 Err(e) => log_path_err(&format!("net.{}", k), e),
             },
@@ -320,7 +324,7 @@ fn set_pin(app_context: AppContext, key: Option<&str>, value: &str) {
     };
     let full_path = format!("pin.{}", key);
     let mut config = app_context.storage.pin();
-    match paths::set_pin(&mut config, key, value) {
+    match hw_paths::set_pin(&mut config, key, value) {
         Ok(()) => {
             app_context.storage.set_pin(config);
             log_set(full_path.as_str(), value);
@@ -336,7 +340,7 @@ fn set_net(app_context: AppContext, key: Option<&str>, value: &str) {
     };
     let full_path = format!("net.{}", key);
     let mut config = app_context.storage.net();
-    match paths::set_net(&mut config, key, value) {
+    match hw_paths::set_net(&mut config, key, value) {
         Ok(()) => {
             match key {
                 "ssid" => app_context.storage.set_ssid(value),

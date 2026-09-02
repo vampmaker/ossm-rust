@@ -6,7 +6,6 @@ pub mod command;
 pub mod config;
 pub mod engine;
 pub mod error;
-pub mod event;
 pub mod modbus;
 pub mod motion;
 pub mod paths;
@@ -16,16 +15,12 @@ pub mod state;
 pub mod time;
 
 pub use command::Command;
-pub use config::{
-    MotorControllerConfig, NetworkConfiguration, PinConfiguration, OPERATING_MODE_RTU_RELAY,
-    OPERATING_MODE_SERVO,
-};
-pub use engine::Engine;
+pub use config::MotorControllerConfig;
+pub use engine::{CycleOutput, Engine};
 pub use error::CoreError;
-pub use event::CycleOutput;
 pub use motion::MotorController;
 pub use rpc::{dispatch_rpc, RpcAction};
-pub use rpc_types::{PausedControl, SubscribeParams, WaypointsInput, WaypointsObject, WsMessage};
+pub use rpc_types::{PausedControl, RpcRequest, SubscribeParams, WaypointsInput, WaypointsObject};
 pub use state::{
     LoopStats, ModbusStats, MotionCommand, StateResponse, StreamStatus, StreamWaypoint,
     TimingWindowStats,

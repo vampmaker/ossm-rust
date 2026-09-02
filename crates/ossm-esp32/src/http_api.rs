@@ -29,7 +29,7 @@ use crate::motion::MotorControllerConfig;
 use crate::rpc::{self, RpcAction};
 use crate::storage::{NetworkConfiguration, PinConfiguration};
 
-pub use ossm_core::{PausedControl, SubscribeParams, WaypointsInput, WsMessage};
+pub use ossm_core::{PausedControl, RpcRequest, SubscribeParams, WaypointsInput};
 
 const APP_HTML_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
 
@@ -676,7 +676,7 @@ async fn run_ws_session(mut socket: TcpSocket<'static>, ctx: AppContext) {
                 Ok((frame_type, len)) => match frame_type {
                     FrameType::Text(_) | FrameType::Binary(_) => {
                         let payload = &buf[..len];
-                        let request = match serde_json::from_slice::<WsMessage>(payload) {
+                        let request = match serde_json::from_slice::<RpcRequest>(payload) {
                             Ok(request) => request,
                             Err(_) => continue,
                         };

@@ -24,15 +24,15 @@ mod console;
 mod context;
 mod error;
 mod http_api;
+mod hw_paths;
 mod modbus_relay;
+mod modbus_rtu;
 mod motion;
 mod motor;
 mod motor_57aim30;
 mod rpc;
 mod storage;
 mod wifi;
-
-pub use ossm_core::modbus as modbus_rtu;
 
 use context::AppContext;
 #[cfg(feature = "esp32c6")]

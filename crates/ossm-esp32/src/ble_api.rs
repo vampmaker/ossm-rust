@@ -15,7 +15,7 @@ use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 use trouble_host::prelude::*;
 
 use crate::context::AppContext;
-use crate::http_api::{PausedControl, WsMessage};
+use crate::http_api::{PausedControl, RpcRequest};
 use crate::motion::MotorControllerConfig;
 use crate::rpc::{self, RpcAction};
 use crate::storage::{NetworkConfiguration, PinConfiguration};
@@ -471,7 +471,7 @@ async fn handle_gatt_events<C: Controller>(
                             }
                         }
                     } else if handle == server.ossm.rpc.handle {
-                        if let Ok(request) = serde_json::from_slice::<WsMessage>(&data) {
+                        if let Ok(request) = serde_json::from_slice::<RpcRequest>(&data) {
                             let id = request.id.clone().unwrap_or(serde_json::Value::Null);
                             match rpc::dispatch_rpc(&request, app_context).await {
                                 RpcAction::Respond(json) => {

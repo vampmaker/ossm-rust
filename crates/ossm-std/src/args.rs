@@ -41,6 +41,14 @@ pub struct Args {
     /// Skip 57AIM30 travel homing (env: OSSM_NO_HOMING=1)
     #[arg(long, default_value_t = false)]
     pub no_homing: bool,
+
+    /// Force stdin REPL even when stdin is not a TTY (env: OSSM_REPL=1)
+    #[arg(long, default_value_t = false)]
+    pub repl: bool,
+
+    /// Disable stdin REPL even on a TTY (env: OSSM_NO_REPL=1)
+    #[arg(long, default_value_t = false)]
+    pub no_repl: bool,
 }
 
 impl Args {
@@ -86,6 +94,12 @@ impl Args {
         if env_truthy("OSSM_NO_HOMING") {
             self.no_homing = true;
         }
+        if env_truthy("OSSM_REPL") {
+            self.repl = true;
+        }
+        if env_truthy("OSSM_NO_REPL") {
+            self.no_repl = true;
+        }
 
         if self.baud.is_none() {
             self.baud = Some(115200);
@@ -113,6 +127,17 @@ impl Args {
 
     pub fn is_mock(&self) -> bool {
         self.mock || self.serial.is_none()
+    }
+
+    /// Interactive stdin CLI. Default: on when stdin is a TTY.
+    pub fn want_repl(&self) -> bool {
+        if self.no_repl {
+            false
+        } else if self.repl {
+            true
+        } else {
+            std::io::IsTerminal::is_terminal(&std::io::stdin())
+        }
     }
 
     pub fn baud(&self) -> u32 {
@@ -183,6 +208,8 @@ mod tests {
             slave_id: None,
             static_dir: None,
             no_homing: false,
+            repl: false,
+            no_repl: false,
         }
         .finalize();
 

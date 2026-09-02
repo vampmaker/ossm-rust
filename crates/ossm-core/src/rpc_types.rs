@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::StreamWaypoint;
 
 #[derive(Deserialize)]
-pub struct WsMessage {
+pub struct RpcRequest {
     #[serde(default)]
     pub id: Option<serde_json::Value>,
     #[serde(alias = "method")]
@@ -17,7 +17,7 @@ pub struct WsMessage {
     pub extra: serde_json::Value,
 }
 
-impl WsMessage {
+impl RpcRequest {
     pub fn parse_params<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         if let Some(ref params) = self.params {
             if !params.is_null() && (params.is_object() || params.is_array()) {

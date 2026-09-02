@@ -1,74 +1,34 @@
 use crate::command::Command;
-use crate::config::{MotorControllerConfig, NetworkConfiguration, PinConfiguration};
+use crate::config::MotorControllerConfig;
 use crate::error::{CoreError, Result};
-use crate::event::CycleOutput;
-use crate::modbus;
 use crate::motion::MotorController;
 use crate::state::{MotionCommand, StateResponse};
 use crate::time::Micros;
 
+pub struct CycleOutput {
+    pub position: f32,
+    pub speed: f32,
+}
+
 pub struct Engine {
     motion: MotorController,
-    pin: PinConfiguration,
-    net: NetworkConfiguration,
 }
 
 impl Engine {
     pub fn new(motor: MotorControllerConfig) -> Self {
         Self {
             motion: MotorController::new(motor),
-            pin: PinConfiguration::default(),
-            net: NetworkConfiguration::default(),
-        }
-    }
-
-    pub fn with_pin_net(
-        motor: MotorControllerConfig,
-        pin: PinConfiguration,
-        net: NetworkConfiguration,
-    ) -> Self {
-        Self {
-            motion: MotorController::new(motor),
-            pin,
-            net,
         }
     }
 
     pub fn apply(&mut self, cmd: Command) {
-        if self.pin.is_rtu_relay() {
-            match &cmd {
-                Command::SetConfig(_)
-                | Command::AppendWaypoints(_)
-                | Command::SetWaypoints { .. }
-                | Command::ResetTimestamp
-                | Command::SetPaused { .. }
-                | Command::HomingComplete { .. } => {
-                    return;
-                }
-                _ => {}
-            }
-        }
-
         match cmd {
-            Command::SetConfig(cfg) => {
-                self.motion.set_config(cfg);
-                self.motion.flush_snapshot();
-            }
-            Command::AppendWaypoints(waypoints) => {
-                self.motion
-                    .apply_motion(MotionCommand::AppendWaypoints(waypoints));
-            }
-            Command::SetWaypoints {
-                waypoints,
-                reset_timestamp,
-            } => {
-                self.motion.apply_motion(MotionCommand::SetWaypoints {
-                    waypoints,
-                    reset_timestamp,
-                });
-            }
-            Command::ResetTimestamp => {
-                self.motion.apply_motion(MotionCommand::ResetTimestamp);
+            Command::Motion(m) => {
+                let flush = matches!(&m, MotionCommand::SetConfig(_));
+                self.motion.apply_motion(m);
+                if flush {
+                    self.motion.flush_snapshot();
+                }
             }
             Command::SetPaused { paused, position } => {
                 let mut cfg = self.motion.snapshot().config.clone();
@@ -78,14 +38,6 @@ impl Engine {
                 }
                 self.motion.set_config(cfg);
                 self.motion.flush_snapshot();
-            }
-            Command::SetPin(pin) => {
-                let mut pin = pin;
-                pin.normalize_operating_mode();
-                self.pin = pin;
-            }
-            Command::SetNet(net) => {
-                self.net = net;
             }
             Command::HomingComplete {
                 pos_min,
@@ -100,9 +52,6 @@ impl Engine {
             }
             Command::SetModbusStats(stats) => {
                 self.motion.set_modbus_stats(stats);
-            }
-            Command::SetInject { mode, nbytes } => {
-                modbus::set_inject_junk(mode, nbytes);
             }
         }
     }
@@ -128,25 +77,10 @@ impl Engine {
         self.motion.reset_cycle_clock(now);
     }
 
-    pub fn pin(&self) -> &PinConfiguration {
-        &self.pin
-    }
-
-    pub fn net(&self) -> &NetworkConfiguration {
-        &self.net
-    }
-
-    pub fn is_rtu_relay(&self) -> bool {
-        self.pin.is_rtu_relay()
-    }
-
     pub fn try_set_config(
         &mut self,
         mut cfg: MotorControllerConfig,
     ) -> Result<MotorControllerConfig> {
-        if self.pin.is_rtu_relay() {
-            return Err(CoreError::RelayMode);
-        }
         let current_version = self.motion.snapshot().config.version;
         if cfg.version > 0 && cfg.version < current_version {
             return Err(CoreError::StaleVersion);

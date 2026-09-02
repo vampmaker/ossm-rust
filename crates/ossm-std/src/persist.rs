@@ -2,15 +2,11 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use ossm_core::{MotorControllerConfig, NetworkConfiguration, PinConfiguration};
+use ossm_core::MotorControllerConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SavedConfig {
-    #[serde(default)]
-    pub pin: PinConfiguration,
-    #[serde(default)]
-    pub net: NetworkConfiguration,
     #[serde(default)]
     pub motor: MotorControllerConfig,
 }
@@ -118,6 +114,20 @@ mod tests {
         assert_eq!(loaded.motor.bpm, 12.0);
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("12"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_ignores_legacy_pin_net_keys() {
+        let dir = unique_dir();
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"pin":{"modbus_tx":2},"net":{"ssid":"x"},"motor":{"version":0,"bpm":22.0,"depth":1.0,"depth_top":false,"reversed":false,"wave_func":"sine","sharpness":0.3,"paused":true,"paused_position":0.0,"streaming":false}}"#,
+        )
+        .unwrap();
+        let loaded = Persist::new(&path).load();
+        assert_eq!(loaded.motor.bpm, 22.0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

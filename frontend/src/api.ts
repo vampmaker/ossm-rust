@@ -182,7 +182,7 @@ export function cancelWsIdleDisconnect(): void {
 /**
  * Schedules an idle disconnect check after inactivity.
  */
-export async function closeWsIfIdle(timeoutMs = 3000): Promise<void> {
+export async function closeWsIfIdle(): Promise<void> {
   wsManager.resetIdleTimer()
 }
 

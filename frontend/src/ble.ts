@@ -386,7 +386,9 @@ export async function connectBle(onDisconnect?: () => void): Promise<boolean> {
             if (gattServer && gattServer.connected) {
               gattServer.disconnect()
             }
-          } catch (e) {}
+          } catch {
+            // Ignore disconnect errors between connect retries.
+          }
           await delay(attempt * 500)
         }
       }

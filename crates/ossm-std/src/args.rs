@@ -169,6 +169,11 @@ mod tests {
 
     #[test]
     fn no_serial_implies_mock() {
+        let saved_port = std::env::var("DEVICE_PORT").ok();
+        let saved_serial = std::env::var("OSSM_SERIAL").ok();
+        std::env::remove_var("DEVICE_PORT");
+        std::env::remove_var("OSSM_SERIAL");
+
         let args = Args {
             serial: None,
             baud: None,
@@ -180,6 +185,16 @@ mod tests {
             no_homing: false,
         }
         .finalize();
+
+        match saved_port {
+            Some(v) => std::env::set_var("DEVICE_PORT", v),
+            None => std::env::remove_var("DEVICE_PORT"),
+        }
+        match saved_serial {
+            Some(v) => std::env::set_var("OSSM_SERIAL", v),
+            None => std::env::remove_var("OSSM_SERIAL"),
+        }
+
         assert!(args.is_mock());
         assert!(args.no_homing);
         assert_eq!(args.baud(), 115200);

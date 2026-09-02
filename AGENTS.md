@@ -21,7 +21,7 @@ This document serves as an architectural overview, operational reference, and ru
 - **`crates/ossm-core/src/motion/`** + **`crates/ossm-core/src/engine.rs`**: `MotorController::tick(now: Micros)` and `Engine::apply` / `try_set_config` (`apply` returns `()`; persistence is a shell concern). Firmware SPSC stays in `crates/ossm-esp32/src/motion.rs` (`COMMAND_QUEUE_SIZE = 3`); the motor task dequeues `MotionCommand` into `Engine::apply` then `tick`. **Default `paused: true`**. Snapshot config is version-gated. Sole config write path bumps `config_version`. After homing, `HomingComplete` → `sync_to_position` parks via `set_config(paused=true)`.
 - **`crates/ossm-std/`**: Linux desktop shell (`cargo +stable run -p ossm-std`). Owns tokio-serial + axum REST/`/ws/command` around `Engine` (mpsc, not a shared mutex). **CLI > env > defaults** (`--serial`/`OSSM_SERIAL`/`DEVICE_PORT`, `--baud`/`DEVICE_BAUD`, `--bind`/`OSSM_BIND` default `127.0.0.1:8080`, `--config`/`OSSM_CONFIG`, `--mock`/`OSSM_MOCK`). Atomic `{pin,net,motor}` JSON via temp+fsync+rename. No BLE. Scripts: `DEVICE_IP=127.0.0.1:8080`.
 - **`crates/ossm-core/src/rpc.rs`** + **`crates/ossm-core/src/paths.rs`**: Sync `dispatch_rpc(&mut Engine, request, out)` and CLI path catalog/`get`/`set`. ESP32 HTTP/BLE cannot hold `&mut Engine` (motor-task ownership); they use the async adapter.
-- **`crates/ossm-esp32/src/motor_57aim30.rs` & `crates/ossm-esp32/src/motor.rs`**: `motor.rs` defines the `Motor` trait only. All Modbus RTU / UHCI GDMA / homing live in `motor_57aim30.rs`. The motor task exclusively owns `MotorController`; after `homing()`, calls `sync_to_position` then `flush_snapshot` / `update_snapshot` so telemetry matches the parked state before the control loop runs. When `PinConfiguration.modbus_debug` is true (NVS; reboot to apply), the master uses a **5 ms** RX deadline, keeps **`dma_buffers!(256, 256)`** + `pkt_thres=expected_len`, CRC-scans long/misaligned captures via [`crates/ossm-core/src/modbus/mod.rs`](crates/ossm-core/src/modbus/mod.rs) `find_modbus_response` (classes `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`), copies only the trimmed frame, and logs `MODBUS_DBG` with `skip`/`trim` (throttles `exact` when inject off) — increases USB log volume; steady-state `ups` modestly lower than production; leave off in normal use. Debug-only RAM fault injection: `set inject` / `GET|POST /modbus-inject` corrupts the software capture buffer (not the bus); verify with `scripts/test_modbus_resync.py` (host), `scripts/test_modbus_debug_device.py` (live C6, RTT), and `scripts/test_console_fairness.py` (USB serial CLI under flood).
+- **`crates/ossm-esp32/src/motor_57aim30.rs` & `crates/ossm-esp32/src/motor.rs`**: `motor.rs` defines the `Motor` trait only. All Modbus RTU / UHCI GDMA / homing live in `motor_57aim30.rs`. The motor task exclusively owns `MotorController`; after `homing()`, calls `sync_to_position` then `flush_snapshot` / `update_snapshot` so telemetry matches the parked state before the control loop runs. When `PinConfiguration.modbus_debug` is true (NVS; reboot to apply), the master uses a **5 ms** RX deadline, keeps **`dma_buffers!(256, 256)`** + `pkt_thres=expected_len`, CRC-scans long/misaligned captures via [`crates/ossm-core/src/modbus/mod.rs`](crates/ossm-core/src/modbus/mod.rs) `find_modbus_response` (classes `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`), copies only the trimmed frame, and logs `MODBUS_DBG` with `skip`/`trim` (throttles `exact` when inject off) — increases USB log volume; steady-state `ups` modestly lower than production; leave off in normal use. Debug-only RAM fault injection: `set inject` / `GET|POST /modbus-inject` corrupts the software capture buffer (not the bus); verify with `scripts/test_modbus_resync.py` (host), `scripts/test_modbus_debug_device.py` (live C6 inject RTT), and `scripts/test_console.py` (USB CLI / `ups` / RTT).
 - **`crates/ossm-esp32/src/rpc.rs`**: Async JSON-RPC adapter for HTTP/WebSocket and BLE. Encodes via `ossm_core::rpc::write_result` / `write_error`. Mutations use `try_enqueue_config` / `enqueue_motion` so `set-config` returns immediately with the authoritative configuration snapshot including the newly incremented `version`.
 - **`crates/ossm-esp32/src/context.rs`**: `AppContext` is a `Copy` tip of domain handles — **not** one big shared mutex around all app state:
   - Motor task owns `MotorController`; HTTP/BLE/CLI send config/waypoints through `enqueue_motion` or non-blocking `try_enqueue_config` (`MotionCommand` SPSC, capacity 3). `try_enqueue_config` pre-increments `version`, rejects stale `config.version < snapshot.version` (`409` REST / RPC `-32001`), retries enqueue for ~250 ms on queue full, and returns the authoritative config blob for GATT/REST/RPC replies.
@@ -30,7 +30,7 @@ This document serves as an architectural overview, operational reference, and ru
 - **`crates/ossm-esp32/src/error.rs`**: Firmware error types.
 - **`frontend/`**: Vue 3 + TypeScript single-page application embedded into the firmware for real-time motor control and configuration over WiFi. Bundled into a single HTML file (`dist/index.html`) via `vite-plugin-singlefile`.
 - **`flasher/`**: Standalone browser-based serial flasher and device configurator built with Vue 3, `esptool-js`, and xterm.js (`dist/index.html` -> `release/flasher.html`).
-- **`scripts/`**: Self-contained `uv` Python automation scripts. Includes `ossm.py` (unified dual-mode CLI and shared `DeviceBackend`), `setup_device.py`, `test_websocket.py`, `test_frontend.py`, `test_ble.py`, `test_modbus_relay.py`, `test_modbus_tcp.py`, `test_modbus_resync.py` (host CRC/resync mirror), `test_modbus_debug_device.py` (live inject + `MODBUS_DBG` E2E), `test_console_fairness.py` (serial CLI under `MODBUS_DBG` TX flood), and `test_console_late_attach.py` (CLI ACK after ACM closed).
+- **`scripts/`**: Self-contained `uv` Python automation scripts. Includes `ossm.py` (unified dual-mode CLI and shared `DeviceBackend`), `setup_device.py`, `test_websocket.py`, `test_frontend.py`, `test_ble.py`, `test_modbus_relay.py`, `test_modbus_tcp.py`, `test_modbus_resync.py` (host CRC/resync mirror), `test_modbus_debug_device.py` (live inject + `MODBUS_DBG` E2E), and `test_console.py` (USB CLI, motor `ups`, probe-rs RTT).
 - **`motor-control/`**: Standalone YZ_AIM-style 57AIM30 Modbus PC tool (`dist/index.html` → `release/motor-control.html`). Vue 3 + Web Serial / Remote `/ws/modbus`; layout mimics `assets/57aim30_pc_control.frm` (Chinese groupbox captions). Protocol stays in `lib/modbus-rtu.ts` + `lib/registers.ts` — UI-only changes must not rewrite the Modbus layer.
 - **`assets/`**: Standalone HTML templates (`wiring_diagram.html`, `wiring_diagram_zh.html`) with dynamic JS auto-wiring and their exported vector graphics (`wiring_diagram.svg`, `wiring_diagram_zh.svg`) embedded in user documentation. Also holds the vendor VB6 form reference `57aim30_pc_control.frm` for motor-control UI parity.
 
@@ -166,26 +166,17 @@ Live device E2E (requires `modbus_debug` enabled + reboot, motor connected):
 - Asserts `MODBUS_DBG ok=true class=long` (trailing) and `class=long_resync skip=3` (leading) in the RTT capture.
 - Disables `modbus_debug` and restarts on exit. Requires `probe-rs` (may invoke `sudo` without udev rules).
 
-### Console fairness testing (`scripts/test_console_fairness.py`)
-Verifies serial CLI stays responsive when `modbus_debug` floods USB TX with `MODBUS_DBG` lines (motor running + fault injection):
+### Console live tests (`scripts/test_console.py`)
+USB Serial/JTAG CLI, motor-loop `ups`, and probe-rs RTT against a live device (`DEVICE_IP` / `DEVICE_PORT` / `DEVICE_MODEL` in `.env`):
 ```bash
-./scripts/test_console_fairness.py
+./scripts/test_console.py
+./scripts/test_console.py --only ups,rtt
 ```
-- Requires `modbus_debug` enabled + reboot and motor connected (`DEVICE_IP` / `DEVICE_PORT` in `.env`).
-- Uses **`POST /modbus-inject`** (`trailing` / `leading`, `nbytes=3`) and unpauses the motor to generate the log flood.
-- Sends `get inject` over USB serial (`write_timeout=2` s) and expects an ACK within retries.
-- Asserts motor `ups` remains healthy (≥ 100) during the flood.
-- Disables inject, pauses motor, turns off `modbus_debug`, and restarts on exit.
-- Complements `test_modbus_debug_device.py` (RTT capture avoids ACM write stalls) by exercising the **USB serial CLI path** under the same diagnostic load.
-
-### Console late-attach testing (`scripts/test_console_late_attach.py`)
-Verifies the configurator ACK path after the chip has been up with nobody reading USB:
-```bash
-./scripts/test_console_late_attach.py
-```
-- Soft-resets (best-effort), leaves ACM **closed** for ~12 s, then opens **without** DTR so native USB-Serial-JTAG is not reset.
-- Sends `set pin.ble_enabled true` and expects `pin.ble_enabled set to` within 2 s.
-- Catches USB IN FIFO wedges from retrying `write_async` into a full endpoint, and set-ACKs dropped on the log queue.
+- **`ups`**: ACM closed; `ups` ≥ 300 and `dt_max_ms` < 4.5 after the first 1 s window.
+- **`acm-open`**: open ACM with **DTR=0 / RTS=0 before `open()`**. Linux CDC may still pulse chip reset; the test **keeps the port open through boot** and then asserts the same `ups`/`dt_max` bounds plus CLI `get pin.modbus_tx`.
+- **`rtt`**: `sudo probe-rs attach --chip <model> --no-catch-reset` (ELF from `cargo b-c6 --release`; **no** `--rtt-scan-memory` — that can Load-fault during homing). Assert RTT has firmware logs, no `PANIC`, and `ups` stays healthy.
+- **`late-attach`**: ACM closed ~12 s, then CLI `set pin.ble_enabled true` expects `pin.ble_enabled set to` within 2 s.
+- **`fairness`**: enables `modbus_debug` (reboot), `POST /modbus-inject` trailing/leading flood, `get inject` over a held-open ACM, `ups` ≥ 100; disables debug on exit.
 
 ---
 
@@ -337,7 +328,7 @@ When interacting over USB serial (`115200` baud, `\r\n` terminated), configurati
      - Update `crates/ossm-esp32/src/command.rs` (Serial UART command handling).
      - Update `frontend/src/types.ts`, `frontend/src/api.ts`, `frontend/src/mapper.ts`, `frontend/src/macro.ts`, and `frontend/src/connectionStateMachine.ts` (if web interface interaction, causal versioning, or state properties change).
      - For 57AIM30 Modbus register map / RTU send types: update `motor-control/src/lib/registers.ts`, `send-options.ts`, and related panels; rebuild `release/motor-control.html`.
-     - Update automated test suites and backend tools in `scripts/ossm.py`, `scripts/test_websocket.py`, `scripts/test_frontend.py` (includes `test_motor_control`), `scripts/test_ble.py`, `scripts/test_modbus_debug_device.py`, `scripts/test_console_fairness.py`, `scripts/test_console_late_attach.py`, and `scripts/setup_device.py`.
+     - Update automated test suites and backend tools in `scripts/ossm.py`, `scripts/test_websocket.py`, `scripts/test_frontend.py` (includes `test_motor_control`), `scripts/test_ble.py`, `scripts/test_modbus_debug_device.py`, `scripts/test_console.py`, and `scripts/setup_device.py`.
      - Update user documentation in `README.md` and `README.zh.md`.
 7. **Frontend & Firmware Build Dependency**:
    - The embedded web server (`crates/ossm-esp32/src/http_api.rs`) embeds **`index.html.gz`** from `OUT_DIR` (produced by `build.rs` from `frontend/dist/index.html`). Whenever you modify code in `frontend/`, you **must** rebuild the frontend (`npm run build` inside `frontend/` or via `./scripts/release.sh`) before compiling or flashing the Rust firmware, otherwise changes will not be included in the binary.

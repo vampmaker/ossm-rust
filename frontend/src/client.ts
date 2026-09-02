@@ -9,7 +9,7 @@ import type {
 
 export interface Deferred<T> {
   resolve: (value: T) => void
-  reject: (reason?: any) => void
+  reject: (reason?: unknown) => void
 }
 
 /**
@@ -29,7 +29,7 @@ export class WsDataManager {
   private connectingPromise: Promise<void> | null = null
 
   // Routing table: maps JSON-RPC message IDs to pending Deferred coroutines
-  private pendingRequests = new Map<number, Deferred<any>>()
+  private pendingRequests = new Map<number, Deferred<unknown>>()
 
   // Deferred waiters waiting for the next shared MotorState push notification
   private pendingStateWaiters = new Set<Deferred<MotorState>>()
@@ -104,7 +104,9 @@ export class WsDataManager {
         try {
           ws.onclose = null
           ws.close()
-        } catch (e) {}
+        } catch {
+          // Ignore close errors while aborting a hung handshake.
+        }
         reject(new Error('WebSocket connection timed out'))
       }, 3000)
 
@@ -147,7 +149,7 @@ export class WsDataManager {
   /**
    * Sends a JSON-RPC 2.0 command over WebSocket and correlates response via Deferred ID map.
    */
-  public async sendRpc(method: string, params?: any): Promise<any> {
+  public async sendRpc(method: string, params?: unknown): Promise<unknown> {
     this.resetIdleTimer()
     await this.ensureConnected()
     const id = this.nextId++
@@ -337,7 +339,7 @@ export class WsDataManager {
           }))
         }
         break
-      } catch (e) {
+      } catch {
         await new Promise(resolve => setTimeout(resolve, 1000))
       }
     }

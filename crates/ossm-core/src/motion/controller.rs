@@ -224,12 +224,11 @@ impl MotorController {
 
         let now = self.last_now;
 
-        if target_mode == MotionMode::Paused {
-            if self.active_mode != MotionMode::Paused {
-                self.paused_source = PausedMotionSource::new(self.last_y, config.paused_position);
-            } else if (self.config.paused_position - config.paused_position).abs() > 0.001 {
-                self.paused_source = PausedMotionSource::new(self.last_y, config.paused_position);
-            }
+        if target_mode == MotionMode::Paused
+            && (self.active_mode != MotionMode::Paused
+                || (self.config.paused_position - config.paused_position).abs() > 0.001)
+        {
+            self.paused_source = PausedMotionSource::new(self.last_y, config.paused_position);
         }
 
         if target_mode == MotionMode::Streaming && self.active_mode != MotionMode::Streaming {

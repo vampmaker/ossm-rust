@@ -215,9 +215,9 @@ async function connectToBle() {
     if (ok) {
       await fetchConfig()
     }
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error(e)
-    error.value = e.message || t('errors.bleConnectFailed')
+    error.value = e instanceof Error ? e.message : t('errors.bleConnectFailed')
     connected.value = false
     motorReady.value = false
   } finally {

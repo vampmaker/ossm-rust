@@ -965,7 +965,7 @@ fn expected_modbus_response_len(req: &[u8]) -> u16 {
 fn bytes_to_base64(data: &[u8], max_bytes: usize) -> alloc::string::String {
     const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let n = data.len().min(max_bytes);
-    let mut s = alloc::string::String::with_capacity((n + 2) / 3 * 4);
+    let mut s = alloc::string::String::with_capacity(n.div_ceil(3) * 4);
     let mut i = 0;
     while i < n {
         let b0 = data[i];

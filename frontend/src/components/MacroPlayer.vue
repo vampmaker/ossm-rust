@@ -246,7 +246,7 @@ function setParam(idx: number, key: string, value: unknown) {
   if (editingLocked.value) return
   const cur = doc.value.instructions[idx]
   if (!cur) return
-  const params = { ...(cur.params ?? {}) } as Record<string, unknown>
+  const params = { ...cur.params } as Record<string, unknown>
   params[key] = value
   updateInstruction(idx, { params: params as MacroInstruction['params'] }, false)
 }

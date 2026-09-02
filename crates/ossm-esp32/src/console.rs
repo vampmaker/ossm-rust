@@ -119,7 +119,9 @@ fn log_ring_pop(dst: &mut [u8]) -> usize {
         for (i, slot) in dst.iter_mut().take(n).enumerate() {
             *slot = buf[(head + i) % LOG_RING_CAP];
         }
-        LOG_RING.head.store((head + n) % LOG_RING_CAP, Ordering::Relaxed);
+        LOG_RING
+            .head
+            .store((head + n) % LOG_RING_CAP, Ordering::Relaxed);
         LOG_RING.len.store(len - n, Ordering::Relaxed);
         n
     })

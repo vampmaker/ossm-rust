@@ -72,6 +72,15 @@ def get_state(http: httpx.Client, retries: int = 5) -> dict:
     raise RuntimeError(f"GET /state failed after {retries} retries ({last})")
 
 
+def http_up() -> bool:
+    try:
+        with client() as http:
+            http.get(f"{BASE}/shell-config").raise_for_status()
+            return True
+    except Exception:
+        return False
+
+
 def wait_http(timeout_s: float = 45.0) -> None:
     end = time.monotonic() + timeout_s
     last = None
@@ -86,22 +95,81 @@ def wait_http(timeout_s: float = 45.0) -> None:
     fail(f"device HTTP not reachable at {BASE} ({last})")
 
 
-def recover_http_after_probe() -> None:
-    """STA can drop while probe-rs holds SWD; restore before later tests."""
-    end = time.monotonic() + 15.0
+def wait_http_ok(timeout_s: float) -> bool:
+    end = time.monotonic() + timeout_s
     while time.monotonic() < end:
-        try:
-            with client() as http:
-                http.get(f"{BASE}/shell-config").raise_for_status()
-                return
-        except Exception:
-            time.sleep(1)
-    print("  HTTP down after probe-rs; POST /restart")
+        if http_up():
+            return True
+        time.sleep(1)
+    return False
+
+
+def close_acm(ser: serial.Serial | None) -> None:
+    if ser is None:
+        return
     try:
-        with client() as http:
-            http.post(f"{BASE}/restart")
+        ser.dtr = False
+        ser.rts = False
+        ser.close()
+    except Exception:
+        pass
+
+
+def probe_reset_cmd() -> list[str]:
+    cmd = [str(PROBE_RS), "reset", "--chip", CHIP]
+    if os.geteuid() != 0 and shutil.which("sudo"):
+        return ["sudo", "-n", *cmd]
+    return cmd
+
+
+def _acm_kick_and_wait_http(timeout_s: float = 50.0) -> bool:
+    """Bring STA back when HTTP is down: ACM CLI reset, then SWD reset."""
+    print("  HTTP down after probe-rs; recovering via ACM")
+    ser = None
+    try:
+        ser = open_acm(dtr=False, rts=False)
+        try:
+            ser.write(b"reset\r\n")
+            ser.flush()
+        except Exception as e:
+            print(f"  ACM reset write skipped: {e}")
+        end = time.monotonic() + timeout_s
+        while time.monotonic() < end:
+            _ = drain(ser)
+            if http_up():
+                print("  HTTP recovered via ACM")
+                return True
+            time.sleep(0.4)
     except Exception as e:
-        print(f"  /restart failed: {e}")
+        print(f"  ACM recover error: {e}")
+    finally:
+        close_acm(ser)
+
+    if not PROBE_RS:
+        return False
+    print("  ACM wait failed; probe-rs reset")
+    try:
+        subprocess.run(probe_reset_cmd(), check=False, timeout=15)
+    except Exception as e:
+        print(f"  probe-rs reset skipped: {e}")
+        return False
+    return wait_http_ok(timeout_s)
+
+
+def recover_http_after_probe(*, allow_reset: bool = True) -> None:
+    """STA can drop while probe-rs holds SWD; restore before later tests.
+
+    `POST /restart` needs WiFi, so it cannot recover a dead STA. After the
+    probe is gone, kick the chip over ACM (CLI `reset`) or `probe-rs reset`.
+    While SWD is still attached, only wait — do not fight the debugger.
+    """
+    if wait_http_ok(15.0):
+        return
+    if not allow_reset:
+        print("  HTTP still down while probe-rs attached")
+        return
+    if _acm_kick_and_wait_http():
+        return
     wait_http(timeout_s=50.0)
 
 
@@ -173,6 +241,15 @@ def open_acm(*, dtr: bool = False, rts: bool = False) -> serial.Serial:
     ser.open()
     ser.dtr = dtr
     ser.rts = rts
+    # Closing with HUPCL set pulses DTR again; keep the chip running.
+    try:
+        import termios
+
+        attrs = termios.tcgetattr(ser.fd)
+        attrs[2] &= ~termios.HUPCL
+        termios.tcsetattr(ser.fd, termios.TCSANOW, attrs)
+    except Exception:
+        pass
     return ser
 
 
@@ -314,6 +391,7 @@ def probe_cmd(*, scan_memory: bool = False) -> list[str]:
         "--chip",
         CHIP,
         "--no-catch-reset",
+        "--no-catch-hardfault",
     ]
     if scan_memory:
         cmd.append("--rtt-scan-memory")
@@ -335,26 +413,32 @@ def test_rtt() -> None:
     with RTT_OUT.open("wb") as rtt_file:
         proc = subprocess.Popen(cmd, stdout=rtt_file, stderr=subprocess.PIPE)
         rtt_error: str | None = None
+        ser = None
         try:
             time.sleep(2.5)
             if proc.poll() is not None:
                 err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
                 rtt_error = f"probe-rs attach exited early: {err[:800]}"
             else:
+                recover_http_after_probe(allow_reset=False)
+                ser = open_acm(dtr=False, rts=False)
+                if not wait_http_ok(20.0):
+                    raise RuntimeError("HTTP down during probe-rs attach")
                 with client() as http:
-                    time.sleep(2.0)
+                    wait_motor(http, UPS_MIN, timeout_s=50)
                     rows = sample_loop(http, 5, skip_first=True)
                     assert_healthy(rows, min_ups=UPS_MIN, label="during-RTT")
-        except (RuntimeError, httpx.HTTPError, OSError) as e:
+        except (RuntimeError, httpx.HTTPError, OSError, SystemExit) as e:
             rtt_error = str(e)
         finally:
+            close_acm(ser)
             if proc.poll() is None:
                 proc.send_signal(signal.SIGINT)
                 try:
                     proc.wait(timeout=8)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-            recover_http_after_probe()
+            recover_http_after_probe(allow_reset=True)
         if rtt_error:
             fail(rtt_error)
 

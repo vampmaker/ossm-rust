@@ -131,7 +131,7 @@ def main() -> None:
                 err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
                 raise RuntimeError(f"probe-rs attach exited early: {err[:800]}")
 
-            recover_http_after_probe()
+            recover_http_after_probe(allow_reset=False)
             ser = open_acm(dtr=False, rts=False)
             reader = threading.Thread(
                 target=drain_acm, args=(ser, acm_chunks, stop), daemon=True

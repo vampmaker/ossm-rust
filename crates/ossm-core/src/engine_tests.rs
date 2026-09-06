@@ -243,3 +243,40 @@ fn state_copy_from_copies_all_fields() {
     assert_eq!(dst.config.bpm, 99.0);
     assert_eq!(dst.loop_stats.ups, 321);
 }
+
+#[test]
+fn waveform_fold_keeps_sine_phase_across_many_cycles() {
+    let t0 = 1_000_000u64;
+    let mut short = homed_paused_at(1.0, 0.5, t0);
+    let mut cfg = short.snapshot().config;
+    cfg.paused = false;
+    short.try_set_config(cfg).unwrap();
+    let period_us = crate::time::seconds_to_micros(60.0 / short.snapshot().config.bpm);
+
+    let mut long = homed_paused_at(1.0, 0.5, t0);
+    let mut cfg = long.snapshot().config;
+    cfg.paused = false;
+    long.try_set_config(cfg).unwrap();
+
+    let _ = short.tick(t0);
+    let _ = short.tick(t0 + 3_000);
+    let _ = long.tick(t0);
+    let _ = long.tick(t0 + 10 * period_us + 3_000);
+
+    let sy = short.snapshot().y;
+    let ly = long.snapshot().y;
+    assert!(
+        (sy - ly).abs() < 1e-4,
+        "waveform y drifted across fold: {sy} vs {ly}"
+    );
+    let st = short.snapshot().t;
+    let lt = long.snapshot().t;
+    assert!(
+        st < 60.0 / short.snapshot().config.bpm + 0.05,
+        "short t should be intra-cycle, got {st}"
+    );
+    assert!(
+        lt < 60.0 / long.snapshot().config.bpm + 0.05,
+        "folded t should be intra-cycle, got {lt}"
+    );
+}

@@ -30,10 +30,26 @@ impl WaveformMotionSource {
             t0: 0,
         }
     }
+
+    /// Drop whole cycles so `elapsed` stays in one period (`f32` stays exact).
+    fn fold_t0(&mut self, now: Micros) {
+        if self.bpm <= 0.0 {
+            return;
+        }
+        let period_us = seconds_to_micros(60.0 / self.bpm);
+        if period_us == 0 {
+            return;
+        }
+        let elapsed_us = now.saturating_sub(self.t0);
+        if elapsed_us >= period_us {
+            self.t0 = self.t0.saturating_add((elapsed_us / period_us) * period_us);
+        }
+    }
 }
 
 impl MotionSource for WaveformMotionSource {
     fn update(&mut self, _dt: f32, now: Micros) -> (f32, f32) {
+        self.fold_t0(now);
         let elapsed = dt_seconds(self.t0, now);
         self.generator.evaluate(elapsed, self.bpm)
     }
@@ -47,7 +63,17 @@ impl MotionSource for WaveformMotionSource {
     }
 
     fn get_phase_info(&self, now: Micros) -> (f32, f32) {
-        let elapsed = dt_seconds(self.t0, now);
+        let mut t0 = self.t0;
+        if self.bpm > 0.0 {
+            let period_us = seconds_to_micros(60.0 / self.bpm);
+            if period_us > 0 {
+                let elapsed_us = now.saturating_sub(t0);
+                if elapsed_us >= period_us {
+                    t0 = t0.saturating_add((elapsed_us / period_us) * period_us);
+                }
+            }
+        }
+        let elapsed = dt_seconds(t0, now);
         let cycles = elapsed * self.bpm / 60.0;
         let x = cycles % 1.0;
         (elapsed, x)
@@ -200,6 +226,8 @@ const CATCHUP_SPEED: f32 = 0.5; // y-units/s
 const CATCHUP_MIN_DURATION: f32 = 0.2;
 const CATCHUP_MAX_DURATION: f32 = 2.0;
 const UNDERRUN_DECEL: f32 = 20.0; // y-units/s^2
+const STREAM_REBASE_S: f32 = 1800.0;
+const STREAM_REBASE_KEEP_S: f32 = 1.0;
 
 enum StreamSample {
     Interpolated(f32, f32),
@@ -244,6 +272,23 @@ impl StreamingMotionSource {
             buffered: self.window.len(),
             stream_time: self.stream_time,
             underrun: self.underrun,
+        }
+    }
+
+    fn rebase_if_needed(&mut self) {
+        if self.stream_time <= STREAM_REBASE_S {
+            return;
+        }
+        let shift = self.stream_time - STREAM_REBASE_KEEP_S;
+        if shift <= 0.0 {
+            return;
+        }
+        self.stream_time -= shift;
+        for w in &mut self.window {
+            w.t -= shift;
+        }
+        if let Some((_, epoch_t)) = &mut self.epoch {
+            *epoch_t -= shift;
         }
     }
 
@@ -410,6 +455,7 @@ impl StreamingMotionSource {
 
 impl MotionSource for StreamingMotionSource {
     fn update(&mut self, dt: f32, _now: Micros) -> (f32, f32) {
+        self.rebase_if_needed();
         self.evict_old();
 
         // Start a catch-up trajectory toward the first upcoming waypoint if
@@ -485,5 +531,76 @@ impl MotionSource for StreamingMotionSource {
 
     fn get_phase_info(&self, _now: Micros) -> (f32, f32) {
         (self.stream_time, 0.0) // No phase concept in streaming
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use crate::motion::waveform::WaveformKind;
+    use crate::motion::waveform::SineWaveform;
+
+    #[test]
+    fn waveform_fold_preserves_sine_phase() {
+        let bpm = 36.0;
+        let period_us = seconds_to_micros(60.0 / bpm);
+        let t_base = 1_000_000u64;
+        let mut src = WaveformMotionSource::new(WaveformKind::Sine(SineWaveform), bpm);
+        src.follow(0.5, 0.0, t_base);
+        let (y_short, speed_short) = src.update(0.003, t_base + 3_000);
+        let (y_long, speed_long) = src.update(0.003, t_base + 10 * period_us + 3_000);
+        assert!(
+            (y_short - y_long).abs() < 1e-5,
+            "y {y_short} vs {y_long}"
+        );
+        assert!(
+            (speed_short - speed_long).abs() < 1e-4,
+            "speed {speed_short} vs {speed_long}"
+        );
+        let elapsed = t_base + 10 * period_us + 3_000 - src.t0;
+        assert!(elapsed < 2 * period_us, "t0 not folded: elapsed_us={elapsed}");
+    }
+
+    #[test]
+    fn stream_rebase_shifts_window_and_epoch() {
+        let mut src = StreamingMotionSource::new(0.5);
+        src.stream_time = 1801.0;
+        src.epoch = Some((1000, 1800.5));
+        src.window.push_back(Waypoint {
+            t: 1800.4,
+            pos: 0.2,
+            vel: None,
+        });
+        src.window.push_back(Waypoint {
+            t: 1801.4,
+            pos: 0.8,
+            vel: Some(0.1),
+        });
+        let y_before = match src.sample(src.stream_time) {
+            StreamSample::Interpolated(y, _) => y,
+            StreamSample::BeforeFirst => panic!("before first"),
+            StreamSample::Exhausted => panic!("exhausted"),
+        };
+        src.rebase_if_needed();
+        assert!((src.stream_time - 1.0).abs() < 1e-4);
+        assert!((src.window[0].t - 0.4).abs() < 1e-3);
+        assert!((src.window[1].t - 1.4).abs() < 1e-3);
+        assert_eq!(src.epoch, Some((1000, 0.5)));
+        let y_after = match src.sample(src.stream_time) {
+            StreamSample::Interpolated(y, _) => y,
+            StreamSample::BeforeFirst => panic!("before first after rebase"),
+            StreamSample::Exhausted => panic!("exhausted after rebase"),
+        };
+        assert!((y_before - y_after).abs() < 1e-5, "y {y_before} vs {y_after}");
+    }
+
+    #[test]
+    fn stream_rebase_skips_short_clock() {
+        let mut src = StreamingMotionSource::new(0.0);
+        src.stream_time = 12.0;
+        src.epoch = Some((0, 0.2));
+        src.rebase_if_needed();
+        assert_eq!(src.stream_time, 12.0);
+        assert_eq!(src.epoch, Some((0, 0.2)));
     }
 }

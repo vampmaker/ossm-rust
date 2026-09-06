@@ -1,10 +1,15 @@
 # OSSM-Rust — User Manual
 
+[**English**](README.md) | [**🇨🇳 简体中文**](README.zh.md)
+
+> [!TIP]
+> 🇨🇳 **中文读者**：本文档提供完整中文说明，请直接参阅 [**简体中文版用户手册 (README.zh.md)**](README.zh.md)。
+
 OSSM-Rust drives an Open Source Sex Machine built around a **57AIM30** servo motor. It gives you a web interface with speed, depth, and stroke-shape controls, plus custom motion curves and recorded sequences.
 
-There are three ways to run it. Pick one and follow that section — you do not need the others.
+There are two ways to run it. Pick one and follow that section — you do not need the other.
 
-Building on the code, or looking for the HTTP / WebSocket / BLE API? See the [Developer Guide](DEVELOPERS.md). Motion and bus telemetry are split into `loop_stats` (motor update rate) and `link_stats` (RTT / exchange counters) on `/state`; `ossm-std` also exposes `GET /link-stats`.
+Building on the code, or looking for the HTTP / WebSocket / BLE API? See the [Developer Guide](DEVELOPERS.md).
 
 > [!CAUTION]
 > This machine moves with real force. Before every session, make sure nothing and nobody is in the path of travel, and keep the power switch within reach. The motor always starts **paused** and always finds its own travel limits at startup — let it finish that first slow sweep before using it.
@@ -13,26 +18,26 @@ Building on the code, or looking for the HTTP / WebSocket / BLE API? See the [De
 
 ## 1. Choose your setup
 
-| | **A — Computer or phone** | **B — ESP32 (standalone)** | **C — Browser** |
-| --- | --- | --- | --- |
-| **What runs it** | A Linux PC or an Android phone running Termux | A small WiFi board wired to the motor | A Chrome/Edge tab |
-| **Extra hardware** | USB-RS485 adapter | ESP32-C6 or ESP32-S3 board + MAX3485 module | USB-RS485 adapter, or an ESP32 from setup B |
-| **Needs a computer nearby?** | Yes, it *is* the computer | No — it runs on its own once configured | Yes |
-| **Setup effort** | Low: plug in, run one command | Medium: flash firmware, enter WiFi details | Low, but the tab must stay open |
-| **Control from** | `http://127.0.0.1:8080` | Any phone or PC on your WiFi | The same tab |
+| | **A — Computer or phone** | **B — ESP32 (standalone)** |
+| --- | --- | --- |
+| **What runs it** | A Linux PC or an Android phone running Termux | A small WiFi board wired to the motor |
+| **Extra hardware** | USB-RS485 adapter | ESP32-C6 or ESP32-S3 board + MAX3485 module |
+| **Needs a computer nearby?** | Yes, it *is* the computer | No — it runs on its own once configured |
+| **Setup effort** | Low: plug in, run one command | Medium: flash firmware, enter WiFi details |
+| **Control from** | `http://127.0.0.1:8080` | Any phone or PC on your WiFi |
 
-**Setup B is the best choice for normal use** — it is the only one that keeps working when you close your laptop. Setups A and C are good for trying things out or if you would rather not solder or flash anything.
+**Setup B is the best choice for normal use** — it is the only one that keeps working when you close your laptop. Setup A is good for trying things out or if you would rather not solder or flash anything.
 
-All three use the same motor, the same power supply, and the same plugs.
+Both use the same motor, the same power supply, and the same plugs.
 
 > [!TIP]
 > **The two motor connectors**
-> - **Front, 6-pin green (KF2EDGK-3.81 6P)** — 24 V power for the shaft.
-> - **Back, 10-pin white (PHB2.0 2×5P)** — 5 V logic and the RS-485 data pair.
+> - **Front, 6-pin green (KF2EDGK-3.81 6P)** — 24 V power for the shaft and internal driver.
+> - **Back, 10-pin white (PHB2.0 2×5P)** — 5 V power for the isolated RS-485 transceiver and the RS-485 data pair.
 >
 > **Never put 24 V into the back connector.** It will destroy the drive electronics.
 
-Get the plain **`57AIM30`**, not the `57AIM30H` — the H variant speaks a different protocol.
+The standard **`57AIM30`** is recommended — the `57AIM30H` uses the same communication protocol, but has different RPM and torque ratings.
 
 ---
 
@@ -44,11 +49,10 @@ No microcontroller, no firmware. A USB adapter connects your machine directly to
 
 | Item | Notes |
 | --- | --- |
-| Linux PC, or Android phone with [Termux](https://termux.dev/) | Termux uses the `ossm-std-linux-arm64` download |
-| USB-RS485 adapter | Must handle send/receive switching **automatically**. Cheap "loopback" adapters and ones needing manual direction control will not work. |
-| 57AIM30 motor | Not the `H` variant |
+| Linux PC, or Android phone with [Termux](https://f-droid.org/packages/com.termux/) | Install Termux and Termux:API from **F-Droid** (do NOT use Google Play). Uses the `ossm-std-linux-arm64` download |
+| USB-RS485 adapter | Must provide a 5 V / VCC pin (to power the motor's isolated RS-485 transceiver) and handle send/receive switching **automatically**. Cheap "loopback" adapters and ones needing manual direction control will not work. |
+| 57AIM30 motor | Standard model (`57AIM30H` has different RPM/torque) |
 | 24 V DC power supply | Sized for your mechanical load |
-| 5 V USB charger | Powers the motor's logic side |
 | Cables | DC 5.5×2.1/2.5 mm barrel jack, KF2EDGK-3.81 6P, PHB2.0 2×5P |
 
 ### Wiring
@@ -60,9 +64,8 @@ No microcontroller, no firmware. A USB adapter connects your machine directly to
 | Motor | → | Other end |
 | --- | --- | --- |
 | Front **+V** / **GND** | → | 24 V supply **+** / **−** |
-| Back pin **10 (5V)** / pin **6 (COM)** | → | 5 V charger **5 V** / **GND** |
+| Back pin **10 (5V)** / pin **6 (COM)** | → | USB-RS485 **5V** / **GND** |
 | Back pin **2 (485A)** / pin **3 (485B)** | → | USB-RS485 **A** / **B** |
-| Back **COM** | → | USB-RS485 **GND** |
 
 > [!CAUTION]
 > Double-check 24 V polarity before switching on, and make sure it goes to the **front** connector only.
@@ -95,7 +98,10 @@ Useful options:
 
 ### On Android (Termux)
 
-Install the **Termux:API** app from the **same store** as Termux (`pkg install termux-api` is not enough by itself). Then:
+> [!IMPORTANT]
+> **Install from F-Droid, not Google Play.** The Google Play Store build of Termux is deprecated and unmaintained. Always install both **[Termux](https://f-droid.org/packages/com.termux/)** and the **[Termux:API](https://f-droid.org/packages/com.termux.api/)** companion app from **F-Droid** (or GitHub Releases). Note that installing the command-line package (`pkg install termux-api`) alone is not sufficient; the Android companion app is required to grant USB access.
+
+Then:
 
 ```bash
 pkg install termux-api
@@ -122,7 +128,7 @@ The board holds the firmware and joins your WiFi, so you can control the machine
 | --- | --- |
 | ESP32-C6 or ESP32-S3 dev board with USB-C | Many boards have **two** USB-C ports — see the note below |
 | MAX3485 TTL module | Converts the board's serial pins to RS-485 |
-| 57AIM30 motor | Not the `H` variant |
+| 57AIM30 motor | Standard model (`57AIM30H` has different RPM/torque) |
 | 24 V DC power supply | Motor shaft power |
 | 5 V USB charger | Powers the ESP32 once it is set up |
 | Cables | DC barrel jack, KF2EDGK-3.81 6P, PHB2.0 2×5P, jumper wires |
@@ -144,13 +150,13 @@ The board holds the firmware and joins your WiFi, so you can control the machine
 | **+V** | → | **+** |
 | **GND** | → | **−** |
 
-**Data and logic (back 10-pin, MAX3485, ESP32)**
+**Data and RS-485 interface (back 10-pin, MAX3485, ESP32)**
 
 | From | → | To | Why |
 | --- | --- | --- | --- |
 | Motor **485A** | → | MAX3485 **A** | Data pair |
 | Motor **485B** | → | MAX3485 **B** | Data pair |
-| ESP32 **5V** (or VBUS/VIN) | → | Motor **5V** | Motor logic power |
+| ESP32 **5V** (or VBUS/VIN) | → | Motor **5V** | RS-485 transceiver power |
 | ESP32 **GND** | → | Motor **COM / GND** | Shared ground |
 | ESP32 **3.3V** | → | MAX3485 **VCC** | Module power |
 | ESP32 **GND** | → | MAX3485 **GND** | Module ground |
@@ -204,27 +210,9 @@ Browse to the IP address from the serial log, for example `http://192.168.1.123`
 
 ---
 
-## 4. Setup C — Browser only
+## 4. Using the controls
 
-Everything runs inside one browser tab, using either a USB-RS485 adapter or an ESP32 from setup B.
-
-If you are using an ESP32, open its settings page first and change **Operating mode** to `rs485`. That hands the motor over to the browser; it takes effect immediately, and setting it back to `servo` returns control to the board.
-
-Open `ossm-wasm.html` from the release package **through a web server** — opening the file directly will not work:
-
-```bash
-cd <folder containing ossm-wasm.html>
-python3 -m http.server 8000
-# then open http://localhost:8000/ossm-wasm.html
-```
-
-Chrome or Edge on desktop only. The same automatic-direction requirement applies to USB-RS485 adapters. Closing the tab stops the machine.
-
----
-
-## 5. Using the controls
-
-The interface is the same in all three setups, minus the WiFi and hardware pages where they do not apply.
+The interface is the same in both setups, minus the WiFi and hardware pages where they do not apply.
 
 **Main controls**
 
@@ -262,7 +250,7 @@ The interface is the same in all three setups, minus the WiFi and hardware pages
 
 ---
 
-## 6. Controlling it over USB
+## 5. Controlling it over USB
 
 Any serial terminal at **115200 baud** works, as does the **Serial** panel in `flasher.html`. This is mainly useful for setup and troubleshooting.
 
@@ -293,15 +281,17 @@ The full list of settings, along with the HTTP and Bluetooth APIs, is in the [De
 
 ---
 
-## 7. Troubleshooting
+## 6. Troubleshooting
 
 **The interface loads but the machine does not move.** It boots paused — press Resume. If the position readout stays at zero, the board is not reaching the motor; check the section below.
 
 **The motor never responds / startup homing never finishes.**
-- Check that A and B are not swapped, and that the board's TX goes to **DI** and RX to **RO**, not to pins labelled TXD/RXD.
-- Confirm ground is shared between the motor's COM and your adapter or board.
-- Confirm 24 V is on the **front** connector and 5 V on the **back** one.
-- On the ESP32, confirm the GPIO numbers you configured match how you actually wired it.
+- **Check A / B and TX / RX:** Ensure A and B are not swapped. On the MAX3485 transceiver, confirm the ESP32's TX connects to **DI** and RX connects to **RO** (beware of modules where pins are misleadingly labelled TXD/RXD).
+- **Check the two power domains:** The motor contains two separate, independent power domains: the main 24 V motor & internal driver domain, and the isolated 5 V RS-485 transceiver domain. (The internal driver logic is powered entirely from the 24 V input on the front terminal — it operates normally even with no PHB2.0 cable connected; the 5 V pin on the back terminal only powers the isolated RS-485 transceiver and optocoupler circuit). Note that RS-485 is differential, so communication itself does not require grounding across systems. Make sure each domain forms its own complete circuit:
+  - **Driver domain (front 6-pin connector):** Connect **+V** and **GND** to your 24 V power supply to power the motor and internal driver.
+  - **RS-485 transceiver domain (back 2×5-pin connector):** Connect **Pin 10 (5V)** and **Pin 6 (COM)** to your 5 V power source (from the USB-RS485 adapter, or ESP32 5 V / step-down converter) to power the communication transceiver.
+  - **Grounding between domains:** GND (front) and COM (back) can either be isolated or shared. If using a 24 V → 5 V step-down buck converter to power the ESP32 or 5 V rail from the main supply, you can simply share ground between the 24 V and 5 V rails.
+- **On the ESP32:** Confirm the configured GPIO numbers match how you actually wired the board.
 
 **Nothing moves after the motor was powered separately.** Check the serial log for a message about a communication-speed mismatch, then power-cycle the motor's 24 V supply for three seconds.
 
@@ -315,8 +305,9 @@ The full list of settings, along with the HTTP and Bluetooth APIs, is in the [De
 
 ---
 
-## 8. Going further
+## 7. Going further
 
 - [Developer Guide](DEVELOPERS.md) — architecture, design decisions, build instructions, and the complete HTTP / WebSocket / Bluetooth API.
 - `motor-control.html` in the release package — a diagnostic tool that reads and writes the 57AIM30 drive's own registers, styled after the vendor's utility. It connects through a USB-RS485 adapter, or through an ESP32 with its operating mode set to `rtu_relay`.
-- [中文文档](README.zh.md)
+- `ossm-wasm.html` in the release package — an all-in-one browser control page that runs the engine locally using WebAssembly. Connects via Web Serial or WebSocket relay, and can be opened directly by double-clicking the file in Chrome or Edge (`file://` supported).
+- [简体中文用户手册 (README.zh.md)](README.zh.md) — 完整中文版使用与配置指南

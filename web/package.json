@@ -10,6 +10,7 @@
         "build:webui-std": "npm run build -w webui-std",
         "build:flasher": "npm run build -w ossm-flasher",
         "build:motor-control": "npm run build -w ossm-motor-control",
-        "build:webui-wasm": "npm run build -w webui-wasm"
+        "build:webui-wasm": "npm run build -w webui-wasm",
+        "build:wiring-diagram": "npm run build -w ossm-wiring-diagram"
     }
 }

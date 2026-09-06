@@ -283,7 +283,7 @@ wasm-bindgen --target web --out-dir web/apps/webui-wasm/src/pkg \
 cd web && npm run build:html -w webui-wasm
 ```
 
-The order matters — crate, then `wasm-bindgen`, then Vite. Serve the result over HTTP; `file://` will not work.
+The order matters — crate, then `wasm-bindgen`, then Vite. The wasm binary and all assets are inlined into a single self-contained HTML file (`release/ossm-wasm.html`), which can be opened directly in Chrome or Edge (including via `file://`).
 
 ### Web apps
 
@@ -702,10 +702,11 @@ Adding a command or a config field touches several layers. Update the crate that
 
 ### Wiring diagrams
 
-Never hand-author the SVGs. Edit the HTML sources in `assets/` (`wiring_diagram.html` and `wiring_diagram_zh.html` for the ESP32 path, `wiring_diagram_std.html` and `wiring_diagram_std_zh.html` for the USB-RS485 path), then export:
+Never hand-author the SVGs. Edit the Vue app sources in `web/apps/wiring-diagram/src/` (`PathAView.vue` for the USB-RS485 path, `PathBView.vue` for the ESP32 path), build, then export:
 
 ```bash
+npm --prefix web run build:wiring-diagram
 uv run scripts/export_wiring_svg.py
 ```
 
-They use CSS Grid with JavaScript midpoint routing; the exporter renders them through Playwright with `html-to-image`.
+The app provides route-driven views (`#/std`, `#/std-zh`, `#/esp`, `#/esp-zh`) with reusable components and renders them through Playwright with `html-to-image`.

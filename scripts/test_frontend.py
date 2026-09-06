@@ -1,29 +1,11 @@
 #!/usr/bin/env -S uv run
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "playwright",
-#     "httpx",
-#     "python-dotenv>=1.0.0",
-#     "bleak>=0.21.0",
-#     "requests>=2.31.0",
-#     "pyserial>=3.5",
-#     "typer>=0.12.0",
-#     "rich>=13.7.0",
-#     "pydantic>=2.0.0",
-#     "websockets>=12.0",
-#     "aiohttp>=3.9.0",
-# ]
-# ///
-
-import asyncio
 import argparse
-import base64
-import uuid
-import serial
+import asyncio
 import json
 import os
 import pty
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -40,281 +22,19 @@ from mock_ossm_server import MockOssmServer
 
 from playwright.async_api import Page
 
-class WebSerialBridge:
-    def __init__(self, page: Page, auto_select_port: str = None):
-        """
-        Initializes the Web Serial bridge.
-        :param page: The Playwright page object.
-        :param auto_select_port: If provided, requestPort() will automatically select this port (e.g., '/dev/ttyACM0').
-        """
-        self.page = page
-        self.auto_select_port = auto_select_port
-        self.ports = {}  # Map of id -> serial.Serial
-        self.read_tasks = {} # Map of id -> asyncio.Task
+from webserial_bridge import WebSerialBridge
 
-    async def setup(self):
-        """Must be called before navigating the page."""
-        await self.page.expose_binding("_ws_requestPort", self._handle_requestPort)
-        await self.page.expose_binding("_ws_getPorts", self._handle_getPorts)
-        await self.page.expose_binding("_ws_open", self._handle_open)
-        await self.page.expose_binding("_ws_close", self._handle_close)
-        await self.page.expose_binding("_ws_write", self._handle_write)
-        await self.page.expose_binding("_ws_setSignals", self._handle_setSignals)
-
-        mock_script = """
-        (() => {
-            class SerialPort {
-                constructor(id, info) {
-                    this._id = id;
-                    this._info = info;
-                    this.readable = null;
-                    this.writable = null;
-                    this._open = false;
-                }
-
-                getInfo() {
-                    return this._info;
-                }
-
-                async open(options) {
-                    if (this._open) {
-                        return;
-                    }
-                    console.log("WebSerial mock: open() called with", options);
-                    await window._ws_open({ id: this._id, options });
-                    console.log("WebSerial mock: open() finished");
-                    this._open = true;
-                    this._readController = null;
-
-                    this.readable = new ReadableStream({
-                        start: (controller) => {
-                            this._readController = controller;
-                            window._ws_ports[this._id] = this;
-                        },
-                        cancel: async () => {
-                            if (this._readController) {
-                                try { this._readController.close(); } catch (_) {}
-                                this._readController = null;
-                            }
-                        }
-                    });
-
-                    this.writable = new WritableStream({
-                        write: async (chunk) => {
-                            const binary = Array.from(chunk).map(b => String.fromCharCode(b)).join('');
-                            const base64 = btoa(binary);
-                            await window._ws_write({ id: this._id, data: base64 });
-                        },
-                        close: async () => {}
-                    });
-                }
-
-                async close() {
-                    console.log("WebSerial mock: close() called");
-                    this._open = false;
-                    if (this._readController) {
-                        try { this._readController.close(); } catch (_) {}
-                        this._readController = null;
-                    }
-                    this.readable = null;
-                    this.writable = null;
-                    delete window._ws_ports[this._id];
-                    await window._ws_close({ id: this._id });
-                    console.log("WebSerial mock: close() finished");
-                }
-
-                async setSignals(signals) {
-                    await window._ws_setSignals({ id: this._id, signals });
-                }
-            }
-
-            window._ws_ports = {};
-
-            window._ws_data_received = (id, base64) => {
-                const port = window._ws_ports[id];
-                if (port && port._readController) {
-                    const binaryString = atob(base64);
-                    const bytes = new Uint8Array(binaryString.length);
-                    for (let i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
-                    }
-                    port._readController.enqueue(bytes);
-                }
-            };
-
-            window._ws_stream_closed = (id, reason) => {
-                const port = window._ws_ports[id];
-                if (!port) return;
-                port._open = false;
-                if (port._readController) {
-                    try { port._readController.close(); } catch (_) {}
-                    port._readController = null;
-                }
-                port.readable = null;
-                port.writable = null;
-                console.log("WebSerial mock: stream closed (" + (reason || "disconnect") + ")");
-            };
-
-            Object.defineProperty(navigator, 'serial', {
-                value: {
-                    requestPort: async (options) => {
-                        console.log("WebSerial mock: requestPort called!");
-                        const res = await window._ws_requestPort(options);
-                        if (!res) throw new DOMException("No port selected by the user.", "NotFoundError");
-                        return new SerialPort(res.id, res.info);
-                    },
-                    getPorts: async () => {
-                        const ports = await window._ws_getPorts();
-                        return ports.map(p => new SerialPort(p.id, p.info));
-                    }
-                },
-                writable: true,
-                configurable: true
-            });
-        })();
-        """
-        await self.page.add_init_script(mock_script)
-
-    async def _handle_requestPort(self, source, options):
-        # Implement auto-selection
-        if not self.auto_select_port:
-            return None # Simulate user cancelling
-
-        port_id = str(uuid.uuid4())
-        self.ports[port_id] = {"device": self.auto_select_port, "serial": None}
-        return {"id": port_id, "info": {"usbVendorId": 0x303a, "usbProductId": 0x1001}} # ESP32-C6 typical
-
-    async def _handle_getPorts(self, source):
-        # Return all authorized ports
-        res = []
-        for pid, p in self.ports.items():
-            res.append({"id": pid, "info": {"usbVendorId": 0x303a, "usbProductId": 0x1001}})
-        return res
-
-    async def _handle_open(self, source, args):
-        port_id = args.get("id")
-        options = args.get("options", {})
-        baud_rate = options.get("baudRate", 115200)
-
-        if port_id not in self.ports:
-            raise Exception("Port not found")
-        
-        device = self.ports[port_id]["device"]
-        print(f"WebSerialBridge: Attempting to open {device} with baudRate {baud_rate}...", flush=True)
-        try:
-            ser = await asyncio.to_thread(serial.Serial, device, baud_rate, timeout=0.1)
-            print(f"WebSerialBridge: Successfully opened {device}")
-        except Exception as e:
-            print(f"WebSerialBridge: Failed to open {device}: {e}", flush=True)
-            raise Exception(f"NotFoundError: Failed to connect: {e}")
-        self.ports[port_id]["serial"] = ser
-        self.ports[port_id]["baud_rate"] = baud_rate
-
-        # Start read task
-        task = asyncio.create_task(self._read_loop(port_id))
-        self.read_tasks[port_id] = task
-
-    async def _notify_stream_closed(self, port_id: str, reason: str = "disconnect") -> None:
-        try:
-            reason_js = json.dumps(reason)
-            await self.page.evaluate(
-                f"window._ws_stream_closed && window._ws_stream_closed('{port_id}', {reason_js})"
-            )
-        except Exception as e:
-            print(f"WebSerialBridge: Failed to notify JS stream closed: {e}", flush=True)
-
-    async def _read_loop(self, port_id: str):
-        device = self.ports[port_id]["device"]
-        ser = self.ports[port_id].get("serial")
-        try:
-            while True:
-                try:
-                    if ser is None or not ser.is_open:
-                        break
-                    data = await asyncio.to_thread(ser.read, 1024)
-                    if not ser.is_open:
-                        raise serial.SerialException("serial port closed")
-                    if data:
-                        b64 = base64.b64encode(data).decode("ascii")
-                        try:
-                            await self.page.evaluate(
-                                f"window._ws_data_received('{port_id}', '{b64}')"
-                            )
-                        except Exception as e:
-                            print(f"WebSerialBridge: Failed to forward data to JS: {e}")
-                            break
-                    await asyncio.sleep(0.01)
-                except asyncio.CancelledError:
-                    raise
-                except (serial.SerialException, OSError) as e:
-                    print(
-                        f"WebSerialBridge: Serial disconnect on {device}, closing JS stream: {e}",
-                        flush=True,
-                    )
-                    if ser is not None:
-                        try:
-                            await asyncio.to_thread(ser.close)
-                        except Exception:
-                            pass
-                    self.ports[port_id]["serial"] = None
-                    await self._notify_stream_closed(port_id)
-                    break
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"WebSerialBridge: Read loop error: {e}")
-
-    async def _handle_close(self, source, args):
-        port_id = args.get("id")
-        if port_id in self.ports:
-            if port_id in self.read_tasks:
-                task = self.read_tasks.pop(port_id)
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-            ser = self.ports[port_id].get("serial")
-            if ser and ser.is_open:
-                print(f"WebSerialBridge: Closing {self.ports[port_id]['device']}", flush=True)
-                await asyncio.to_thread(ser.close)
-            self.ports[port_id]["serial"] = None
-
-    async def _handle_write(self, source, args):
-        port_id = args.get("id")
-        b64 = args.get("data")
-        if port_id not in self.ports:
-            raise Exception("Port not found")
-        ser = self.ports[port_id].get("serial")
-        if ser is None or not ser.is_open:
-            raise Exception("NetworkError: Serial port is not open")
-        data = base64.b64decode(b64)
-        await asyncio.to_thread(ser.write, data)
-        await asyncio.to_thread(ser.flush)
-
-    async def _handle_setSignals(self, source, args):
-        port_id = args.get("id")
-        signals = args.get("signals", {})
-        if port_id in self.ports:
-            ser = self.ports[port_id].get("serial")
-            if ser and ser.is_open:
-
-                def apply_signals():
-                    if "dataTerminalReady" in signals:
-                        ser.dtr = signals["dataTerminalReady"]
-                    if "requestToSend" in signals:
-                        ser.rts = signals["requestToSend"]
-
-                await asyncio.to_thread(apply_signals)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(SCRIPT_DIR, "..", ".env")
-FRONTEND_DIST = Path(SCRIPT_DIR).parent / "frontend" / "dist"
+FRONTEND_DIST = Path(SCRIPT_DIR).parent / "web" / "apps" / "webui-esp32" / "dist"
 
 REST_ENDPOINTS = (
     "/",
     "/config",
     "/state",
+    "/shell-config",
+)
+GONE_ENDPOINTS = (
     "/pin-config",
     "/network-config",
 )
@@ -426,6 +146,11 @@ async def test_concurrent_http(base_url: str, workers: int = 4, rounds: int = 3)
         f"✓ Threaded burst: {len(mix_paths)} simultaneous clients in {wall_ms:.0f}ms "
         f"(all 200)"
     )
+
+    for gone in GONE_ENDPOINTS:
+        _path, status, _ = await fetch_status(base_url, gone)
+        assert status == 404, f"GET {gone} expected 404, got {status}"
+        print(f"✓ GET {gone} -> 404")
 
 
 async def run_macro_editor_tests(page) -> None:
@@ -682,7 +407,7 @@ async def run_wifi_frontend_tests(page, *, ws_messages: list, ws_connections: li
     pre_count = len(ws_messages)
     fetch_results = await page.evaluate(
         """async () => {
-            const urls = ['/state', '/config', '/pin-config', '/network-config'];
+            const urls = ['/state', '/config', '/shell-config'];
             const res = await Promise.all(urls.map(u => fetch(u).then(r => r.status)));
             return res;
         }"""
@@ -762,9 +487,9 @@ async def run_wifi_frontend_tests(page, *, ws_messages: list, ws_connections: li
     await page.wait_for_selector("text=Waveform", timeout=5000)
     print("✓ Main motion controls verified visible")
 
-    print(f"\n[Step 6] Verifying Motor Position Diagram visualization...")
-    await page.wait_for_selector("text=Motor Position Diagram", timeout=5000)
-    print("✓ Motor Position Diagram component verified visible")
+    print(f"\n[Step 6] Verifying Live Motor Position visualization...")
+    await page.wait_for_selector("text=Live Motor Position", timeout=5000)
+    print("✓ Live Motor Position component verified visible")
 
 
 async def test_frontend(base_url: str):
@@ -817,7 +542,7 @@ async def test_frontend_mock() -> None:
     """Offline WiFi suite against MockOssmServer (no live device)."""
     if not (FRONTEND_DIST / "index.html").exists():
         raise FileNotFoundError(
-            f"Missing {FRONTEND_DIST / 'index.html'}; run: cd frontend && npm run build"
+            f"Missing {FRONTEND_DIST / 'index.html'}; run: npm run build -w webui-esp32 (in web/)"
         )
     async with MockOssmServer(dist_dir=FRONTEND_DIST) as base_url:
         print(f"============================================================")
@@ -852,7 +577,7 @@ async def _run_ble_tests():
         assert "bpm" in config, f"Config missing bpm: {config}"
         assert "position" in state, f"State missing position: {state}"
         print(f"✓ Config: bpm={config.get('bpm')}, depth={config.get('depth')}, paused={config.get('paused')}")
-        print(f"✓ State: position={state.get('position')}, ups={state.get('ups')}")
+        print(f"✓ State: position={state.get('position')}, ups={(state.get('loop_stats') or {}).get('ups')}")
 
         print(f"\n[BLE Step 3] Testing JSON-RPC over BLE (ping)...")
         ping_res = await backend.send_rpc("ping", rpc_id=10)
@@ -984,6 +709,8 @@ async def test_flasher(headless_override: bool = False):
     print(f"  OSSM Web Flasher Playwright E2E Verification Suite")
     print(f"============================================================")
 
+    load_dotenv(ENV_PATH)
+
     flasher_path = Path(__file__).parent.parent / "release" / "flasher.html"
     if not flasher_path.exists():
         print(f"Skipping flasher E2E test: {flasher_path} not found")
@@ -1036,6 +763,22 @@ async def test_flasher(headless_override: bool = False):
         assert await ssid_input.count() == 0, "Expected SSID input to be hidden when WiFi disabled"
         print("✓ WiFi SSID & Password inputs hidden when Enable WiFi is unchecked")
 
+        print(" -> Re-enabling WiFi and filling .env GPIO/SSID...")
+        await wifi_chk.check()
+        ssid = os.getenv("WIFI_SSID", "").strip().strip('"') or "LoudNet-2.4G"
+        password = os.getenv("WIFI_PASSWORD", "").strip().strip('"')
+        tx = int((os.getenv("MODBUS_TX", "2") or "2").strip().strip('"'))
+        rx = int((os.getenv("MODBUS_RX", "1") or "1").strip().strip('"'))
+        dere = int((os.getenv("MODBUS_DERE", "0") or "0").strip().strip('"'))
+        await ssid_input.wait_for(state="visible", timeout=5000)
+        await ssid_input.fill(ssid)
+        await page.locator('input[type="password"]').fill(password)
+        gpio = page.locator('input[type="number"]')
+        await gpio.nth(0).fill(str(tx))
+        await gpio.nth(1).fill(str(rx))
+        await gpio.nth(2).fill(str(dere))
+        print(f"    ssid={ssid!r} pins={tx}/{rx}/{dere}")
+
 
         # Now test the real device connection and config write
         print(" -> Testing real serial connection and config write...")
@@ -1083,7 +826,7 @@ async def test_flasher(headless_override: bool = False):
 
         term_log = page.locator("#flasher-terminal")
         try:
-            await expect(page.get_by_text("Configuration complete")).to_be_visible(timeout=60000)
+            await expect(page.get_by_text("Configuration complete", exact=True)).to_be_visible(timeout=60000)
             await expect(send_config_btn).to_have_text("Send Configuration", timeout=5000)
         except Exception as e:
             log_text = await term_log.inner_text()
@@ -1106,6 +849,31 @@ async def test_flasher(headless_override: bool = False):
                 raise AssertionError(f"Config write log contains failure marker '{bad}':\n{log_text}")
 
         print("✓ Flasher correctly wrote the configuration to the real device")
+
+        ip = os.getenv("DEVICE_IP", "").strip().strip('"')
+        deadline = time.monotonic() + 45.0
+        last: dict | None = None
+        while time.monotonic() < deadline:
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    r = await client.get(f"http://{ip}/shell-config")
+                    if r.status_code == 200:
+                        last = r.json()
+                        if (
+                            last.get("modbus_tx") == tx
+                            and last.get("modbus_rx") == rx
+                            and last.get("modbus_de_re") == dere
+                            and last.get("wifi_enabled") is True
+                        ):
+                            print(
+                                f"✓ GET /shell-config pins={tx}/{rx}/{dere} wifi_enabled=true"
+                            )
+                            break
+            except Exception as e:
+                last = {"err": str(e)}
+            await asyncio.sleep(1.0)
+        else:
+            raise AssertionError(f"shell-config mismatch after flasher write: {last}")
 
         await browser.close()
     print("✓ All Web Flasher E2E tests PASSED")
@@ -1172,49 +940,67 @@ async def test_motor_control():
     print("✓ All Motor-Control E2E tests PASSED")
 
 
-async def _soft_reset_device() -> None:
-    """Reset ESP via USB so BLE advertising restarts (clears stuck CONNECTIONS_MAX=1)."""
-    import subprocess
-
-    port = os.environ.get("DEVICE_PORT", "/dev/ttyACM0").strip().strip('"') or "/dev/ttyACM0"
-    print(f" -> Soft-resetting device on {port} so OSSM re-advertises...")
-    
-    # Send CLI reset command using python script subprocess
+async def _http_restart_for_ble() -> None:
+    """Restart via HTTP so BLE re-advertises without pulsing USB-Serial/JTAG DTR."""
+    ip = os.environ.get("DEVICE_IP", "").strip().strip('"')
+    if not ip:
+        print(" -> DEVICE_IP missing; skip HTTP restart")
+        return
+    print(f" -> HTTP POST /restart so OSSM re-advertises ({ip})...")
     try:
-        ossm_py = os.path.join(os.path.dirname(__file__), "ossm.py")
-        subprocess.run(
-            [sys.executable, ossm_py, "restart", "--mode", "serial"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        print("    (CLI restart successful)")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(f"http://{ip}/restart")
+        print("    (HTTP restart posted)")
     except Exception as e:
-        print(f"    (CLI reset failed: {e}, falling back to espflash board-info)")
-        subprocess.run(
-            ["espflash", "board-info", "--port", port],
-            check=False,
+        print(f"    (HTTP restart failed: {e})")
+    await asyncio.sleep(8.0)
+
+
+async def _cooldown_after_bleak() -> None:
+    """Let BlueZ drop the Bleak session before Chromium owns the adapter."""
+    try:
+        proc = subprocess.run(
+            ["bluetoothctl", "devices"],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=5,
+            check=False,
         )
-    
-    # Boot + BLE stack start can take several seconds (WiFi + trouble-host).
-    await asyncio.sleep(8.0)
+        for line in (proc.stdout or "").splitlines():
+            if "OSSM" not in line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                addr = parts[1]
+                subprocess.run(
+                    ["bluetoothctl", "disconnect", addr],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+                print(f" -> bluetoothctl disconnect {addr}")
+    except Exception as e:
+        print(f" -> bluetoothctl cooldown skipped: {e}")
+    await asyncio.sleep(3.0)
 
 
 async def _ossm_is_advertising(timeout_s: float = 6.0) -> bool:
     from bleak import BleakScanner
 
     try:
-        devices = await BleakScanner.discover(timeout=timeout_s, return_adv=True)
+        devices = await asyncio.wait_for(
+            BleakScanner.discover(timeout=timeout_s, return_adv=True),
+            timeout=timeout_s + 3.0,
+        )
         for dev, adv in devices.values():
             name = (dev.name or adv.local_name or "").strip()
             if "OSSM" in name:
                 return True
+    except TimeoutError:
+        print(" -> [BLE Scanner Note] Bleak discover timed out", flush=True)
     except Exception as e:
-        print(f" -> [BLE Scanner Note] Error during scan: {e}; retrying...")
+        print(f" -> [BLE Scanner Note] Error during scan: {e}; retrying...", flush=True)
         await asyncio.sleep(0.5)
     return False
 
@@ -1225,29 +1011,37 @@ async def _ensure_ossm_advertising(run_idx: int, total_runs: int) -> None:
 
     Do not call this while Playwright Chromium is open — BlueZ typically allows
     only one LE scanner and Bleak/Chrome will fight each other.
+    If Bleak hangs or finds nothing, restart once then let the chooser try anyway.
     """
-    deadline = time.monotonic() + 30.0
-    while time.monotonic() < deadline:
-        remaining = max(2.0, min(6.0, deadline - time.monotonic()))
-        if await _ossm_is_advertising(timeout_s=remaining):
-            return
-        await asyncio.sleep(0.5)
+    deadline = time.monotonic() + 20.0
+    try:
+        while time.monotonic() < deadline:
+            remaining = max(2.0, min(6.0, deadline - time.monotonic()))
+            if await asyncio.wait_for(
+                _ossm_is_advertising(timeout_s=remaining), timeout=remaining + 4.0
+            ):
+                return
+            await asyncio.sleep(0.5)
+    except TimeoutError:
+        print(
+            f" -> [Run {run_idx}/{total_runs}] Bleak advertise check hung",
+            flush=True,
+        )
 
     print(
-        f" -> [Run {run_idx}/{total_runs}] OSSM not advertising; "
-        "resetting peripheral before Web Bluetooth chooser"
+        f" -> [Run {run_idx}/{total_runs}] OSSM not advertising via Bleak; "
+        "HTTP /restart then Chromium chooser",
+        flush=True,
     )
-    await _soft_reset_device()
-
-    deadline = time.monotonic() + 45.0
-    while time.monotonic() < deadline:
-        remaining = max(2.0, min(6.0, deadline - time.monotonic()))
-        if await _ossm_is_advertising(timeout_s=remaining):
+    await _http_restart_for_ble()
+    try:
+        if await asyncio.wait_for(_ossm_is_advertising(timeout_s=6.0), timeout=10.0):
             return
-        await asyncio.sleep(0.5)
-
-    raise AssertionError(
-        f"[Run {run_idx}/{total_runs}] OSSM still not advertising after soft-reset"
+    except TimeoutError:
+        pass
+    print(
+        f" -> [Run {run_idx}/{total_runs}] skipping Bleak gate; Web Bluetooth chooser will scan",
+        flush=True,
     )
 
 
@@ -1274,7 +1068,9 @@ async def _run_single_web_bluetooth_attempt(
         await page.wait_for_function(
             """({ expected }) => {
                 const labels = Array.from(
-                    document.querySelectorAll('header span.text-sm.font-medium')
+                    document.querySelectorAll(
+                      '[data-testid="connection-status"], header span.text-xs.font-bold'
+                    )
                 );
                 return labels.some(
                     (el) => (el.textContent || '').trim() === expected
@@ -1375,8 +1171,14 @@ async def _run_single_web_bluetooth_attempt(
             status = await page.evaluate(
                 """() => ({
                   labels: Array.from(
-                    document.querySelectorAll('header span.text-sm.font-medium')
+                    document.querySelectorAll(
+                      '[data-testid="connection-status"], header span.text-xs.font-bold'
+                    )
                   ).map((el) => (el.textContent || '').trim()),
+                  connectionStatus: document.querySelector('[data-testid="connection-status"]')
+                    ?.textContent?.trim() || null,
+                  motorAlert: document.querySelector('#alert-motor-status')
+                    ?.textContent?.trim() || null,
                   errBanner: document.querySelector('div.mb-4.bg-red-500')
                     ?.textContent?.trim() || null,
                 })"""
@@ -1468,6 +1270,35 @@ async def test_web_bluetooth_frontend(runs: int = WEB_BLUETOOTH_STABILITY_RUNS):
     if runs < 1:
         raise AssertionError(f"Invalid runs={runs}; expected >= 1")
 
+    if not os.environ.get("DISPLAY") and os.environ.get("OSSM_XVFB_OK") != "1":
+        xvfb = shutil.which("xvfb-run")
+        if xvfb:
+            env = os.environ.copy()
+            env["OSSM_XVFB_OK"] = "1"
+            env["PYTHONUNBUFFERED"] = "1"
+            child_timeout = str(max(180, int(runs) * 90))
+            timeout_bin = shutil.which("timeout")
+            cmd = []
+            if timeout_bin:
+                cmd.extend([timeout_bin, child_timeout])
+            cmd.extend(
+                [
+                    xvfb,
+                    "-a",
+                    sys.executable,
+                    "-u",
+                    os.path.abspath(__file__),
+                    "--only-web-bluetooth",
+                    f"--web-bluetooth-runs={runs}",
+                ]
+            )
+            print(f" -> DISPLAY unset; re-exec under xvfb-run: {' '.join(cmd)}", flush=True)
+            rc = subprocess.call(cmd, env=env)
+            if rc != 0:
+                raise AssertionError(f"xvfb-run Web Bluetooth suite failed (rc={rc})")
+            return
+        print("[WARN] DISPLAY unset and xvfb-run not found; trying --headless=new")
+
     print(f"\n============================================================")
     print(f"  OSSM Web Bluetooth E2E Verification Suite (Playwright + CDP)")
     print(f"============================================================")
@@ -1476,9 +1307,9 @@ async def test_web_bluetooth_frontend(runs: int = WEB_BLUETOOTH_STABILITY_RUNS):
     import socketserver
     import threading
 
-    dist_dir = Path(__file__).parent.parent / "frontend" / "dist"
+    dist_dir = Path(__file__).parent.parent / "web" / "apps" / "webui-esp32" / "dist"
     if not (dist_dir / "index.html").exists():
-        print("[WARN] frontend/dist/index.html not found, skipping Web Bluetooth test")
+        print("[WARN] web/apps/webui-esp32/dist/index.html not found, skipping Web Bluetooth test")
         return
 
     class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -1551,7 +1382,7 @@ async def test_web_bluetooth_frontend(runs: int = WEB_BLUETOOTH_STABILITY_RUNS):
                         )
                     finally:
                         await browser.close()
-                    await _soft_reset_device()
+                    await asyncio.sleep(WEB_BLUETOOTH_COOLDOWN_S)
                 assert last_exc is not None
                 raise last_exc
 
@@ -1598,7 +1429,12 @@ async def main():
     parser.add_argument(
         "--skip-ble",
         action="store_true",
-        help="Skip BLE and Web Bluetooth tests when running without a physical Bluetooth adapter on the host",
+        help="Skip native Bleak GATT tests (Playwright Web Bluetooth still runs unless --skip-web-bluetooth)",
+    )
+    parser.add_argument(
+        "--skip-web-bluetooth",
+        action="store_true",
+        help="Skip Playwright Web Bluetooth chooser/GATT E2E",
     )
     parser.add_argument(
         "--only-webserial-bridge",
@@ -1663,9 +1499,11 @@ async def main():
     base_url = load_device_url()
     await test_concurrent_http(base_url)
     if not args.skip_ble:
-        await test_ble_connection()
+        await _cooldown_after_bleak()
+        await asyncio.wait_for(test_ble_connection(), timeout=90.0)
+        await _cooldown_after_bleak()
     await test_frontend(base_url)
-    if not args.skip_ble:
+    if not args.skip_web_bluetooth:
         await test_web_bluetooth_frontend(runs=args.web_bluetooth_runs)
     if not args.skip_flasher:
         await test_flasher()

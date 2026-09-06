@@ -147,6 +147,7 @@ pub fn set_usb_mux_pipe(pipe: bool) {
         pipe_clear(&PIPE_HOST);
         pipe_clear(&PIPE_BUS);
         while IN_CH.try_receive().is_ok() {}
+        crate::rs485::reset_host_magic_matcher();
     } else {
         USB_MUX.store(USB_MUX_CLI, Ordering::Release);
         pipe_clear(&PIPE_HOST);
@@ -158,8 +159,20 @@ pub fn pipe_push_host(data: &[u8]) {
     if data.is_empty() {
         return;
     }
-    pipe_push(&PIPE_HOST, data);
-    HOST_PIPE_SIG.signal(());
+    let mut filtered = [0u8; 80];
+    let mut off = 0usize;
+    while off < data.len() {
+        let chunk = &data[off..data.len().min(off + filtered.len())];
+        let (n, hit) = crate::rs485::filter_host_pipe(chunk, &mut filtered);
+        if n > 0 {
+            pipe_push(&PIPE_HOST, &filtered[..n]);
+            HOST_PIPE_SIG.signal(());
+        }
+        if hit {
+            crate::uart_owner::request_restart();
+        }
+        off += chunk.len();
+    }
 }
 
 pub fn pipe_pop_host(dst: &mut [u8]) -> usize {

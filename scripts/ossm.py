@@ -1,20 +1,7 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "bleak>=0.21.0",
-#     "websockets>=12.0",
-#     "httpx2>=0.1.0",
-#     "pyserial>=3.5",
-#     "typer>=0.12.0",
-#     "rich>=13.7.0",
-#     "python-dotenv>=1.0.0",
-#     "pydantic>=2.0.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """
 OSSM Dual-Mode (WiFi / BLE / Serial) Control CLI Tool
-A self-contained uv single-file script to monitor and control the Open Source Sex Machine.
+Uses the repository uv project (pyproject.toml) to monitor and control the Open Source Sex Machine.
 """
 
 import asyncio
@@ -171,7 +158,7 @@ class StateResponse(BaseModel):
     speed: float = 0.0
     stream: StreamStatus
     motor_connected: bool = True
-    modbus_stats: Optional[dict] = None
+    link_stats: Optional[dict] = None
 
 
 class StatusResponse(BaseModel):
@@ -183,7 +170,7 @@ class StatusResponse(BaseModel):
 
 
 class PinConfiguration(BaseModel):
-    """RS-485 Modbus GPIO pin configuration payload (/pin-config or CHAR_PIN_CONFIG)."""
+    """GPIO/UART/BLE slice of ShellConfig (GET /shell-config or CHAR_PIN_CONFIG)."""
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     modbus_tx: int = 18
@@ -200,7 +187,7 @@ class PinConfiguration(BaseModel):
 
 
 class NetworkConfiguration(BaseModel):
-    """WiFi, DHCP, static IP, and mDNS configuration payload (/network-config or CHAR_NETWORK_CONFIG)."""
+    """WiFi/mDNS slice of ShellConfig (GET /shell-config or CHAR_NETWORK_CONFIG)."""
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     hostname: str = "ossm"
@@ -305,19 +292,73 @@ class DeviceBackend:
 
     async def _get_http_client(self) -> httpx2.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx2.AsyncClient(timeout=4.0)
+            self._http_client = httpx2.AsyncClient(timeout=8.0)
         return self._http_client
 
     # --- Serial Helpers ---
     DEFAULT_SERIAL_COMMAND_TIMEOUT = 10
 
+    def _open_acm(self, *, timeout: float = 0.2, write_timeout: float = 1.0):
+        """Open CDC ACM with DTR/RTS held low.
+
+        Linux `cdc-acm` still asserts DTR+RTS inside `acm_port_activate` before
+        userspace ioctls run, so the first open of ESP32 USB-Serial/JTAG can
+        pulse `USB_UART_HPSYS` (`rst:0x15`). That cannot be prevented without a
+        kernel change; firmware must keep chip-reset enabled for esptool.
+
+        After that pulse we wait for `[console] ready` and keep the fd open so
+        later CLI commands do not reset again. Clearing `HUPCL` avoids a second
+        reset when this process closes the port.
+        """
+        s = serial.Serial()
+        s.port = self.port
+        s.baudrate = self.baud
+        s.timeout = timeout
+        s.write_timeout = write_timeout
+        s.dsrdtr = False
+        s.rtscts = False
+        s.dtr = False
+        s.rts = False
+        s.open()
+        s.dtr = False
+        s.rts = False
+        try:
+            import termios
+
+            attrs = termios.tcgetattr(s.fd)
+            attrs[2] &= ~termios.HUPCL
+            termios.tcsetattr(s.fd, termios.TCSANOW, attrs)
+        except Exception:
+            pass
+        return s
+
+    def _wait_console_ready(self, s, timeout: float = 8.0) -> str:
+        """If this open reset the chip, wait until the CLI is back.
+
+        Returns bytes already consumed so callers can still parse boot logs
+        (WiFi IP) that arrived during the wait.
+        """
+        deadline = time.time() + timeout
+        buf = ""
+        saw_boot = False
+        idle_deadline = time.time() + 0.35
+        while time.time() < deadline:
+            n = getattr(s, "in_waiting", 0) or 0
+            if n:
+                buf += s.read(n).decode("utf-8", errors="replace")
+                if "ESP-ROM" in buf or "USB_UART_HPSYS" in buf or "2nd stage bootloader" in buf:
+                    saw_boot = True
+                if "[console] ready" in buf:
+                    return buf
+            elif not saw_boot and time.time() >= idle_deadline:
+                return buf
+            time.sleep(0.04)
+        return buf
+
     def _get_serial(self):
         if not hasattr(self, "_s") or self._s is None or not self._s.is_open:
-            self._s = serial.Serial(
-                self.port, self.baud, timeout=0.2, write_timeout=1.0
-            )
-            self._s.dtr = True
-            self._s.rts = False
+            self._s = self._open_acm()
+            self._serial_tail = self._wait_console_ready(self._s)
         return self._s
 
     async def _serial_command(
@@ -365,15 +406,20 @@ class DeviceBackend:
                         await asyncio.sleep(0.01)
                 return lines
             except Exception as e:
+                if attempt == 0:
+                    # Keep the fd: close() is another DTR edge on USB-Serial/JTAG.
+                    if hasattr(self, "_s") and self._s is not None and self._s.is_open:
+                        self._serial_tail = self._wait_console_ready(self._s)
+                    else:
+                        self._s = None
+                    await asyncio.sleep(0.2)
+                    continue
                 if hasattr(self, "_s") and self._s is not None:
                     try:
                         self._s.close()
                     except Exception:
                         pass
                     self._s = None
-                if attempt == 0:
-                    await asyncio.sleep(0.3)
-                    continue
                 console.print(
                     f"[bold red]Serial Error:[/bold red] Could not send command '{cmd}' to {self.port}: {e}"
                 )
@@ -395,8 +441,11 @@ class DeviceBackend:
             or not self._ble_device
         ):
             console.print("[dim]Scanning for advertising OSSM BLE device...[/dim]")
-            device = await BleakScanner.find_device_by_filter(
-                lambda d, adv: "OSSM" in (d.name or adv.local_name or ""), timeout=12.0
+            device = await asyncio.wait_for(
+                BleakScanner.find_device_by_filter(
+                    lambda d, adv: "OSSM" in (d.name or adv.local_name or ""), timeout=12.0
+                ),
+                timeout=15.0,
             )
             if not device:
                 console.print(
@@ -419,9 +468,12 @@ class DeviceBackend:
                     )
                     self._ble_device = None
                     self.ble_addr = None
-                    device = await BleakScanner.find_device_by_filter(
-                        lambda d, adv: "OSSM" in (d.name or adv.local_name or ""),
-                        timeout=10.0,
+                    device = await asyncio.wait_for(
+                        BleakScanner.find_device_by_filter(
+                            lambda d, adv: "OSSM" in (d.name or adv.local_name or ""),
+                            timeout=10.0,
+                        ),
+                        timeout=13.0,
                     )
                     if not device:
                         raise RuntimeError("OSSM BLE advertisement not found")
@@ -429,7 +481,7 @@ class DeviceBackend:
                     self.ble_addr = device.address
                 target = self._ble_device
                 client = BleakClient(target, timeout=20.0)
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=25.0)
                 # Tiny settle so GATT discovery finishes before first read.
                 await asyncio.sleep(0.25)
                 self._ble_client = client
@@ -627,14 +679,14 @@ class DeviceBackend:
     async def get_pin_config(self) -> dict:
         if self.mode == "wifi":
             client = await self._get_http_client()
-            res = await client.get(f"http://{self.ip}/pin-config")
+            res = await client.get(f"http://{self.ip}/shell-config")
             return res.json()
         elif self.mode == "ble":
             client = await self._get_ble_client()
             raw = await client.read_gatt_char(BleUUID.CHAR_PIN_CONFIG)
             return json.loads(raw.decode("utf-8"))
         elif self.mode == "serial":
-            lines = await self._serial_command("get pin")
+            lines = await self._serial_command("get shell")
             text = "\n".join(lines)
             if "{" in text and "}" in text:
                 try:
@@ -647,7 +699,9 @@ class DeviceBackend:
     async def set_pin_config(self, pin_dict: dict) -> dict:
         if self.mode == "wifi":
             client = await self._get_http_client()
-            res = await client.post(f"http://{self.ip}/pin-config", json=pin_dict)
+            cur = await self.get_pin_config()
+            cur.update(pin_dict)
+            res = await client.post(f"http://{self.ip}/shell-config", json=cur)
             return res.json()
         elif self.mode == "ble":
             client = await self._get_ble_client()
@@ -695,7 +749,7 @@ class DeviceBackend:
     async def get_network_config(self) -> dict:
         if self.mode == "wifi":
             client = await self._get_http_client()
-            res = await client.get(f"http://{self.ip}/network-config")
+            res = await client.get(f"http://{self.ip}/shell-config")
             return res.json()
         elif self.mode == "ble":
             client = await self._get_ble_client()
@@ -715,7 +769,9 @@ class DeviceBackend:
     async def set_network_config(self, net_dict: dict) -> dict:
         if self.mode == "wifi":
             client = await self._get_http_client()
-            res = await client.post(f"http://{self.ip}/network-config", json=net_dict)
+            cur = await self.get_network_config()
+            cur.update(net_dict)
+            res = await client.post(f"http://{self.ip}/shell-config", json=cur)
             return res.json()
         elif self.mode == "ble":
             client = await self._get_ble_client()
@@ -770,11 +826,19 @@ class DeviceBackend:
             self._ble_client = None
         elif self.mode == "serial":
             await self._serial_command("reset", wait_response=False)
+            if hasattr(self, "_s") and self._s is not None:
+                try:
+                    self._s.close()
+                except Exception:
+                    pass
+                self._s = None
 
     def ws_connect(self):
         import websockets
 
-        return websockets.connect(f"ws://{self.ip}/ws/command", ping_interval=None)
+        return websockets.connect(
+            f"ws://{self.ip}/ws/command", ping_interval=None, ping_timeout=None
+        )
 
     async def send_rpc(
         self, method: str, params: Optional[Any] = None, rpc_id: int = 1
@@ -786,7 +850,7 @@ class DeviceBackend:
             import websockets
 
             async with websockets.connect(
-                f"ws://{self.ip}/ws/command", ping_interval=None
+                f"ws://{self.ip}/ws/command", ping_interval=None, ping_timeout=None
             ) as ws:
                 await ws.send(json.dumps(cmd))
                 msg = await ws.recv()
@@ -864,29 +928,36 @@ class DeviceBackend:
         import re
 
         start_time = time.time()
-        buffer = ""
+        buffer = getattr(self, "_serial_tail", "") or ""
+        self._serial_tail = ""
         try:
-            with serial.Serial(
-                self.port, self.baud, timeout=0.1, write_timeout=1.0
-            ) as s:
-                while time.time() - start_time < timeout:
-                    if s.in_waiting:
-                        chunk = s.read(s.in_waiting).decode("utf-8", errors="replace")
-                        buffer += chunk
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
-                            if line:
-                                print(f"  {line}")
-                                ip_match = re.search(
-                                    r"(?:sta ip:|got ip:|ip:\s*)([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})",
-                                    line,
-                                    re.IGNORECASE,
-                                )
-                                if ip_match:
-                                    return ip_match.group(1)
-                    else:
-                        await asyncio.sleep(0.05)
+            while time.time() - start_time < timeout:
+                try:
+                    s = self._get_serial()
+                    s.timeout = 0.1
+                    if getattr(self, "_serial_tail", ""):
+                        buffer += self._serial_tail
+                        self._serial_tail = ""
+                except Exception:
+                    await asyncio.sleep(0.2)
+                    continue
+                if s.in_waiting:
+                    chunk = s.read(s.in_waiting).decode("utf-8", errors="replace")
+                    buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        print(f"  {line}")
+                        ip_match = re.search(
+                            r"(?:sta ip:|got ip:|ip:\s*)([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})",
+                            line,
+                            re.IGNORECASE,
+                        )
+                        if ip_match:
+                            return ip_match.group(1)
+                if not s.in_waiting:
+                    await asyncio.sleep(0.05)
         except Exception as e:
             console.print(
                 f"[bold red]Serial Error:[/bold red] Could not monitor for IP: {e}"
@@ -897,15 +968,14 @@ class DeviceBackend:
         if self.mode != "serial":
             return
         try:
-            with serial.Serial(
-                self.port, self.baud, timeout=0.1, write_timeout=1.0
-            ) as s:
-                start_time = time.time()
-                while timeout is None or time.time() - start_time < timeout:
-                    if s.in_waiting:
-                        chunk = s.read(s.in_waiting).decode("utf-8", errors="replace")
-                        print(chunk, end="", flush=True)
-                    await asyncio.sleep(0.05)
+            s = self._get_serial()
+            s.timeout = 0.1
+            start_time = time.time()
+            while timeout is None or time.time() - start_time < timeout:
+                if s.in_waiting:
+                    chunk = s.read(s.in_waiting).decode("utf-8", errors="replace")
+                    print(chunk, end="", flush=True)
+                await asyncio.sleep(0.05)
         except KeyboardInterrupt:
             print("\nExiting monitor mode.")
         except Exception as e:
@@ -1002,12 +1072,13 @@ def status(
             else "[bold red]NO[/bold red]"
         ),
     )
-    if "modbus_stats" in state and state["modbus_stats"]:
-        mst = state["modbus_stats"]
+    if "link_stats" in state and state["link_stats"]:
+        mst = state["link_stats"]
         sr = mst.get("success_rate", 0.0)
+        ok = mst.get("exchanges", 0) - mst.get("failures", 0)
         table.add_row(
             "Modbus Success Rate",
-            f"{sr:.1f}% ({mst.get('successful_requests', 0)} ok / {mst.get('failed_requests', 0)} fail)",
+            f"{sr:.1f}% ({ok} ok / {mst.get('failures', 0)} fail)",
         )
     table.add_row("BPM (Speed)", f"{config.get('bpm', 0.0):.1f}")
     table.add_row("Stroke Depth", f"{config.get('depth', 0.0) * 100.0:.1f}%")
@@ -1321,8 +1392,8 @@ def monitor(
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
                             data = json.loads(msg)
-                            if "state" in data or "result" in data:
-                                st = data.get("state") or (
+                            if data.get("method") == "state" or "result" in data:
+                                st = data.get("params") or data.get("state") or (
                                     data.get("result")
                                     if isinstance(data.get("result"), dict)
                                     else {}

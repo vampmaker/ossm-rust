@@ -1,6 +1,3 @@
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-
 use crate::config::MotorControllerConfig;
 
 pub(crate) trait WaveformGenerator: Send {
@@ -10,7 +7,7 @@ pub(crate) trait WaveformGenerator: Send {
     fn find_x_for_y(&self, y: f32) -> f32;
 }
 
-struct SineWaveform;
+pub(crate) struct SineWaveform;
 
 impl WaveformGenerator for SineWaveform {
     fn evaluate(&self, time_offset_seconds: f32, bpm: f32) -> (f32, f32) {
@@ -44,7 +41,7 @@ impl WaveformGenerator for SineWaveform {
     }
 }
 
-struct ThrustWaveform {
+pub(crate) struct ThrustWaveform {
     sharpness: f32,
 }
 
@@ -125,14 +122,23 @@ impl WaveformGenerator for ThrustWaveform {
     }
 }
 
-struct SplineWaveform {
-    points: Vec<f32>,
-    tangents: Vec<f32>,
+pub(crate) struct SplineWaveform {
+    points: [f32; crate::config::SPLINE_POINTS_CAP],
+    tangents: [f32; crate::config::SPLINE_POINTS_CAP],
+    len: u8,
     min_pos: f32,
     inv_range: f32,
 }
 
 impl SplineWaveform {
+    fn points_slice(&self) -> &[f32] {
+        &self.points[..self.len as usize]
+    }
+
+    fn tangents_slice(&self) -> &[f32] {
+        &self.tangents[..self.len as usize]
+    }
+
     fn eval_raw(points: &[f32], tangents: &[f32], x: f32) -> (f32, f32) {
         let num_points = points.len();
         if num_points == 0 {
@@ -188,42 +194,44 @@ impl SplineWaveform {
         (pos, dy_dx)
     }
 
-    fn from_points(points: &[f32]) -> Self {
-        let num_points = points.len();
-
-        if num_points == 0 {
+    fn from_points(src: &[f32]) -> Self {
+        let cap = crate::config::SPLINE_POINTS_CAP;
+        let mut points = [0.0f32; crate::config::SPLINE_POINTS_CAP];
+        if src.is_empty() {
+            points[0] = 0.5;
             return Self {
-                points: alloc::vec![0.5],
-                tangents: alloc::vec![0.0],
+                points,
+                tangents: [0.0; crate::config::SPLINE_POINTS_CAP],
+                len: 1,
                 min_pos: 0.5,
                 inv_range: 0.0,
             };
         }
-        if num_points == 1 {
+        let n = src.len().min(cap);
+        points[..n].copy_from_slice(&src[..n]);
+        if n == 1 {
             return Self {
-                points: alloc::vec![points[0]],
-                tangents: alloc::vec![0.0],
+                points,
+                tangents: [0.0; crate::config::SPLINE_POINTS_CAP],
+                len: 1,
                 min_pos: points[0],
                 inv_range: 0.0,
             };
         }
 
-        // Use Catmull-Rom splines to calculate tangents for cubic Hermite interpolation
-        let mut tangents = alloc::vec::Vec::with_capacity(num_points);
-        for i in 0..num_points {
-            let p_prev = points[(i + num_points - 1) % num_points];
-            let p_next = points[(i + 1) % num_points];
-            // Tangent dy/dx at point i
-            tangents.push((p_next - p_prev) * num_points as f32 / 2.0);
+        let mut tangents = [0.0f32; crate::config::SPLINE_POINTS_CAP];
+        for i in 0..n {
+            let p_prev = src[(i + n - 1) % n];
+            let p_next = src[(i + 1) % n];
+            tangents[i] = (p_next - p_prev) * n as f32 / 2.0;
         }
 
-        // Find min and max positions over the spline to normalize to [0, 1]
         let mut min_pos = f32::MAX;
         let mut max_pos = f32::MIN;
-        let num_samples = (num_points * 20).max(100);
+        let num_samples = (n * 20).max(100);
         for i in 0..=num_samples {
             let x = (i as f32 / num_samples as f32).min(0.999999);
-            let (pos, _) = Self::eval_raw(points, &tangents, x);
+            let (pos, _) = Self::eval_raw(&points[..n], &tangents[..n], x);
             if pos < min_pos {
                 min_pos = pos;
             }
@@ -240,8 +248,9 @@ impl SplineWaveform {
         };
 
         Self {
-            points: points.to_vec(),
+            points,
             tangents,
+            len: n as u8,
             min_pos,
             inv_range,
         }
@@ -254,7 +263,7 @@ impl WaveformGenerator for SplineWaveform {
         let cycles = time_offset_seconds * freq;
         let x = cycles % 1.0;
 
-        let (raw_pos, raw_dy_dx) = Self::eval_raw(&self.points, &self.tangents, x);
+        let (raw_pos, raw_dy_dx) = Self::eval_raw(self.points_slice(), self.tangents_slice(), x);
 
         let pos = if self.inv_range > 0.0 {
             (raw_pos - self.min_pos) * self.inv_range
@@ -290,14 +299,39 @@ impl WaveformGenerator for SplineWaveform {
     }
 }
 
-pub(crate) fn create_waveform_generator(
-    config: &MotorControllerConfig,
-) -> Box<dyn WaveformGenerator> {
-    match config.wave_func.as_str() {
-        "sine" => Box::new(SineWaveform),
-        "thrust" => Box::new(ThrustWaveform::new(config.sharpness)),
-        "spline" => Box::new(SplineWaveform::from_points(&config.spline_points)),
-        _ => Box::new(SineWaveform),
+pub(crate) enum WaveformKind {
+    Sine(SineWaveform),
+    Thrust(ThrustWaveform),
+    Spline(SplineWaveform),
+}
+
+impl WaveformKind {
+    pub(crate) fn evaluate(&self, time_offset_seconds: f32, bpm: f32) -> (f32, f32) {
+        match self {
+            Self::Sine(w) => w.evaluate(time_offset_seconds, bpm),
+            Self::Thrust(w) => w.evaluate(time_offset_seconds, bpm),
+            Self::Spline(w) => w.evaluate(time_offset_seconds, bpm),
+        }
+    }
+
+    pub(crate) fn find_x_for_y(&self, y: f32) -> f32 {
+        match self {
+            Self::Sine(w) => w.find_x_for_y(y),
+            Self::Thrust(w) => w.find_x_for_y(y),
+            Self::Spline(w) => w.find_x_for_y(y),
+        }
+    }
+}
+
+pub(crate) fn create_waveform_generator(config: &MotorControllerConfig) -> WaveformKind {
+    match config.wave_func {
+        crate::config::WaveFunc::Sine => WaveformKind::Sine(SineWaveform),
+        crate::config::WaveFunc::Thrust => {
+            WaveformKind::Thrust(ThrustWaveform::new(config.sharpness))
+        }
+        crate::config::WaveFunc::Spline => {
+            WaveformKind::Spline(SplineWaveform::from_points(config.spline_points.as_slice()))
+        }
     }
 }
 

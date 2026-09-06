@@ -2,20 +2,24 @@
 
 Architectural overview, crate intents, and operational rules for agents working on this repository.
 
-**OSSM Rust** drives an Open Source Sex Machine (OSSM) servo (typically 57AIM30 over RS-485 Modbus RTU) from two shells around one domain crate:
+**OSSM Rust** drives an Open Source Sex Machine (OSSM) servo (typically 57AIM30 over RS-485 Modbus RTU) from shells around one domain crate and a shared common leaf:
 
 - **`ossm-core`** — portable domain (motion + RTU math + motion RPC/CLI)
+- **`ossm-common`** — telemetry windows + BBR-style link PLL (`LoopStats`, `LinkStats`, `Pll`)
 - **`ossm-esp32`** — ESP32-C6 / ESP32-S3 device shell (`esp-hal` + Embassy)
-- **`ossm-std`** — Linux desktop shell (tokio + axum)
+- **`ossm-std`** — Linux / Termux desktop shell (tokio + axum)
+- **`ossm-wasm`** — browser shell (page thread + Web Serial / `/ws/rs485`)
 
 If a crate cannot be stated in one paragraph of intent plus a short invariant list, it is mis-scoped and should be split or emptied — not given a vaguer name.
 
 ```
-shell (esp32 | std) owns: clock, UART/serial, HTTP/BLE/CLI, flash/FS
+shell (esp32 | std | wasm) owns: clock, UART/serial, HTTP/BLE/CLI, flash/FS, loop/link stats windows
         │  sync calls, no .await in core
         ▼
 ossm-core  Engine::apply / tick(now) / snapshot
            CRC / find_modbus_response / aim30
+        ▲
+ossm-common  LoopStatsWindow / LinkStatsWindow / Pll (no clock — caller supplies micros)
 ```
 
 ---
@@ -34,7 +38,7 @@ A file belongs in a crate only if it serves that crate's intent. The tables belo
 - No `std`, Embassy, tokio, or `esp-hal`. Caller supplies `Micros`.
 - `Engine { motion }` only (`Engine::new(motor)`). `apply` returns `()` — persistence is a shell concern.
 - Default `paused: true`. Sole config write path bumps `version`. Stale `version` → `CoreError::StaleVersion`.
-- `tick` clamps step `dt` to **12 ms**.
+- `tick` clamps step `dt` to **12 ms** (motion only — no telemetry aggregation in core).
 - JSON-RPC (`RpcRequest`) covers motion methods. `RpcAction::{Subscribe, Unsubscribe, Restart}` are **sentinels** for the shell, not side effects inside core.
 - CLI `paths` / `get` / `set` are **motor** only.
 - Modbus: CRC, `find_modbus_response`, `classify_*`, `aim30` pack/unpack. No inject knobs, no UART timing.
@@ -46,9 +50,9 @@ A file belongs in a crate only if it serves that crate's intent. The tables belo
 | `lib.rs` | `no_std` + `alloc` root; re-exports |
 | `engine.rs` | Facade: `apply` / `tick` / `try_set_config` / `CycleOutput` |
 | `command.rs` | `Command` wraps `MotionCommand` + pause/homing/telemetry pokes |
-| `config.rs` | `MotorControllerConfig` only |
+| `config.rs` | `MotorControllerConfig` (`WaveFunc` enum, `SplinePoints` fixed buffer, `Copy`) |
 | `motion/` | Waveform, shaper, stream source, `MotorController` |
-| `state.rs` | `StateResponse` schema (includes `modbus_stats` fields shells fill) |
+| `state.rs` | `StateResponse` schema (`loop_stats` / `link_stats` from `ossm-common`; shells fill via `SetLoopStats` / `SetLinkStats`) |
 | `time.rs` | `Micros` |
 | `error.rs` | `StaleVersion`, `InvalidConfig` |
 | `rpc.rs` / `rpc_types.rs` | Sync dispatcher + wire types (`RpcRequest`; `cmd` / `method` alias) |
@@ -57,11 +61,23 @@ A file belongs in a crate only if it serves that crate's intent. The tables belo
 | `modbus/aim30.rs` | 57AIM30 position + homing register literals |
 | `engine_tests.rs` / `rpc_tests.rs` | Host unit tests (`#[cfg(test)]`) |
 
-`log` is used only for motion diagnostics (`controller` / `source`). `SetModbusStats` / `SetMotorConnected` are domain telemetry updates, not hardware drivers.
+`log` is used only for motion diagnostics (`controller` / `source`). `SetLoopStats` / `SetLinkStats` / `SetMotorConnected` are domain telemetry snapshot writes, not hardware drivers.
 
-**Do not put in core:** GPIO, WiFi, BLE, inject, `operating_mode`, chip/process reset, DMA buffers.
+**Do not put in core:** GPIO, WiFi, BLE, inject, `operating_mode`, chip/process reset, DMA buffers, loop/link stat windows.
 
-### 1.2 `ossm-esp32` — ESP32 device shell
+### 1.2 `ossm-common` — telemetry + link pacing
+
+**Intent:** Leaf `no_std` + `alloc` crate. Owns `LoopStatsWindow`, `LinkStatsWindow`, percentile math, serde wire structs (`LoopStats`, `LinkStats`, `TimingWindowStats`), and the BBR-style `Pll` (probe-freq / probe-phase). No clock — every entry point takes caller-supplied micros.
+
+**Invariants**
+
+- No workspace crate dependencies; host-testable on stable (`cargo +stable test -p ossm-common`).
+- Not a workspace `default-member` (firmware default build stays `ossm-esp32`).
+- Shells call `record` / `poll` then `engine.apply(SetLoopStats(...))` and `engine.apply(SetLinkStats(...))` before `tick`.
+- `Pll` is sync. `next_wake` / `on_tx` / `on_ack` / `on_timeout` only. ProbeFreq is ACK-paced (max rate); ProbePhase snaps period to the link slot and hill-climbs TX delay to cut RTT. Re-probes on a 10 s interval, RTT inflation, or timeout share.
+- Firmware UART stays hardware-paced; `ossm-std` and `ossm-wasm` own the PLL.
+
+### 1.3 `ossm-esp32` — ESP32 device shell
 
 **Intent:** The microcontroller. Owns hardware, RF, flash, and transports. One motor *or* RTU-relay task exclusively owns UART1. HTTP/BLE/CLI never hold `&mut Engine`.
 
@@ -70,6 +86,7 @@ A file belongs in a crate only if it serves that crate's intent. The tables belo
 - Heap **96 KiB**. Snapshot publish is in-place `Arc` (`copy_from` / `make_mut`). Never `Arc::new` every motor cycle.
 - Boot: `esp_hal::init` → heap → `esp_rtos::start` → `console::init_logger` → `console_task` → CLI / UART1 owner / storage → WiFi/HTTP (`HTTP_READY`) → BLE.
 - `servo` vs `rtu_relay` vs `rs485` is exclusive (same UART1). Roles switch at runtime via a stoppable UART1 owner (no reboot). Live switch **into** `servo` always re-homes (`run_motor` → travel homing); no cached `pos_min`/`pos_max`.
+- USB/`/ws/rs485` magic-exit `F0 0F 4F 53 53 4D 1B 71` (`rs485::EXIT_MAGIC`) leaves transceiver mode without WiFi: firmware ACKs `shell.operating_mode set to servo` and re-homes.
 - C6: motor on `InterruptExecutor`. S3: motor on Core 1. Observed `dt_max_ms` **< 4.5** under HTTP+WS.
 - Pin/net types and NVS live in `storage.rs`. RAM inject lives in `modbus_rtu.rs`.
 - Soft-reset only for explicit `restart` / CLI `reset`. BLE runner failure must recover in-process.
@@ -79,13 +96,13 @@ A file belongs in a crate only if it serves that crate's intent. The tables belo
 
 | File | Role |
 | --- | --- |
-| `main.rs` | Init, heap, task spawn, boot branch; `nvs_saver_task` (2 s motor persist debounce) |
+| `main.rs` | Init, heap, task spawn, boot branch; S3 Core-1 stack in `.dram2_uninit`; `nvs_saver_task` (2 s motor persist debounce) |
 | `context.rs` | `AppContext` handles (queue + snapshot + storage) — not one big mutex; `storage_task` is the sole flash I/O actor |
 | `motion.rs` | Firmware SPSC aliases (`MotionCommand`, capacity 3) — not motion math |
 | `motor.rs` | `Motor` trait |
 | `motor_57aim30.rs` | UHCI GDMA master, homing, stoppable motor loop |
 | `uart_owner.rs` | UART1 supervisor: servo / rtu_relay / rs485 until stop, then re-init |
-| `rs485.rs` | Raw UART1 + DE/RE pipe; USB mux + `/ws/rs485` TX/RX/CFG |
+| `rs485.rs` | Raw UART1 + DE/RE pipe; USB mux + `/ws/rs485` TX/RX/CFG; `EXIT_MAGIC` |
 | `modbus_relay.rs` | RTU ↔ TCP `:502` + `/ws/modbus` |
 | `modbus_rtu.rs` | Re-export core CRC/find/aim30; own inject atomics |
 | `storage.rs` | NVS + `PinConfiguration` + `NetworkConfiguration` |
@@ -101,49 +118,79 @@ A file belongs in a crate only if it serves that crate's intent. The tables belo
 
 Two RPC dispatchers is deliberate: core is sync (`&mut Engine`); firmware cannot await the motor task, so `rpc.rs` enqueues `MotionCommand`.
 
-### 1.3 `ossm-std` — Linux desktop shell
+### 1.4 `ossm-std` — Linux desktop / Termux shell
 
-**Intent:** The same `Engine` on a PC. Host USB-serial is the motor bus; `--bind` is the HTTP listen address. The process *is* the device.
+**Intent:** The same `Engine` on a PC or Termux phone. Host USB-serial (kernel tty or userspace USB-host) is the motor bus; `--bind` is the HTTP listen address. The process *is* the device.
 
 **Invariants**
 
-- CLI > env > defaults (`--serial` / `OSSM_SERIAL` / `DEVICE_PORT`, `--baud`, `--bind` default `127.0.0.1:8080`, `--mode servo|rtu-relay`, `--relay-tcp` / `--relay-ws` / `--rs485-ws`, `--modbus-bind` default `127.0.0.1:502`, `--config`, `--mock`).
-- Persist `{ motor }` JSON (temp + fsync + rename). Legacy `pin`/`net` keys ignored.
-- No BLE, GPIO, WiFi STA, `/pin-config`, `/network-config`, or `/modbus-inject`.
+- CLI > env > defaults (`--serial` / `OSSM_SERIAL` / `DEVICE_PORT`, `--baud`, `--bind` default `127.0.0.1:8080`, `--mode servo|rtu-relay|flash|console`, `--relay-tcp` / `--relay-ws` / `--rs485-ws`, `--modbus-bind` default `127.0.0.1:502`, `--config`, `--mock`). `--mode flash` / `--mode console` own the serial port exclusively (no Engine / HTTP).
+- Persist `{ motor, shell }` JSON (temp + fsync + rename). Legacy top-level `pin`/`net` keys ignored. CLI > env > file > defaults.
+- No BLE, GPIO, WiFi STA, `/pin-config`, `/network-config`, `/shell-config`, or `/modbus-inject`. Motor REST CORS is `*`. Bundled webui-std on `GET /` (`--static-dir` override).
 - Stdin REPL is motor + motion actions. `reset` exits the process; `quit` leaves REPL.
 - PC USB-serial cannot use RTU t1.5/t3.5; RX is an unbounded stream in `modbus_rx.rs` (header length + CRC, leftover kept). Homing uses core `aim30` literals.
 - `--serial` USB-RS485 requires **automatic direction control**. TX-loopback adapters and host-driven DE/RE are unsupported. The ESP32 `rs485` pipe already drives DE in firmware. ossm-std does not strip TX echoes (FC06 ACKs are a copy of the request).
+- `--serial termux-usb:/dev/bus/usb/…` re-execs `termux-usb` (keep the prefix in argv after `TERMUX_USB_FD`). Bare `/dev/bus/usb/…` is direct usbfs (no `termux-usb`). Motor path deasserts DTR/RTS. Do **not** enable `android-usb-serial` `serialport-compat` (pulls `libudev`, breaks musl zigbuild). `--mode flash` keeps DTR/RTS controllable for the USB-Serial-JTAG reset sequence. Workspace `[patch.crates-io] nusb` (`vendor/nusb`) skips USBDEVFS mmap after `EPERM` (Termux); upstream nusb warns on every zero-copy allocate.
 - Real `--serial` / relay bus always homes; `--mock` only uses a virtual `0..100` range. There is no `--no-homing`.
-- Motor TX is next-available (USB 1 ms poll wake, or immediately after the previous ACK on TCP/WS), not a 3 ms interval.
-- One bus owner: Engine (`--mode servo`) **or** RTU relay server (`--mode rtu-relay` serves `:502` + `/ws/modbus`). Never both on the same bus.
+- Motor TX is paced by `ossm_common::Pll` on every `ossm-std` bus (kernel tty, USB-host, TCP `:502`, `/ws/modbus`, `/ws/rs485`). Homing still uses blocking `exchange_rtu` (200 ms). Streaming CRC deadline is 12 ms on kernel tty and 6 ms on USB-host.
+- One bus owner: Engine (`--mode servo`) **or** RTU relay server (`--mode rtu-relay` serves `:502` + `/ws/modbus`) **or** `--mode flash` / `--mode console`. Never two of these on the same bus.
 
 **Files (all hold)**
 
 | File | Role |
 | --- | --- |
-| `main.rs` | Tokio runtime, spawn engine + HTTP + optional REPL |
+| `main.rs` | Tokio runtime; flash/console branch before engine; else spawn engine + HTTP + optional REPL |
+| `build.rs` | Embed `web/apps/webui-std/dist/index.html` |
 | `args.rs` | CLI / env / defaults |
-| `engine_task.rs` | Owns `Engine`; tick + homing + persist |
-| `http.rs` | axum `/config` `/state` `/paused` `/restart` `/ws/command` |
+| `engine_task.rs` | Owns `Engine`; tick + homing + persist; `ossm_common::Pll` wake |
+| `http.rs` | axum `/` (bundled webui-std) `/config` `/state` `/link-stats` `/paused` `/restart` `/ws/command`; CORS `*` |
 | `cli.rs` | Stdin REPL (`ossm_core::paths`) |
 | `persist.rs` | `{ motor }` atomic JSON |
-| `serial.rs` | tokio-serial FC03/06/16 + homing; DTR/RTS off |
-| `bus.rs` | Pluggable RTU bus: serial, TCP 502, `/ws/modbus`, `/ws/rs485` |
-| `relay_server.rs` | `--mode rtu-relay` Modbus TCP + `/ws/modbus` |
+| `serial.rs` | tokio-serial FC03/06/16 + homing; DTR/RTS off; USB-host writer |
+| `usb_host.rs` | `/dev/bus/usb/…` Termux `termux-usb` / Linux usbfs + `android-usb-serial` |
+| `flash_port.rs` | Raw serial trait for flash/console (tty + USB-host) |
+| `esptool/` | ROM-loader SLIP protocol (no stub); compressed write + MD5 |
+| `console_mode.rs` | UART CLI `--send` / `--until` / `--exit-rs485` / `--raw` |
+| `bus.rs` | Pluggable RTU bus: serial, TCP 502, `/ws/modbus`, `/ws/rs485`; records link RTT in `exchange_rtu` |
+| `link_stats.rs` | `SharedLinkStats` (`Arc<Mutex<LinkStatsWindow>>`) for HTTP `/link-stats` |
+| `relay_server.rs` | `--mode rtu-relay` Modbus TCP + `/ws/modbus` + `GET /link-stats` |
 | `modbus_rx.rs` | Host RX accumulator (stream parse) |
-| `usb_pll.rs` | f32 PID lock to host USB 1 ms poll phase for `--serial` |
 
 Scripts against desktop: `DEVICE_IP=127.0.0.1:8080`.
 
-### 1.4 Other packages (not Rust crates)
+### 1.5 `ossm-wasm` — browser shell
 
-- **`frontend/`** — Vue SPA gzip-embedded in firmware (`index.html.gz`).
-- **`flasher/`** — browser esptool (`release/flasher.html`).
-- **`motor-control/`** — YZ_AIM PC tool (`release/motor-control.html`); not embedded.
-- **`scripts/`** — `uv` PEP 723 tools (`ossm.py`, `setup_device.py`, live tests).
+**Intent:** The same `Engine` on the page thread. Owns clock (`performance.now`), Web Serial or `/ws/rs485` byte I/O, homing, and motor persist (IndexedDB). Vue talks only `OssmControl`; the UI does not see RTU frames.
+
+**Invariants**
+
+- Window / dedicated-page shell (not a PWA Service Worker). `requestPort()` stays on the page (user gesture); `SerialPort` is opened in-process.
+- Vue never holds `&mut Engine` and never sees RTU frames (`WasmClient` in `webui-wasm` owns `OssmShell`).
+- Real bus always homes; mock uses virtual `0..100`. DTR/RTS off before serial open.
+- Build with `cargo +stable --target wasm32-unknown-unknown`. Not a workspace `default-member`.
+
+**Files**
+
+| File | Role |
+| --- | --- |
+| `lib.rs` | Host-testable re-exports; wasm_bindgen gated on `wasm32` |
+| `shell.rs` | Engine owner: RPC, pause, tick, persist dirty flag, `Pll` |
+| `rtu.rs` | AIM30 frame build/parse + homing via JS `exchange` |
+| `wasm_api.rs` | `OssmShell` bindgen surface |
+
+### 1.5 Other packages (not Rust crates)
+
+- **`web/apps/webui-esp32`** — Vue SPA gzip-embedded in firmware (`index.html.gz`); WiFi/BLE/pin/net settings.
+- **`web/apps/webui-std`** — motion-only SPA compile-time-embedded in `ossm-std` (`GET /`).
+- **`web/apps/flasher`** — browser esptool (`release/flasher.html`).
+- **`web/apps/motor-control`** — YZ_AIM PC tool (`release/motor-control.html`); not embedded.
+- **`web/apps/webui-wasm`** — wasm harness (`release/ossm-wasm.html`); page-thread `WasmClient` owns Engine + RTU; not embedded.
+- **`web/packages/shared`** — `@ossm/shared` Vue components (`MotionWorkbench`), types, mapper, macro, i18n/vite helpers.
+- **`web/packages/client`** — `@ossm/client` WiFi/BLE control transports.
+- **`scripts/`** — `uv` project tools (`ossm.py`, `setup_device.py`, live tests including `test_wasm.py`). Root [`pyproject.toml`](pyproject.toml) / [`uv.lock`](uv.lock); shebang `uv run` (not PEP 723 `--script`).
 - **`assets/`** — wiring HTML/SVG and vendor VB6 form reference.
 
-**Audit:** every `src/` file in the three crates matches the crate intent. Core is *domain* (motion + RTU math + motion RPC/CLI), not “motion-only” — that is why CRC/`aim30` live here. A fourth crate would be ceremony, not clarity.
+**Audit:** every `src/` file in the four crates matches the crate intent. Core is *domain* (motion + RTU math + motion RPC/CLI), not “motion-only” — that is why CRC/`aim30` live here.
 
 ---
 
@@ -165,7 +212,7 @@ This is a `no_std` bare-metal project using `esp-hal`. Both chips use the Espres
   ```
 
 ### Build System Details
-- Firmware is crate `ossm-esp32` (binary name `ossm-rust`). Host-safe crates `ossm-core` and `ossm-std` must compile on stable without `build-std` (`cargo +stable test -p ossm-core`, `cargo +stable run -p ossm-std -- --help`). Workspace `default-members` is `ossm-esp32` so bare `cargo build` still targets firmware.
+- Firmware is crate `ossm-esp32` (binary name `ossm-rust`). Host-safe crates `ossm-common`, `ossm-core`, `ossm-std`, and `ossm-wasm` must compile on stable without `build-std` (`cargo +stable test -p ossm-common -p ossm-core`, `cargo +stable test -p ossm-wasm`, `cargo +stable run -p ossm-std -- --help`). Workspace `default-members` is `ossm-esp32` so bare `cargo build` still targets firmware. Workspace `[profile.release]` is host-sized (`debug = false`); `b-c6` / `b-s3` pass `--config=profile.release.debug=true` (and overflow-checks / opt-level 2) so only firmware keeps DWARF.
 - `build-std = ["core", "alloc"]` is passed on the `b-c6` / `b-s3` aliases and clippy (not globally — that would break `cargo +stable test -p ossm-core`).
 - `crates/ossm-esp32/build.rs` emits `cargo:rustc-link-arg=-Tlinkall.x` for the esp-hal linker script. **ESP32-S3** uses `crates/ossm-esp32/ld/esp32s3/linkall.x` + `ossm-rodata.x` instead: merges `.flash.appdesc` alignment padding into one DROM PROGBITS section so espflash emits a single DROM segment (bootloader error: *multiple DROM segments*).
 - `esp-bootloader-esp-idf` provides the ESP-IDF app descriptor macro required by `espflash`.
@@ -173,13 +220,13 @@ This is a `no_std` bare-metal project using `esp-hal`. Both chips use the Espres
 - **Logging vs crash dump**: Runtime logs go through `console` (`log` + bounded OUT channel + USB/UART0/RTT). `esp-backtrace` **must** enable the `println` feature (build gate), which pulls in `esp-println` — keep `esp-println` on `jtag-serial` + `critical-section` only (**no** `log` feature, **never** call `esp_println::logger::init_logger_from_env()`). Do **not** enable `esp-backtrace` `panic-handler` or `exception-handler` (duplicate symbols with `console` / `esp-hal`). Panic frames: `console::panic_write` + `esp_backtrace::arch::backtrace()`. RISC-V needs `-C force-frame-pointers` in `.cargo/config.toml`.
 
 ### Full Release Script
-To build the frontend, flasher, motor-control, and firmware for both ESP32-C6 and ESP32-S3, and generate merged `.bin` flash images:
+To build the three webuis, flasher, motor-control, wasm harness, `ossm-std` zigbuild binaries, and firmware for both ESP32-C6 and ESP32-S3:
 ```bash
-./scripts/release.sh
+uv run scripts/release.py
 ```
-Merged binaries are output to `release/ossm-esp32c6.bin` and `release/ossm-esp32s3.bin`. The script also copies standalone apps to `release/flasher.html` and `release/motor-control.html`.
+Merged binaries are output to `release/ossm-esp32c6.bin` and `release/ossm-esp32s3.bin`. Standalone apps: `release/flasher.html`, `release/motor-control.html`, `release/ossm-wasm.html`. `ossm-std` artifacts: `ossm-std-linux-x64` / `linux-arm64` (Termux) / `linux-armel` / `win-x64.exe` / `macos-arm64`. Optional `--skip-firmware` / `--skip-std` / `--skip-web`. Linux hosts without a cached SDK download `MACOSX_SDK_URL` into `.macos-sdk/` (or set `SDKROOT`). `--skip-macos` skips that target. `webui-std` is built **before** zigbuild so the HTML is inside each `ossm-std-*` binary. Wasm order is crate → wasm-bindgen → Vite HTML (not one hidden `npm run build:wasm`).
 
-**Important:** `cargo b-c6 --release` only updates `target/.../ossm-rust`. Flashing via `./scripts/setup_device.py --flash` uses the merged `release/ossm-*.bin` image. Rebuild `motor-control/` (`npm run build` → copy `dist/index.html` to `release/motor-control.html`, or via `./scripts/release.sh`) whenever that UI changes.
+**Important:** `cargo b-c6 --release` only updates `target/.../ossm-rust`. Flashing via `./scripts/setup_device.py --flash` uses the merged `release/ossm-*.bin` image. Rebuild `motor-control/` (`npm run build` → copy `dist/index.html` to `release/motor-control.html`, or via `uv run scripts/release.py`) whenever that UI changes.
 ---
 
 ## 3. Environment Configuration & Secrets (`.env`)
@@ -206,13 +253,16 @@ MODBUS_DERE="0"
 
 # Target device IP address (auto-updated by setup_device.py)
 DEVICE_IP="192.168.x.x"
+
+# macOS SDK tarball for zigbuild aarch64-apple-darwin on Linux
+MACOSX_SDK_URL="https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz"
 ```
 
 ---
 
 ## 4. Device Setup & Flashing (`/scripts`)
 
-All scripts in `/scripts` are formatted as PEP 723 self-contained inline script declarations, allowing execution directly with `uv run` without setting up a virtual environment manually.
+Scripts under `/scripts` use the root uv project (`pyproject.toml`). Run `uv sync` once, then `./scripts/ossm.py` / `uv run scripts/test_wasm.py`. Shebang is `#!/usr/bin/env -S uv run` (not `--script`).
 
 ### Unified Dual-Mode CLI & Shared Backend (`scripts/ossm.py`)
 A comprehensive command-line tool and shared library class (`DeviceBackend`) used across the automation suite. BLE mode maintains a **persistent connection** across operations using a dedicated asyncio event loop, avoiding costly reconnections per operation.
@@ -268,11 +318,11 @@ Host CRC/resync mirror (no hardware):
 ```bash
 ./scripts/test_modbus_resync.py
 ```
-Live device E2E (requires `modbus_debug` enabled + reboot, motor connected):
+Live device E2E (enables `modbus_debug` + reboot if needed, motor connected; restores off on exit):
 ```bash
 ./scripts/test_modbus_debug_device.py
 ```
-- Captures logs via **probe-rs RTT** (`attach --rtt-scan-memory`) instead of USB serial — avoids `MODBUS_DBG` write-timeout floods on ACM.
+- Captures logs via **probe-rs RTT** (`attach --no-catch-reset`, no `--rtt-scan-memory`) instead of USB serial — avoids `MODBUS_DBG` write-timeout floods on ACM.
 - Uses **`POST /modbus-inject`** to set `leading`/`trailing` junk injection while motor runs briefly.
 - Asserts `MODBUS_DBG ok=true class=long` (trailing) and `class=long_resync skip=3` (leading) in the RTT capture.
 - Disables `modbus_debug` and restarts on exit. Requires `probe-rs` (may invoke `sudo` without udev rules).
@@ -286,7 +336,7 @@ USB Serial/JTAG CLI, motor-loop `ups`, and probe-rs RTT against a live device (`
 - **`ups`**: ACM closed; `ups` ≥ 300 and `dt_max_ms` < 4.5 after the first 1 s window.
 - **`acm-open`**: open ACM with **DTR=0 / RTS=0 before `open()`**. Linux CDC may still pulse chip reset; the test **keeps the port open through boot** and then asserts the same `ups`/`dt_max` bounds plus CLI `get pin.modbus_tx`.
 - **`rtt`**: `sudo probe-rs attach --chip <model> --no-catch-reset` (ELF from `cargo b-c6 --release`; **no** `--rtt-scan-memory` — that can Load-fault during homing). Assert RTT has firmware logs, no `PANIC`, and `ups` stays healthy.
-- **`late-attach`**: ACM closed ~12 s, then CLI `set pin.ble_enabled true` expects `pin.ble_enabled set to` within 2 s.
+- **`late-attach`**: ACM closed ~12 s, then CLI `set shell.ble_enabled true` expects `shell.ble_enabled set to` within 2 s.
 - **`fairness`**: enables `modbus_debug` (reboot), `POST /modbus-inject` trailing/leading flood, `get inject` over a held-open ACM, `ups` ≥ 100; disables debug on exit.
 
 ### RS-485 transceiver live tests (`scripts/test_rs485_transceiver.py`)
@@ -298,30 +348,64 @@ Live-switch `operating_mode=rs485` **without reboot**, then exercise USB ACM and
 - USB path: `ossm-std --mode rtu-relay --serial $DEVICE_PORT` (DTR=0/RTS=0) serving Modbus TCP; FC03 unit 1.
 - WS path: `ossm-std --mode rtu-relay --rs485-ws ws://$DEVICE_IP/ws/rs485`; CFG baud then FC03.
 - Restore `operating_mode=servo` (no restart) and assert `/state` `ups` recovers.
+- Optional ACM magic-exit: `ossm-std --mode console --exit-rs485` expects `shell.operating_mode set to servo`.
+
+### Termux USB-host flash + phone shell (`scripts/test_termux.py`)
+Flash the C6 plugged into the Android phone (SSH host `termux`) and run `ossm-std` there:
+```bash
+./scripts/test_termux.py
+./scripts/test_termux.py --skip-flash   # only the phone servo / --mock path
+./scripts/test_termux.py --mock
+```
+- zigbuild `ossm-std-linux-arm64`, `scp` binary + `release/ossm-esp32c6.bin`.
+- `ossm-std --mode console` dumps old pin/net; `--mode flash` writes the merged image over `termux-usb`.
+- Re-provisions `net.*` and `pin.modbus_tx/rx/de_re` (default `2,1,0`), waits for `ip:`, updates `.env` `DEVICE_IP`, asserts firmware `/state` `ups` > 300.
+- Live-switch firmware `rs485`, run phone `ossm-std --serial /dev/bus/usb/… --bind 0.0.0.0:8080`, homing + motion over HTTP; `--exit-rs485` then firmware `ups` recovers.
+- First `termux-usb -r` needs a USB permission tap on the phone.
+
+### WASM harness live tests (`scripts/test_wasm.py`)
+Playwright E2E against `web/apps/webui-wasm` (or `release/ossm-wasm.html`). Live runs switch the device to `operating_mode=rs485` (no reboot):
+```bash
+./scripts/test_wasm.py           # mock + /ws/rs485 + Web Serial ACM
+./scripts/test_wasm.py --mock    # harness only
+./scripts/test_wasm.py --skip-serial
+```
+- Uses `WebSerialBridge` with DTR/RTS **off before open**.
+- Restore `servo` and assert `/state` `ups` recovered.
+
+### Bundled ossm-std UI (`scripts/test_webui_std.py`)
+Playwright against `ossm-std --mock` serving the compile-time-embedded webui-std:
+```bash
+./scripts/test_webui_std.py
+./scripts/test_webui_std.py --url http://192.168.24.222:8080
+```
+- Motion controls present (`#speed-slider`); **no** `#ble-enabled` / `#wifi-ssid`.
 
 ---
 
-## 5. Web Applications Architecture (`/frontend`, `/flasher`, `/motor-control`)
+## 5. Web Applications Architecture (`/web`)
 
-The web apps in this repository are built using **Vue 3 (Composition API)**, **TypeScript**, **Tailwind CSS**, and **Vite**. A key architectural choice is `vite-plugin-singlefile`, which bundles each app into a single self-contained HTML document without external asset dependencies.
+The web apps live under `web/` as an npm workspace (one Vite app per shipped HTML). Shared Vue/TS is `@ossm/shared`; transports are `@ossm/client`.
 
-### Embedded Web Interface (`/frontend`)
-The frontend is a single-page application embedded directly into the ESP32 firmware to provide real-time motor control and monitoring over WiFi.
-- **Single-File Embedding**: Compiles to `frontend/dist/index.html`. During build (`crates/ossm-esp32/build.rs`), it is compressed to `index.html.gz` in `OUT_DIR`. This compressed file is statically included into the firmware binary at compile time via `include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"))` in `crates/ossm-esp32/src/http_api.rs` and served with `Content-Encoding: gzip` directly from ROM without filesystem overhead.
-- **Key Components (`frontend/src/components/`)**:
+### Embedded Web Interface (`web/apps/webui-esp32`)
+The firmware SPA provides real-time motor control over WiFi/BLE, including pin/net/WiFi/BLE settings (`UnifiedSettings`).
+- **Single-File Embedding**: Compiles to `web/apps/webui-esp32/dist/index.html`. During build (`crates/ossm-esp32/build.rs`), it is compressed to `index.html.gz` in `OUT_DIR`. This compressed file is statically included into the firmware binary at compile time via `include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"))` in `crates/ossm-esp32/src/http_api.rs` and served with `Content-Encoding: gzip` directly from ROM without filesystem overhead.
+- **`web/apps/webui-std`**: motion-only (no pin/net/WiFi/BLE). `crates/ossm-std/build.rs` embeds `dist/index.html`; `GET /` serves it. `--static-dir` overrides for live Vite. REST CORS is `Access-Control-Allow-Origin: *`.
+- **Key Components (`web/packages/shared/src/components/`)**:
+  - `MotionWorkbench.vue`: diagram + MainControl / Spline / Funscript / Macro stack shared by all three webuis.
   - `MotorPositionDiagram.vue`: Toggleable visual diagram displaying full stroke range (`0% - 100%`), hardware bounds (`pos_min`/`pos_max`), active stroke window (Left Limit & Right Limit markers), and real-time animated position indicator at 30 FPS.
   - `MainControl.vue`: Manages core motion settings including BPM (speed), stroke depth, top/bottom depth anchoring, stroke reversal, and pause/resume functionality (supporting fixed-position and in-place pause modes).
   - `SplineEditor.vue`: Interactive curve editor allowing users to design custom periodic motion trajectories (`wave_func: 'spline'`) by manipulating spline control points.
   - `MacroPlayer.vue`: Interactive macro sequence player with top-level **Active Macro** selection above management actions (`Save`, `Save As`, `Rename`, `Delete`), clickable instruction gaps (`#macro-gap-X`) for seeking, exact `0%`/`100%` edge locating, `100%` wrap-around playback, and bilingual translations (`en.json` / `zh.json`). Logic in `macro.ts` (`BUILTIN_PRESETS`, validation, playback engine, `localStorage` keys `ossm_macros_v1` / `ossm_macro_draft_v1`).
-  - `ModbusSettings.vue`: Configures RS-485 Modbus UART GPIO pins (`modbus_tx`, `modbus_rx`, `modbus_de_re`), communication timeouts / inter-frame delay, `modbus_debug`, BLE enable, firmware restart, and displays live motor update frequency (`updates/sec` rate in Hz).
-- **Communication & State (`frontend/src/api.ts`, `client.ts`, `connectionStateMachine.ts`, `mapper.ts`, & `types.ts`)**:
-  - Communicates with the firmware via HTTP REST/JSON endpoints (`/config`, `/state`, `/paused`, `/pin-config`, `/network-config`, `/restart`) and optionally BLE (see `ble.ts` / `ConnectionMode`).
+  - `UnifiedSettings.vue` (`webui-esp32`): Modbus GPIO, `operating_mode`, `modbus_debug`, BLE enable, WiFi SSID/password, restart, motor `ups` telemetry.
+- **Communication & State (`@ossm/client` + `@ossm/shared`)**:
+  - Communicates with the firmware via HTTP REST/JSON endpoints (`/config`, `/state`, `/paused`, `/shell-config`, `/restart`) and optionally BLE (see `ble.ts` / `ConnectionMode`).
   - Implements a single-owner WebSocket client (`WsDataManager` in `client.ts`) for resilient real-time state synchronization via JSON-RPC 2.0 (`/ws/command`) at up to 30 FPS (`33ms`). Features automatic request/response promise routing (`pendingRequests`), application-level watchdog silent-failure detection, automatic reconnection loops (`triggerReconnect`) that re-subscribe active listeners without page refreshes, and automatic idle disconnection after 3 seconds when UI panels are closed.
   - **Causal Consistency & Data Mapping**: Tracks `authoritativeVersion` across mutations in `connectionStateMachine.ts`, rejecting stale remote config when `remoteConfig.version < authoritativeVersion`. `beginEnginePlayback` / `endEnginePlayback` (`MACRO` / `FUNSCRIPT`) and `beginLocalEdit` / `endLocalEdit` suppress background merges during virtual playback or optimistic edits; `scheduleOptimisticMutation` debounces slider POSTs. When diagram/settings panels are closed, falls back to **1 Hz** REST `/state` polling instead of WebSocket subscribe. `mapper.ts` (`wireToDomainConfig`, `domainToWireConfig`, `sanitizeMotorState`, `isConfigEqual`) preserves virtual `wave_func` (`macro` / `funscript`) in the UI while posting concrete firmware waveforms.
-  - When opened from hostname `localhost`, the frontend API client targets `http://ossm.lan`; otherwise it uses the current page origin.
+  - When `webui-esp32` is opened from hostname `localhost` in Vite DEV, the API client targets `http://ossm.lan`; production uses the page origin. `webui-std` Vite DEV targets `http://127.0.0.1:8080` (`VITE_OSSM_API`); the bundled binary uses same-origin.
 
 ### Web Serial Flasher & Configurator (`/flasher`)
-The flasher is a standalone, browser-based tool (`flasher/dist/index.html` -> `release/flasher.html`) that enables users to flash firmware binaries and configure microcontrollers over USB without installing local command-line tools.
+The flasher is a standalone, browser-based tool (`web/apps/flasher/dist/index.html` -> `release/flasher.html`) that enables users to flash firmware binaries and configure microcontrollers over USB without installing local command-line tools.
 - **Web Serial API & esptool-js**: Uses `@w3c/web-serial` and `esptool-js` (`ESPLoader`, `Transport`) to connect to ESP32-C6 / ESP32-S3 bootloaders directly from supported browsers (Chrome, Edge). Status-bar actions: **Connect** (ROM bootloader), **Flash Firmware**, **Monitor** / **Stop**, **Reset**, **Disconnect**.
 - **Firmware Flashing**: Drag-and-drop or file selection of merged firmware images (e.g. `release/ossm-esp32c6.bin`) written at a configurable address (default `0x0`). After flash, `hard_reset` runs and status becomes `flash_done` while keeping the serial port so configuration can proceed without reconnecting.
 - **Dual terminals**: **Console** (tool progress / ACKs) and **Serial** (device UART). Config send auto-attaches Serial monitor afterward.
@@ -353,7 +437,7 @@ All requests must adhere to JSON-RPC 2.0 format:
 #### Supported Methods
 1. **`ping`**: Returns `"pong"` in `result`. Used for application-level liveness checking.
 2. **`status`**: Returns stream buffer status (`{"buffered": 0, "stream_time": 0.0, "underrun": false}`).
-3. **`get-state`**: Returns current `StateResponse` object (motor position, speed, coordinates, physical bounds `pos_min`/`pos_max`, live loop telemetry `ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, `dt_mdev_ms`, update rate `update_history`, and config).
+3. **`get-state`**: Returns current `StateResponse` object (motor position, speed, coordinates, physical bounds `pos_min`/`pos_max`, `loop_stats` (`ups`, `dt_*`, `update_history`, `position_history`), `link_stats` (transport RTT / exchange counters), and config).
 4. **`set-config`**: Accepts partial or full `MotorControllerConfig` in `params` to dynamically update motion parameters. Returns the updated configuration object including the newly incremented causal version number (`version: u32`) which clients use to reject stale background state pushes. Rejects writes where `params.version` is older than the current snapshot (`-32001 Stale causal version`). `POST /config` returns **409 Conflict** for the same case.
 5. **`subscribe-state`**: Accepts `{"interval_ms": 300}` in `params` (range: 20–60000ms, default: 33ms). Acknowledges with `"result": {"subscribed": true, "interval_ms": 300}` confirming the resolved push rate. Re-sending `subscribe-state` dynamically adjusts the interval without requiring an unsubscribe. Begins pushing periodic notifications from the server:
    ```json
@@ -361,16 +445,15 @@ All requests must adhere to JSON-RPC 2.0 format:
      "jsonrpc": "2.0",
      "method": "state",
      "cmd": "state",
-     "params": { ...StateResponse... },
-     "state": { ...StateResponse... }
+     "params": { ...StateResponse... }
    }
    ```
 6. **`unsubscribe-state`**: Stops periodic state push notifications. Returns `"result": "unsubscribed"`.
 7. **`reset-timestamp`**: Resets motion trajectory time `t` to 0.
 8. **`append-waypoints`**: Appends a list of motion waypoints (`[{"ts": 100, "pos": 0.5, "vel": 0.1}, ...]`) to the stream buffer.
 9. **`set-waypoints`**: Clears currently buffered waypoints and sets a new list of motion waypoints in the buffer. Supports passing a list directly or an object `{"waypoints": [...], "reset-timestamp": true}` to optionally reset the stream time anchoring.
-10. **`get-network-config`**: Firmware only. Returns current `NetworkConfiguration` (mDNS hostname, DHCP, static IP). Not in `ossm-core::dispatch_rpc` / `ossm-std`.
-11. **`set-network-config`**: Firmware only. Updates `NetworkConfiguration` in NVS (reboot required).
+10. **`get-shell-config`**: Firmware only. Returns current `ShellConfig` (GPIO/UART/BLE plus WiFi/mDNS). Not in `ossm-core::dispatch_rpc` / `ossm-std`.
+11. **`set-shell-config`**: Firmware only. Updates `ShellConfig` in NVS (WiFi fields need reboot; `operating_mode` applies live).
 
 ### Bluetooth Low Energy (BLE) GATT API
 When connected via Bluetooth Low Energy (Service UUID: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`):
@@ -378,7 +461,7 @@ When connected via Bluetooth Low Energy (Service UUID: `6e400001-b5a3-f393-e0a9-
 - **`CHAR_STATE` (`...0003`)**: Read/Notify compact telemetry JSON (`position`, `speed`, `ups`, `y`/`shaped_y`, plus minimal config fields). Attribute buffer is ≤ **256 B** so ATT Read works without Read Blob. Pre-populated on connect; push notifications use the compact format via the chunked protocol. Full `StateResponse` is via JSON-RPC `get-state` on `CHAR_RPC`.
 - **`CHAR_PAUSED` (`...0004`)**: Write JSON string `{"paused": true, "position": 0.0}` for immediate pause/resume (`paused_position` accepted as an alias). Updates the cached `CHAR_CONFIG` attribute value; does **not** send unsolicited config notifications on write.
 - **`CHAR_PIN_CONFIG` (`...0005`)**: Read/Write JSON string of `PinConfiguration` (including `"ble_enabled": true` and `"modbus_debug": false`). Pre-populated on connection and updated on write; GATT Read returns the cached value.
-- **`CHAR_RPC` (`...0006`)**: Write/Notify JSON-RPC 2.0 command strings (e.g., `ping`, `get-state`, `subscribe-state`, `unsubscribe-state`, `restart`, `get-network-config`, `set-network-config`). All notifications use the **chunked notification protocol** (see below).
+- **`CHAR_RPC` (`...0006`)**: Write/Notify JSON-RPC 2.0 command strings (e.g., `ping`, `get-state`, `subscribe-state`, `unsubscribe-state`, `restart`, `get-shell-config`, `set-shell-config`). All notifications use the **chunked notification protocol** (see below).
 - **`CHAR_NETWORK_CONFIG` (`...0007`)**: Read/Write JSON string of `NetworkConfiguration` (including mDNS hostname, DHCP status, and static IP settings). Pre-populated on connection and updated on write; GATT Read returns the cached value.
 
 ### BLE Chunked Notification Protocol
@@ -397,13 +480,11 @@ Bytes 2+:       — payload fragment
 - Firmware helpers: `chunked_notify_state()`, `chunked_notify_rpc()`. The Python client provides `BleChunkReassembler` in `scripts/ossm.py` for transparent reassembly.
 
 ### Serial UART CLI Commands
-When interacting over USB serial (`115200` baud, `\r\n` terminated), configuration uses nmcli-style **`get <path>`** / **`set <path> <value>`**. Type **`paths`** on-device for the full catalog (also in README). Pin/net/inject paths are **firmware-only**; `ossm-std` stdin REPL is motor + motion actions.
+When interacting over USB serial (`115200` baud, `\r\n` terminated), configuration uses nmcli-style **`get <path>`** / **`set <path> <value>`**. Type **`paths`** on-device for the full catalog (also in README). Shell/inject paths are **firmware-only**; `ossm-std` stdin REPL is motor + motion actions.
 
-**Sections (firmware):** `get pin` | `get net` | `get motor` (full JSON); scalars: `get pin.modbus_tx`, `get net.wifi_enabled`, `get motor.bpm`, etc.
+**Sections (firmware):** `get shell` | `get motor` (full JSON); scalars: `get shell.modbus_tx`, `get shell.ssid`, `get motor.bpm`, etc. Legacy `pin.*` / `net.*` aliases still set; ACK is `shell.<key> set to`.
 
-**Pin paths:** `pin.modbus_tx` / `modbus_rx` / `modbus_de_re` (GPIO 0..48); `pin.modbus_timeout_ms` (0..1000, 0=default); `pin.modbus_rx_timeout_us` / `modbus_scan_delay_us` / `modbus_inter_frame_delay_us` (0..200000, 0=auto); `pin.modbus_baud` (1200..3000000, default 115200); `pin.ble_enabled` / `pin.modbus_debug` (true|false, debug needs reboot); `pin.operating_mode` (servo|rtu_relay|rs485, live).
-
-**Net paths:** `net.wifi_enabled` / `net.dhcp_enabled` (true|false); `net.ssid` / `password` / `hostname` (string); `net.static_ip` / `static_mask` / `static_gateway` / `static_dns` (IPv4).
+**Shell paths:** `shell.modbus_tx` / `modbus_rx` / `modbus_de_re` (GPIO 0..48); `shell.modbus_timeout_ms` (0..1000, 0=default); `shell.modbus_rx_timeout_us` / `modbus_scan_delay_us` / `modbus_inter_frame_delay_us` (0..200000, 0=auto); `shell.modbus_baud` (1200..3000000, default 115200); `shell.ble_enabled` / `shell.modbus_debug` (true|false, debug needs reboot); `shell.operating_mode` (servo|rtu_relay|rs485, live); `shell.wifi_enabled` / `dhcp_enabled`; `shell.ssid` / `password` / `hostname`; `shell.static_ip` / `static_mask` / `static_gateway` / `static_dns`.
 
 **Motor paths:** `motor.bpm` (>0); `motor.depth` (0.01..1); `motor.depth_top` / `reversed` / `paused` / `streaming` (true|false); `motor.wave_func` (sine|thrust|spline); `motor.sharpness` (0.01..0.99); `motor.paused_position` (0..1); `motor.spline_points` (space-separated floats); bulk `set motor {"bpm":36,...}` (read-only: `motor.version`).
 
@@ -428,29 +509,29 @@ Firmware (`ossm-esp32`) unless a subsection says otherwise. `ossm-core` has no I
 
 ### 7.2 Motion, snapshots, and causal version
 
-- Motor loop runs `compute_cycle()` at high frequency and reports 1-second window stats (`ups`, `dt_min_ms`, `dt_max_ms`, `dt_avg_ms`, `dt_mdev_ms`) in `StateResponse`. `compute_cycle()` clamps step duration (`dt.min(0.012)`) so CPU preemption does not jerk the servo.
+- Motor loop runs `compute_cycle()` at high frequency; shells aggregate 1-second window stats into `StateResponse.loop_stats` via `LoopStatsWindow` + `SetLoopStats`. `compute_cycle()` clamps step duration (`dt.min(0.012)`) so CPU preemption does not jerk the servo. Link timing (`link_stats`) is aggregated per shell (`LinkStatsWindow` + `SetLinkStats`) from UART/serial/WebSocket exchanges.
 - Publish telemetry with `AppContext::update_snapshot` (in-place `copy_from` / `Arc::make_mut`). **Never** `Arc::new(snapshot.clone())` every motor cycle — that OOMs the WiFi+BLE **96 KiB** heap. Allocate a new `Arc` **outside** the critical section only when the current snapshot is shared.
 - Boot policy is **paused** (`MotorControllerConfig::default().paused = true`; post-homing `sync_to_position` also forces pause). Snapshot `config` updates only when `config_version` advances — after any logical config change call `set_config` / `commit_config` or non-blocking `try_enqueue_config`, **not** bare `self.config.field = ...`. Every update increments `version: u32`. The web frontend (`connectionStateMachine.ts`) discards stale background pushes. Skipping the bump leaves `/config` and `/state` advertising stale versions while `MotionMode::Paused` holds the motor still.
 - `try_enqueue_config` pre-increments `version`, rejects stale `config.version < snapshot.version` (`409` REST / RPC `-32001`), retries enqueue for ~250 ms on queue full, and returns the authoritative config blob.
 - Firmware SPSC is `MotionCommand` capacity **3** (`crates/ossm-esp32/src/motion.rs`). The motor task dequeues into `Engine::apply` then `tick`. After homing: `HomingComplete` → `sync_to_position` parks via `set_config(paused=true)`, then `flush_snapshot` / `update_snapshot` before the control loop.
-- Performance (required): on **ESP32-C6** under concurrent HTTP + WebSocket, observed `dt_max_ms` must stay **< 4.5 ms**. Scratchpad in hot paths must use Embassy mutex fast-path (non-yield expected path), not long critical-section serialization.
+- Performance (required): on **ESP32-C6** under concurrent HTTP + WebSocket, observed `loop_stats.dt_max_ms` must stay **< 4.5 ms**. Scratchpad in hot paths must use Embassy mutex fast-path (non-yield expected path), not long critical-section serialization.
 - The web UI disconnects the live WebSocket after 3 seconds of inactivity when no components are subscribed.
 
 ### 7.3 Task placement and cores
 
 - **ESP32-C6:** UART1 owner (`uart_owner_task`) on `esp_rtos::embassy::InterruptExecutor` at elevated priority. Console, CLI, network, BLE on the main Embassy executor.
 - **ESP32-S3:** UART1 owner on **Core 1** via `esp_rtos::start_second_core(...)` → `run_uart_owner_blocking(...)`. WiFi/HTTP on Core 0. Console + CLI stay on Core 0.
-- Boot: `esp_hal::init()` → `esp_alloc` (**96 KiB** heap; S3 also places a ~**24 KiB** Core-1 motor/relay stack in RWDATA) → `esp_rtos::start()` → `console::init_logger()` → spawn `console_task` → CLI / UART1 owner / storage → WiFi/HTTP (`HTTP_READY`) → then BLE.
+- Boot: `esp_hal::init()` → `esp_alloc` (**96 KiB** heap; S3 also places a ~**24 KiB** Core-1 motor/relay stack in `.dram2_uninit`) → `esp_rtos::start()` → `console::init_logger()` → spawn `console_task` → CLI / UART1 owner / storage → WiFi/HTTP (`HTTP_READY`) → then BLE.
 - `servo`, `rtu_relay`, and `rs485` are exclusive (same UART1). The owner task stops the current role and re-inits; never spawn two UART1 roles at once.
 
 ### 7.4 Firmware Modbus (GDMA, timing, debug)
 
 - RS-485 via ESP-HAL GDMA `Uhci` (`UHCI0` + `DMA_CH0`) wrapping `esp_hal::uart::Uart`. `UhciRx` + `UhciTx` with `esp_hal::dma_buffers!(256, 256)` stream bytes into memory without per-FIFO CPU interrupts.
 - **RX inter-byte timeout ($t_{1.5}$):** default `750 µs` (`compute_rx_inter_byte_timeout`) — Modbus RTU spec for >19200 bps. This is the SOFTWARE `with_timeout()` guard per `read_async`. Whole-frame timeout default at 115200 is **10 ms**.
-- **Hardware UART FIFO idle (`timeout_symbols`):** when `modbus_rx_timeout_us == 0`, default **`2` symbols** (~**174 µs** at 115200). For variable-length GDMA `UhciRx` frames this triggers `RX_TOUT` and completes the DMA transfer without splitting frames.
+- **Hardware UART FIFO idle (`timeout_symbols`):** when `modbus_rx_timeout_us == 0`, default symbols cover $t_{3.5}$ (**5** at 115200, ~**434 µs**) so software IFD is 0. Production `pkt_thres` is set once to FC16 ACK length **8**; FC03 reads raise it for that exchange then restore. Debug mode uses `pkt_thres=256` plus idle-EOF.
 - **Re-arm race:** CPU two-phase reads (`uart_read_exactly(&resp[..3])` then `resp[3..len]`) could drop bytes in the re-arm gap. GDMA captures continuously between phases so high-rate polling (>330 Hz) does not lose frames.
-- **Inter-frame quiet ($t_{3.5}$):** default `350 µs` at `115200` (`get_default_inter_frame_delay`). Subtract `hardware_silence_us` (~174 µs of `timeout_symbols`) from the wait so the bus is not silenced twice. End-to-end RTU cycle **< 3 ms** for **> 330 Hz** `ups`.
-- **`modbus_debug`:** keep DMA at **`dma_buffers!(256, 256)`** and `pkt_thres` at expected frame length. Do **not** raise `pkt_thres` to capture capacity (false `empty` after cancel). Debug only: 5 ms software RX deadline, CRC-resync (`exact` / `long` / `long_resync` / `leading_junk` / `parse_fail` in `ossm-core` `find_modbus_response`), `MODBUS_DBG` logs (`skip`/`trim`; throttle `exact` when inject off). Raises USB log volume; `ups` modestly lower; leave off in production.
+- **Inter-frame quiet ($t_{3.5}$):** default `350 µs` at `115200` (`get_default_inter_frame_delay`). Hardware idle covers that silence; remaining software `Delay` is 0 unless the user shortened RX timeout. End-to-end RTU cycle **< 3 ms** for **> 330 Hz** `ups` while moving. Paused loops may skip unchanged FC16 (2 Hz keepalive).
+- **`modbus_debug`:** keep DMA at **`dma_buffers!(256, 256)`**. Do **not** raise production `pkt_thres` to capture capacity (false `empty` after cancel). Debug only: 5 ms software RX deadline, CRC-resync (`exact` / `long` / `long_resync` / `leading_junk` / `parse_fail` in `ossm-core` `find_modbus_response`), `MODBUS_DBG` logs (`skip`/`trim`; throttle `exact` when inject off). Raises USB log volume; `ups` modestly lower; leave off in production.
 - RAM inject (firmware `modbus_rtu.rs`, not the bus): `set inject` or **`POST /modbus-inject`** `{"mode":"leading|trailing|both|off","nbytes":N}`. Host: `scripts/test_modbus_resync.py`. Live C6: `scripts/test_modbus_debug_device.py`. Console fairness: `scripts/test_console.py`.
 - `ossm-std` cannot use t1.5/t3.5 on PC USB-serial; its RX is `modbus_rx.rs` (unbounded stream, emit on header+CRC). Same `aim30` literals as firmware.
 
@@ -459,8 +540,8 @@ Firmware (`ossm-esp32`) unless a subsection says otherwise. `ossm-core` has no I
 - `edge-http`: 4 signal-gated acceptors, socket queue, up to 3 concurrent WebSocket sessions. Embassy net **`StackResources<20>`** (DHCP + HTTP + Modbus TCP `:502` + concurrent TCP).
 - **`REST_GATE` serializes mutating POSTs only.** GETs, `/state`, and `/restart` must not hold the gate for the whole request (starves acceptors; port 80 looks dead under burst).
 - JSON REST: `"Connection": "close"`. Gzip HTML `/` does not need it. WebSocket: `FrameType::Text(false)` (final text). End WS sessions with **`drop(socket)`**, not `close(Both).await` (smoltcp Load-fault after peer/WiFi teardown). REST may still `finish_connection` → `close(Both)`.
-- Prefer **`GET/POST /modbus-inject`** over serial `set inject` when `MODBUS_DBG` floods USB. `rtu_relay` serves `/ws/modbus` and Modbus TCP `:502`. `rs485` serves `/ws/rs485` (binary `u8 type | u16le len | payload`: 0 TX, 1 RX, 2 CFG). Wrong-mode WS paths return 404.
-- `ossm-std` HTTP is axum: `--mode servo` → `/config` `/state` `/paused` `/restart` `/ws/command`; `--mode rtu-relay` → `/ws/modbus` + Modbus TCP `--modbus-bind`. `restart` exits the process.
+- Prefer **`GET/POST /modbus-inject`** over serial `set inject` when `MODBUS_DBG` floods USB. `rtu_relay` serves `/ws/modbus` and Modbus TCP `:502`. `rs485` serves `/ws/rs485` (binary `u8 type | u16le len | payload`: 0 TX, 1 RX, 2 CFG). A TX payload equal to `EXIT_MAGIC` (`F0 0F OSSM ESC q`) exits rs485 the same way USB does. Wrong-mode WS paths return 404.
+- `ossm-std` HTTP is axum: `--mode servo` → `/` (embedded webui-std) `/config` `/state` `/link-stats` `/paused` `/restart` `/ws/command` (CORS `*`); `--mode rtu-relay` → `/ws/modbus` + Modbus TCP `--modbus-bind` + `GET /link-stats`. `restart` exits the process.
 
 ### 7.6 BLE (`trouble-host`)
 
@@ -499,26 +580,30 @@ Firmware (`ossm-esp32`) unless a subsection says otherwise. `ossm-core` has no I
 
 - `crates/ossm-esp32/build.rs` emits `cargo:rustc-link-arg=-Tlinkall.x`. **ESP32-S3:** `ld/esp32s3/linkall.x` + `ossm-rodata.x` merges `.flash.appdesc` padding into one DROM PROGBITS section (bootloader error: *multiple DROM segments*).
 - `esp-bootloader-esp-idf` `esp_app_desc!()` is required by `espflash`. RISC-V: keep `-C force-frame-pointers`.
-- Embed `frontend/dist/index.html` → `OUT_DIR/index.html.gz` → `include_bytes!` in `http_api.rs`.
+- Embed `web/apps/webui-esp32/dist/index.html` → `OUT_DIR/index.html.gz` → `include_bytes!` in `http_api.rs`.
+- `ossm-std` `build.rs` embeds `web/apps/webui-std/dist/index.html` (override with `--static-dir`).
 
 ### 7.10 Keep APIs synchronized
 
 When adding a command or configuration property, update the crate that owns it, then every consumer:
 
 - **Motion / causal version / RPC catalog:** `ossm-core` (`config`, `state`, `command`, `rpc`, `rpc_types`, `paths`, `engine`) plus tests.
+- **Telemetry windows, wire structs, and link PLL** — `ossm-common`; shell drivers in `motor_57aim30.rs` / `engine_task.rs` / `shell.rs` / `bus.rs`.
 - **Firmware SPSC / enqueue:** `crates/ossm-esp32/src/motion.rs`, `context.rs` (`try_enqueue_config`).
 - **Firmware HTTP/WS:** `http_api.rs`. Pin/net/inject live here, not in core.
 - **Firmware BLE:** `ble_api.rs`.
-- **Firmware async RPC adapter:** `crates/ossm-esp32/src/rpc.rs` (enqueue; still handles get/set-network-config on storage).
+- **Firmware async RPC adapter:** `crates/ossm-esp32/src/rpc.rs` (enqueue; still handles get/set-shell-config on storage).
 - **Firmware CLI:** `command.rs` + `hw_paths.rs` (pin/net/inject). Motor paths stay in `ossm_core::paths`.
-- **Desktop shell:** `ossm-std` `http.rs` / `cli.rs` / `engine_task.rs` / `bus.rs` / `relay_server.rs` (motor + motion RPC, or `--mode rtu-relay`).
-- **Frontend:** `types.ts`, `api.ts`, `mapper.ts`, `macro.ts`, `connectionStateMachine.ts`.
-- **57AIM30 PC tool:** `motor-control/src/lib/registers.ts`, `send-options.ts`, panels; rebuild `release/motor-control.html`.
-- **Scripts:** `ossm.py`, `test_websocket.py`, `test_frontend.py`, `test_ble.py`, `test_modbus_debug_device.py`, `test_console.py`, `test_rs485_transceiver.py`, `setup_device.py`.
+- **Desktop shell:** `ossm-std` `http.rs` / `cli.rs` / `engine_task.rs` / `bus.rs` / `relay_server.rs` / `flash_port.rs` / `esptool/` / `console_mode.rs` (motor + motion RPC, rtu-relay, or flash/console). CORS `*` on REST. Bundled webui-std.
+- **webuis:** `web/packages/shared` + `web/packages/client` + `web/apps/webui-esp32` / `webui-std` / `webui-wasm`.
+- **WASM harness:** `web/apps/webui-wasm` + `crates/ossm-wasm`; rebuild `release/ossm-wasm.html`.
+- **57AIM30 PC tool:** `web/apps/motor-control/src/lib/registers.ts`, `send-options.ts`, panels; rebuild `release/motor-control.html`.
+- **Scripts:** `ossm.py`, `test_websocket.py`, `test_frontend.py`, `test_webui_std.py`, `test_wasm.py`, `test_ble.py`, `test_modbus_debug_device.py`, `test_console.py`, `test_rs485_transceiver.py`, `test_termux.py`, `setup_device.py`.
 - **Docs:** `README.md`, `README.zh.md`.
 
 ### 7.11 Frontend embed and wiring diagrams
 
-- After `frontend/` changes, **`npm run build`** (or `./scripts/release.sh`) before compiling/flashing firmware — otherwise ROM still has the old `index.html.gz`.
-- `motor-control/` is **not** embedded; rebuild and copy to `release/motor-control.html`.
+- After `web/apps/webui-esp32/` changes, **`npm run build -w webui-esp32`** in `web/` (or `uv run scripts/release.py`) before compiling/flashing firmware — otherwise ROM still has the old `index.html.gz`.
+- After `web/apps/webui-std/` changes, rebuild **before** `cargo`/`zigbuild` `-p ossm-std` so the embedded HTML is current.
+- `web/apps/motor-control/` and `web/apps/webui-wasm/` are **not** firmware-embedded; rebuild and copy to `release/motor-control.html` / `release/ossm-wasm.html`.
 - **Never** hand-author SVG wiring diagrams. Design HTML/CSS in `assets/wiring_diagram.html` / `wiring_diagram_zh.html` (Path B ESP32) and `wiring_diagram_std.html` / `wiring_diagram_std_zh.html` (Path A USB-RS485). Bright theme, CSS Grid, JS midpoint routing. Export with `scripts/export_wiring_svg.py` (Playwright + `html-to-image`).

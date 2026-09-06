@@ -2,27 +2,33 @@
 //!
 //! Host owns RTU timing. USB ACM and `/ws/rs485` are data planes; UART1 + DE/RE is the bus.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use embassy_futures::select::{select, select4, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer};
-use esp_hal::gpio::{AnyPin, Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::uart::{Config, Uart};
 use heapless::Vec as HVec;
 
 use crate::console;
 use crate::error::{FirmwareError, Result};
+use crate::peripheral_bank::PeripheralBank;
 use crate::storage::PinConfiguration;
 use crate::uart_owner;
 
 pub const PKT_TX: u8 = 0;
 pub const PKT_RX: u8 = 1;
 pub const PKT_CFG: u8 = 2;
+/// USB/`/ws/rs485` sequence that leaves transceiver mode without WiFi.
+/// Chosen so no proper prefix is also a suffix (streaming match is O(1)).
+pub const EXIT_MAGIC: [u8; 8] = [0xF0, 0x0F, b'O', b'S', b'S', b'M', 0x1B, b'q'];
 const FRAME_CAP: usize = 256;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static MAGIC_EXIT: AtomicBool = AtomicBool::new(false);
+static HOST_MAGIC_STATE: AtomicU8 = AtomicU8::new(0);
 static LIVE_BAUD: AtomicU32 = AtomicU32::new(115_200);
 static TX_CH: Channel<CriticalSectionRawMutex, HVec<u8, FRAME_CAP>, 4> = Channel::new();
 static BAUD_CH: Channel<CriticalSectionRawMutex, u32, 2> = Channel::new();
@@ -34,6 +40,66 @@ pub fn is_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+pub fn request_magic_exit() {
+    MAGIC_EXIT.store(true, Ordering::Release);
+}
+
+pub fn magic_exit_requested() -> bool {
+    MAGIC_EXIT.load(Ordering::Acquire)
+}
+
+pub fn take_magic_exit() -> bool {
+    MAGIC_EXIT.swap(false, Ordering::AcqRel)
+}
+
+pub fn reset_host_magic_matcher() {
+    HOST_MAGIC_STATE.store(0, Ordering::Relaxed);
+}
+
+/// Streaming matcher: `matched` is 0..=8. Returns bytes that are not part of a
+/// (possibly still incomplete) `EXIT_MAGIC` prefix, plus whether a full match
+/// completed in this chunk.
+pub fn feed_exit_magic(matched: &mut u8, data: &[u8], out: &mut [u8]) -> (usize, bool) {
+    let mut n = 0usize;
+    let mut hit = false;
+    for &b in data {
+        let expect = EXIT_MAGIC.get(*matched as usize).copied();
+        if expect == Some(b) {
+            *matched = matched.saturating_add(1);
+            if *matched as usize >= EXIT_MAGIC.len() {
+                *matched = 0;
+                hit = true;
+            }
+            continue;
+        }
+        if *matched > 0 {
+            let prefix = &EXIT_MAGIC[..*matched as usize];
+            let copy = prefix.len().min(out.len().saturating_sub(n));
+            out[n..n + copy].copy_from_slice(&prefix[..copy]);
+            n += copy;
+            *matched = 0;
+        }
+        if b == EXIT_MAGIC[0] {
+            *matched = 1;
+        } else if n < out.len() {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    (n, hit)
+}
+
+/// Filter USB host bytes: strip `EXIT_MAGIC` (possibly split across packets).
+pub fn filter_host_pipe(data: &[u8], out: &mut [u8]) -> (usize, bool) {
+    let mut matched = HOST_MAGIC_STATE.load(Ordering::Relaxed);
+    let (n, hit) = feed_exit_magic(&mut matched, data, out);
+    HOST_MAGIC_STATE.store(matched, Ordering::Relaxed);
+    if hit {
+        request_magic_exit();
+    }
+    (n, hit)
+}
+
 pub fn mark_active(active: bool) {
     ACTIVE.store(active, Ordering::Relaxed);
 }
@@ -43,7 +109,7 @@ pub fn live_baud() -> u32 {
 }
 
 pub fn set_live_baud(baud: u32) {
-    if baud >= 1200 && baud <= 3_000_000 {
+    if (1200..=3_000_000).contains(&baud) {
         LIVE_BAUD.store(baud, Ordering::Relaxed);
         let _ = BAUD_CH.try_send(baud);
     }
@@ -74,6 +140,11 @@ pub async fn recv_rx(slot: usize) -> HVec<u8, FRAME_CAP> {
 }
 
 pub fn try_send_tx(payload: &[u8]) -> Result<()> {
+    if payload == EXIT_MAGIC {
+        request_magic_exit();
+        uart_owner::request_restart();
+        return Ok(());
+    }
     if !is_active() {
         return Err(FirmwareError::Modbus("rs485 inactive"));
     }
@@ -83,8 +154,7 @@ pub fn try_send_tx(payload: &[u8]) -> Result<()> {
     let mut v = HVec::new();
     v.extend_from_slice(payload)
         .map_err(|_| FirmwareError::Modbus("rs485 tx full"))?;
-    TX_CH.try_send(v)
-        .map_err(|_| FirmwareError::QueueFull)
+    TX_CH.try_send(v).map_err(|_| FirmwareError::QueueFull)
 }
 
 pub fn apply_cfg_json(json: &[u8]) -> Result<u32> {
@@ -146,10 +216,7 @@ fn uart_config(baud: u32) -> Config {
         .with_rx(esp_hal::uart::RxConfig::default().with_timeout(2))
 }
 
-pub async fn run_rs485(
-    uart_periph: esp_hal::peripherals::UART1<'static>,
-    pin: &PinConfiguration,
-) -> Result<()> {
+pub async fn run_rs485(pin: &PinConfiguration, bank: &mut PeripheralBank) -> Result<()> {
     log::info!("Starting RS-485 transceiver (operating_mode=rs485)");
     let baud = if pin.modbus_baud == 0 {
         115_200
@@ -158,12 +225,13 @@ pub async fn run_rs485(
     };
     LIVE_BAUD.store(baud, Ordering::Relaxed);
 
-    let tx_pin = unsafe { AnyPin::steal(pin.modbus_tx as u8) };
+    let (uart_periph, _uhci, _dma) = bank.take_uart()?;
+    let tx_pin = bank.take_pin(pin.modbus_tx as u8)?;
     let rx_pin = Input::new(
-        unsafe { AnyPin::steal(pin.modbus_rx as u8) },
+        bank.take_pin(pin.modbus_rx as u8)?,
         InputConfig::default().with_pull(Pull::Up),
     );
-    let de_pin = unsafe { AnyPin::steal(pin.modbus_de_re as u8) };
+    let de_pin = bank.take_pin(pin.modbus_de_re as u8)?;
     let mut de_re = Output::new(de_pin, Level::Low, OutputConfig::default());
 
     let mut uart = Uart::new(uart_periph, uart_config(baud))
@@ -179,7 +247,7 @@ pub async fn run_rs485(
 
     let mut rx_buf = [0u8; 64];
     loop {
-        if uart_owner::stop_requested() {
+        if uart_owner::stop_requested() || magic_exit_requested() {
             break;
         }
 
@@ -246,11 +314,7 @@ async fn tx_uart(
     de_re.set_low();
 }
 
-fn drain_uart_rx(
-    uart: &mut Uart<'static, esp_hal::Async>,
-    buf: &mut [u8],
-    mut n: usize,
-) -> usize {
+fn drain_uart_rx(uart: &mut Uart<'static, esp_hal::Async>, buf: &mut [u8], mut n: usize) -> usize {
     while n < buf.len() {
         if !uart.read_ready() {
             break;

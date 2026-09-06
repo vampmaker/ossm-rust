@@ -9,5 +9,7 @@ runner = "espflash flash --monitor"
 
 [alias]
 # Alias args are not shell-parsed; do not wrap --config in extra quotes.
-b-c6 = "build -p ossm-esp32 --config=unstable.build-std=[\"core\",\"alloc\"] --target riscv32imac-unknown-none-elf --features esp32c6 --no-default-features"
-b-s3 = "build -p ossm-esp32 --config=unstable.build-std=[\"core\",\"alloc\"] --target xtensa-esp32s3-none-elf --features esp32s3 --no-default-features"
+# Firmware-only release knobs (debug / overflow-checks / opt-level 2) so host
+# `ossm-std` zigbuilds stay stripped of DWARF.
+b-c6 = "build -p ossm-esp32 --config=unstable.build-std=[\"core\",\"alloc\"] --config=profile.release.debug=true --config=profile.release.overflow-checks=true --config=profile.release.opt-level=2 --target riscv32imac-unknown-none-elf --features esp32c6 --no-default-features"
+b-s3 = "build -p ossm-esp32 --config=unstable.build-std=[\"core\",\"alloc\"] --config=profile.release.debug=true --config=profile.release.overflow-checks=true --config=profile.release.opt-level=2 --target xtensa-esp32s3-none-elf --features esp32s3 --no-default-features"

@@ -1,14 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "playwright",
-#     "httpx",
-#     "python-dotenv>=1.0.0",
-#     "websockets>=12.0",
-#     "aiohttp>=3.9.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """Reproduce Macro Player playback bug where clicking play resets wave_func to sine."""
 
 import asyncio

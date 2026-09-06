@@ -1,12 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "httpx>=0.27",
-#     "pyserial>=3.5",
-#     "python-dotenv>=1.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """Live USB console tests: late-attach CLI, motor ups, probe-rs RTT, fairness.
 
 Usage:
@@ -36,6 +28,10 @@ load_dotenv(REPO_ROOT / ".env")
 IP = os.environ.get("DEVICE_IP", "192.168.24.63")
 PORT = os.environ.get("DEVICE_PORT", "/dev/ttyACM0")
 CHIP = os.environ.get("DEVICE_MODEL", "esp32c6")
+
+
+def _loop(state: dict, key: str, default=0):
+    return (state.get("loop_stats") or {}).get(key, default)
 BASE = f"http://{IP}"
 
 UPS_MIN = 300
@@ -43,8 +39,8 @@ UPS_MIN_DEBUG = 100
 DT_MAX_MS = 4.5
 LATE_IDLE_S = 12.0
 ACK_TIMEOUT_S = 2.0
-SET_CMD = "set pin.ble_enabled true"
-ACK_NEEDLE = "pin.ble_enabled set to"
+SET_CMD = "set shell.ble_enabled true"
+ACK_NEEDLE = "shell.ble_enabled set to"
 
 ELF = Path(
     os.environ.get(
@@ -65,8 +61,15 @@ def client() -> httpx.Client:
     return httpx.Client(timeout=10)
 
 
-def get_state(http: httpx.Client) -> dict:
-    return http.get(f"{BASE}/state").json()
+def get_state(http: httpx.Client, retries: int = 5) -> dict:
+    last: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return http.get(f"{BASE}/state").json()
+        except (httpx.HTTPError, OSError, ValueError) as e:
+            last = e
+            time.sleep(min(2.0, 0.4 * attempt))
+    raise RuntimeError(f"GET /state failed after {retries} retries ({last})")
 
 
 def wait_http(timeout_s: float = 45.0) -> None:
@@ -75,12 +78,31 @@ def wait_http(timeout_s: float = 45.0) -> None:
     while time.monotonic() < end:
         try:
             with client() as http:
-                http.get(f"{BASE}/pin-config").raise_for_status()
+                http.get(f"{BASE}/shell-config").raise_for_status()
                 return
         except Exception as e:
             last = e
             time.sleep(1)
     fail(f"device HTTP not reachable at {BASE} ({last})")
+
+
+def recover_http_after_probe() -> None:
+    """STA can drop while probe-rs holds SWD; restore before later tests."""
+    end = time.monotonic() + 15.0
+    while time.monotonic() < end:
+        try:
+            with client() as http:
+                http.get(f"{BASE}/shell-config").raise_for_status()
+                return
+        except Exception:
+            time.sleep(1)
+    print("  HTTP down after probe-rs; POST /restart")
+    try:
+        with client() as http:
+            http.post(f"{BASE}/restart")
+    except Exception as e:
+        print(f"  /restart failed: {e}")
+    wait_http(timeout_s=50.0)
 
 
 def wait_motor(http: httpx.Client, min_ups: int, timeout_s: float = 90.0) -> dict:
@@ -89,14 +111,14 @@ def wait_motor(http: httpx.Client, min_ups: int, timeout_s: float = 90.0) -> dic
     while time.monotonic() < end:
         try:
             last = get_state(http)
-            ups = last.get("ups") or 0
+            ups = _loop(last, "ups")
             if ups >= min_ups and last.get("motor_connected"):
                 return last
-        except (httpx.HTTPError, OSError, ValueError):
+        except (httpx.HTTPError, OSError, ValueError, SystemExit):
             pass
         time.sleep(1)
     fail(
-        f"motor loop not ready (ups={last.get('ups')} connected={last.get('motor_connected')})"
+        f"motor loop not ready (ups={_loop(last, 'ups')} connected={last.get('motor_connected')})"
     )
     return last
 
@@ -108,9 +130,9 @@ def sample_loop(
     for i in range(n):
         s = get_state(http)
         rec = {
-            "ups": s.get("ups") or 0,
-            "dt_max": float(s.get("dt_max_ms") or 0),
-            "dt_avg": float(s.get("dt_avg_ms") or 0),
+            "ups": _loop(s, "ups"),
+            "dt_max": float(_loop(s, "dt_max_ms", 0.0)),
+            "dt_avg": float(_loop(s, "dt_avg_ms", 0.0)),
             "connected": bool(s.get("motor_connected")),
         }
         print(
@@ -199,7 +221,7 @@ def test_ups_acm_open() -> None:
             reset_on_open = False
             try:
                 s = get_state(http)
-                print(f"  HTTP survived open ups={s.get('ups')}")
+                print(f"  HTTP survived open ups={_loop(s, 'ups')}")
             except Exception:
                 reset_on_open = True
                 print(
@@ -215,9 +237,9 @@ def test_ups_acm_open() -> None:
                 nread += len(drain(ser))
                 s = get_state(http)
                 rec = {
-                    "ups": s.get("ups") or 0,
-                    "dt_max": float(s.get("dt_max_ms") or 0),
-                    "dt_avg": float(s.get("dt_avg_ms") or 0),
+                    "ups": _loop(s, "ups"),
+                    "dt_max": float(_loop(s, "dt_max_ms", 0.0)),
+                    "dt_avg": float(_loop(s, "dt_avg_ms", 0.0)),
                     "connected": bool(s.get("motor_connected")),
                 }
                 print(
@@ -227,10 +249,10 @@ def test_ups_acm_open() -> None:
                     rows.append(rec)
                 time.sleep(1.1)
             assert_healthy(rows, min_ups=UPS_MIN, label="ACM-open")
-            log = serial_cmd(ser, "get pin.modbus_tx", "modbus_tx", 2.0)
+            log = serial_cmd(ser, "get shell.modbus_tx", "modbus_tx", 2.0)
             if "modbus_tx" not in log:
                 fail(f"CLI silent while ACM open: {log[:200]!r}")
-            print("  CLI get pin.modbus_tx ok")
+            print("  CLI get shell.modbus_tx ok")
     finally:
         ser.dtr = False
         ser.rts = False
@@ -312,15 +334,19 @@ def test_rtt() -> None:
     print(" ", " ".join(cmd))
     with RTT_OUT.open("wb") as rtt_file:
         proc = subprocess.Popen(cmd, stdout=rtt_file, stderr=subprocess.PIPE)
+        rtt_error: str | None = None
         try:
             time.sleep(2.5)
             if proc.poll() is not None:
                 err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
-                fail(f"probe-rs attach exited early: {err[:800]}")
-            with client() as http:
-                time.sleep(2.0)
-                rows = sample_loop(http, 5, skip_first=True)
-                assert_healthy(rows, min_ups=UPS_MIN, label="during-RTT")
+                rtt_error = f"probe-rs attach exited early: {err[:800]}"
+            else:
+                with client() as http:
+                    time.sleep(2.0)
+                    rows = sample_loop(http, 5, skip_first=True)
+                    assert_healthy(rows, min_ups=UPS_MIN, label="during-RTT")
+        except (RuntimeError, httpx.HTTPError, OSError) as e:
+            rtt_error = str(e)
         finally:
             if proc.poll() is None:
                 proc.send_signal(signal.SIGINT)
@@ -328,6 +354,9 @@ def test_rtt() -> None:
                     proc.wait(timeout=8)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+            recover_http_after_probe()
+        if rtt_error:
+            fail(rtt_error)
 
     log = RTT_OUT.read_text(encoding="utf-8", errors="replace")
     if "PANIC" in log:
@@ -343,16 +372,16 @@ def test_rtt() -> None:
 def ensure_modbus_debug(enabled: bool) -> dict:
     wait_http()
     with client() as http:
-        pins = http.get(f"{BASE}/pin-config").json()
+        pins = http.get(f"{BASE}/shell-config").json()
         if bool(pins.get("modbus_debug")) == enabled:
             return pins
         print(f"  setting modbus_debug={enabled} and restarting...")
-        http.post(f"{BASE}/pin-config", json={**pins, "modbus_debug": enabled})
+        http.post(f"{BASE}/shell-config", json={**pins, "modbus_debug": enabled})
         http.post(f"{BASE}/restart")
     time.sleep(5)
     wait_http(timeout_s=50)
     with client() as http:
-        pins = http.get(f"{BASE}/pin-config").json()
+        pins = http.get(f"{BASE}/shell-config").json()
         if bool(pins.get("modbus_debug")) != enabled:
             fail(f"modbus_debug did not become {enabled}")
         return pins
@@ -391,7 +420,7 @@ def test_fairness() -> None:
                     time.sleep(0.4)
                 if needle not in log:
                     fail(f"{mode}: serial CLI unresponsive under MODBUS_DBG flood")
-                ups = get_state(http).get("ups") or 0
+                ups = _loop(get_state(http), "ups")
                 if ups < UPS_MIN_DEBUG:
                     fail(f"{mode}: ups={ups} < {UPS_MIN_DEBUG} during flood")
                 print(f"  {mode} n={nbytes}: serial ACK ok (ups={ups})")

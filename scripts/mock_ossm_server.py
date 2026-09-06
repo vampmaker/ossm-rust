@@ -1,10 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "aiohttp>=3.9.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """Full-fidelity OSSM WiFi frontend mock: REST + /ws/command + static SPA."""
 
 from __future__ import annotations
@@ -32,7 +26,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "streaming": False,
 }
 
-DEFAULT_PIN: dict[str, Any] = {
+DEFAULT_SHELL: dict[str, Any] = {
     "modbus_tx": 18,
     "modbus_rx": 19,
     "modbus_de_re": 20,
@@ -44,9 +38,6 @@ DEFAULT_PIN: dict[str, Any] = {
     "modbus_debug": False,
     "operating_mode": "servo",
     "modbus_baud": 115200,
-}
-
-DEFAULT_NET: dict[str, Any] = {
     "wifi_enabled": True,
     "ssid": "MockSSID",
     "password": "mockpass",
@@ -73,8 +64,7 @@ class MockDeviceState:
 
     def __init__(self) -> None:
         self.config = copy.deepcopy(DEFAULT_CONFIG)
-        self.pin = copy.deepcopy(DEFAULT_PIN)
-        self.net = copy.deepcopy(DEFAULT_NET)
+        self.shell = copy.deepcopy(DEFAULT_SHELL)
         self.t = 0.0
         self.x = 0.0
         self.y = 0.5
@@ -83,17 +73,26 @@ class MockDeviceState:
         self.speed = 0.0
         self.pos_min = 0.0
         self.pos_max = 1.0
-        self.ups = 320
-        self.dt_min_ms = 2.0
-        self.dt_avg_ms = 3.1
-        self.dt_max_ms = 4.0
-        self.dt_mdev_ms = 0.2
-        self.update_history = [300, 310, 320, 315, 320]
+        self.loop_stats = {
+            "ups": 320,
+            "dt_min_ms": 2.0,
+            "dt_avg_ms": 3.1,
+            "dt_max_ms": 4.0,
+            "dt_mdev_ms": 0.2,
+            "update_history": [300, 310, 320, 315, 320],
+            "position_history": [0.5, 0.5, 0.5, 0.5, 0.5],
+        }
         self.motor_connected = True
-        self.modbus_stats = {
-            "successful_requests": 1000,
-            "failed_requests": 0,
+        self.link_stats = {
+            "transport": "mock",
+            "connected": True,
+            "exchanges": 1000,
+            "failures": 0,
             "success_rate": 100.0,
+            "exchanges_per_sec": 320,
+            "bytes_tx": 8000,
+            "bytes_rx": 8000,
+            "reconnects": 0,
             "round_trip": _empty_timing(),
             "slave_latency": _empty_timing(),
             "rx_duration": _empty_timing(),
@@ -163,17 +162,11 @@ class MockDeviceState:
                 "stream_time": self.stream_time,
                 "underrun": self.stream_underrun,
             },
-            "update_history": list(self.update_history),
-            "position_history": [self.position] * 5,
             "pos_min": self.pos_min,
             "pos_max": self.pos_max,
-            "ups": self.ups,
-            "dt_min_ms": self.dt_min_ms,
-            "dt_avg_ms": self.dt_avg_ms,
-            "dt_max_ms": self.dt_max_ms,
-            "dt_mdev_ms": self.dt_mdev_ms,
             "motor_connected": self.motor_connected,
-            "modbus_stats": copy.deepcopy(self.modbus_stats),
+            "loop_stats": copy.deepcopy(self.loop_stats),
+            "link_stats": copy.deepcopy(self.link_stats),
         }
 
     def apply_config(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -223,7 +216,7 @@ class MockOssmServer:
 
     def __init__(self, dist_dir: Optional[Path] = None) -> None:
         root = Path(__file__).resolve().parent.parent
-        self.dist_dir = Path(dist_dir) if dist_dir else root / "frontend" / "dist"
+        self.dist_dir = Path(dist_dir) if dist_dir else root / "web" / "apps" / "webui-esp32" / "dist"
         self.state = MockDeviceState()
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -236,7 +229,7 @@ class MockOssmServer:
         index = self.dist_dir / "index.html"
         if not index.exists():
             raise FileNotFoundError(
-                f"frontend dist missing: {index} (run: npm run build in frontend/)"
+                f"webui-esp32 dist missing: {index} (run: npm run build -w webui-esp32 in web/)"
             )
         self._index_bytes = index.read_bytes()
 
@@ -248,10 +241,12 @@ class MockOssmServer:
         app.router.add_post("/config", self._post_config)
         app.router.add_get("/state", self._get_state)
         app.router.add_post("/paused", self._post_paused)
-        app.router.add_get("/pin-config", self._get_pin)
-        app.router.add_post("/pin-config", self._post_pin)
-        app.router.add_get("/network-config", self._get_net)
-        app.router.add_post("/network-config", self._post_net)
+        app.router.add_get("/shell-config", self._get_shell)
+        app.router.add_post("/shell-config", self._post_shell)
+        app.router.add_get("/pin-config", self._gone)
+        app.router.add_post("/pin-config", self._gone)
+        app.router.add_get("/network-config", self._gone)
+        app.router.add_post("/network-config", self._gone)
         app.router.add_post("/restart", self._post_restart)
         app.router.add_get("/ws/command", self._ws_command)
 
@@ -300,8 +295,8 @@ class MockOssmServer:
                     {
                         "jsonrpc": "2.0",
                         "method": "state",
+                        "cmd": "state",
                         "params": snap,
-                        "state": snap,
                     }
                 )
                 for ws, interval_ms in list(self._subscribers.items()):
@@ -354,21 +349,16 @@ class MockOssmServer:
         body = await request.json()
         return await self._json(self.state.apply_paused(body))
 
-    async def _get_pin(self, request: web.Request) -> web.Response:
-        return await self._json(copy.deepcopy(self.state.pin))
+    async def _get_shell(self, request: web.Request) -> web.Response:
+        return await self._json(copy.deepcopy(self.state.shell))
 
-    async def _post_pin(self, request: web.Request) -> web.Response:
+    async def _post_shell(self, request: web.Request) -> web.Response:
         body = await request.json()
-        self.state.pin.update(body)
-        return await self._json(copy.deepcopy(self.state.pin))
+        self.state.shell.update(body)
+        return await self._json(copy.deepcopy(self.state.shell))
 
-    async def _get_net(self, request: web.Request) -> web.Response:
-        return await self._json(copy.deepcopy(self.state.net))
-
-    async def _post_net(self, request: web.Request) -> web.Response:
-        body = await request.json()
-        self.state.net.update(body)
-        return await self._json(copy.deepcopy(self.state.net))
+    async def _gone(self, request: web.Request) -> web.Response:
+        return web.Response(status=404, text="Not Found", headers=_cors_headers())
 
     async def _post_restart(self, request: web.Request) -> web.Response:
         self.state.restart_requested = True
@@ -430,6 +420,12 @@ class MockOssmServer:
                     self.state.waypoints.extend(wps)
                     self.state.stream_buffered += len(wps)
                     result = {"ok": True, "buffered": self.state.stream_buffered}
+                elif method == "get-shell-config":
+                    result = copy.deepcopy(self.state.shell)
+                elif method == "set-shell-config":
+                    if isinstance(params, dict):
+                        self.state.shell.update(params)
+                    result = copy.deepcopy(self.state.shell)
                 elif method == "reset-timestamp":
                     self.state.stream_time = 0.0
                     result = "ok"

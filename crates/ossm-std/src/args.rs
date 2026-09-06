@@ -10,11 +10,13 @@ use clap::{Parser, ValueEnum};
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ossm-std", version, about)]
 pub struct Args {
-    /// Process role: servo (Engine is RTU master) or rtu-relay (serve :502 + /ws/modbus)
+    /// Process role: servo, rtu-relay, flash (ESP ROM loader), or console (UART CLI)
     #[arg(long, value_enum, default_value_t = StdMode::Servo)]
     pub mode: StdMode,
 
     /// RS-485 / USB-UART device (env: OSSM_SERIAL, DEVICE_PORT).
+    /// `/dev/ttyUSB*` uses the kernel CDC/ACM driver. `termux-usb:/dev/bus/usb/…`
+    /// re-execs Termux `termux-usb`. Bare `/dev/bus/usb/…` is direct usbfs.
     /// Requires automatic DE/RE direction control; TX-loopback adapters are not supported.
     #[arg(long)]
     pub serial: Option<PathBuf>,
@@ -22,6 +24,58 @@ pub struct Args {
     /// Serial baud (env: OSSM_BAUD, DEVICE_BAUD; default 115200)
     #[arg(long)]
     pub baud: Option<u32>,
+
+    /// Merged firmware image for `--mode flash` (env: OSSM_IMAGE)
+    #[arg(long)]
+    pub image: Option<PathBuf>,
+
+    /// Flash start address (default 0)
+    #[arg(long, default_value_t = 0, value_parser = parse_u32_auto)]
+    pub flash_offset: u32,
+
+    /// SPI flash size advertised to the ROM loader (default 4mb)
+    #[arg(long, default_value = "4mb")]
+    pub flash_size: String,
+
+    /// Skip NVS / phy_init regions of a merged image
+    #[arg(long, default_value_t = false)]
+    pub keep_nvs: bool,
+
+    /// Skip post-write MD5
+    #[arg(long, default_value_t = false)]
+    pub no_verify: bool,
+
+    /// Allow chips whose magic is not ESP32-C6
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+
+    /// Force USB-Serial-JTAG reset sequence
+    #[arg(long, default_value_t = false)]
+    pub usb_jtag: bool,
+
+    /// CLI command to send (`--mode console`, repeatable)
+    #[arg(long)]
+    pub send: Vec<String>,
+
+    /// Keep reading console until this regex matches
+    #[arg(long)]
+    pub until: Option<String>,
+
+    /// Seconds to wait for each `--send` / `--until` (default 10)
+    #[arg(long)]
+    pub timeout: Option<u64>,
+
+    /// Pulse chip reset before `--mode console`
+    #[arg(long, default_value_t = false)]
+    pub reset: bool,
+
+    /// Send the RS-485 magic-exit sequence and wait for the servo ACK
+    #[arg(long, default_value_t = false)]
+    pub exit_rs485: bool,
+
+    /// stdin ↔ serial passthrough
+    #[arg(long, default_value_t = false)]
+    pub raw: bool,
 
     /// HTTP bind address (env: OSSM_BIND; default 127.0.0.1:8080)
     #[arg(long)]
@@ -43,7 +97,7 @@ pub struct Args {
     #[arg(long)]
     pub rs485_ws: Option<String>,
 
-    /// Atomic `{pin,net,motor}` JSON path (env: OSSM_CONFIG; default ossm-config.json)
+    /// Atomic `{ motor, shell }` JSON path (env: OSSM_CONFIG; default ossm-config.json)
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -55,7 +109,7 @@ pub struct Args {
     #[arg(long)]
     pub slave_id: Option<u8>,
 
-    /// Directory containing `index.html` (env: OSSM_STATIC_DIR)
+    /// Optional directory with `index.html` (env: OSSM_STATIC_DIR). Default: bundled webui-std.
     #[arg(long)]
     pub static_dir: Option<PathBuf>,
 
@@ -74,6 +128,8 @@ pub enum StdMode {
     Servo,
     #[value(name = "rtu-relay")]
     RtuRelay,
+    Flash,
+    Console,
 }
 
 impl Args {
@@ -123,10 +179,17 @@ impl Args {
                 self.rs485_ws = Some(v);
             }
         }
+        if self.image.is_none() {
+            if let Some(v) = env_first(&["OSSM_IMAGE"]) {
+                self.image = Some(PathBuf::from(v));
+            }
+        }
         if let Some(v) = env_first(&["OSSM_MODE"]) {
             match v.to_ascii_lowercase().as_str() {
                 "rtu-relay" | "rtu_relay" => self.mode = StdMode::RtuRelay,
                 "servo" => self.mode = StdMode::Servo,
+                "flash" => self.mode = StdMode::Flash,
+                "console" => self.mode = StdMode::Console,
                 _ => {}
             }
         }
@@ -140,7 +203,9 @@ impl Args {
         }
         if self.static_dir.is_none() {
             if let Some(v) = env_first(&["OSSM_STATIC_DIR"]) {
-                self.static_dir = Some(PathBuf::from(v));
+                if !v.is_empty() {
+                    self.static_dir = Some(PathBuf::from(v));
+                }
             }
         }
         if env_truthy("OSSM_REPL") {
@@ -149,6 +214,8 @@ impl Args {
         if env_truthy("OSSM_NO_REPL") {
             self.no_repl = true;
         }
+
+        self.apply_saved_shell();
 
         if self.baud.is_none() {
             self.baud = Some(115200);
@@ -162,9 +229,6 @@ impl Args {
         if self.slave_id.is_none() {
             self.slave_id = Some(1);
         }
-        if self.static_dir.is_none() {
-            self.static_dir = Some(default_static_dir());
-        }
         if self.modbus_bind.is_none() {
             self.modbus_bind = Some(default_modbus_bind());
         }
@@ -172,10 +236,61 @@ impl Args {
             && self.relay_tcp.is_none()
             && self.relay_ws.is_none()
             && self.rs485_ws.is_none()
+            && !matches!(self.mode, StdMode::Flash | StdMode::Console)
         {
             self.mock = true;
         }
         self
+    }
+
+    fn apply_saved_shell(&mut self) {
+        let path = self
+            .config
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("ossm-config.json"));
+        let saved = crate::persist::Persist::new(&path).load();
+        let sh = saved.shell;
+        if self.serial.is_none() {
+            if let Some(s) = sh.serial {
+                self.serial = Some(PathBuf::from(s));
+            }
+        }
+        if self.baud.is_none() {
+            self.baud = sh.baud;
+        }
+        if self.bind.is_none() {
+            if let Some(b) = sh.bind {
+                self.bind = b.parse().ok();
+            }
+        }
+        if self.slave_id.is_none() {
+            self.slave_id = sh.slave_id;
+        }
+        if self.relay_tcp.is_none() {
+            self.relay_tcp = sh.relay_tcp;
+        }
+        if self.relay_ws.is_none() {
+            self.relay_ws = sh.relay_ws;
+        }
+        if self.rs485_ws.is_none() {
+            self.rs485_ws = sh.rs485_ws;
+        }
+        if self.modbus_bind.is_none() {
+            if let Some(b) = sh.modbus_bind {
+                self.modbus_bind = b.parse().ok();
+            }
+        }
+        if !argv_has_flag("mode") && env_first(&["OSSM_MODE"]).is_none() {
+            if let Some(m) = sh.mode {
+                match m.to_ascii_lowercase().as_str() {
+                    "rtu-relay" | "rtu_relay" => self.mode = StdMode::RtuRelay,
+                    "servo" => self.mode = StdMode::Servo,
+                    "flash" => self.mode = StdMode::Flash,
+                    "console" => self.mode = StdMode::Console,
+                    _ => {}
+                }
+            }
+        }
     }
 
     pub fn is_mock(&self) -> bool {
@@ -188,6 +303,18 @@ impl Args {
 
     pub fn is_rtu_relay(&self) -> bool {
         self.mode == StdMode::RtuRelay
+    }
+
+    pub fn is_flash(&self) -> bool {
+        self.mode == StdMode::Flash
+    }
+
+    pub fn is_console(&self) -> bool {
+        self.mode == StdMode::Console
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout.unwrap_or(10)
     }
 
     pub fn has_remote_bus(&self) -> bool {
@@ -228,16 +355,28 @@ impl Args {
     }
 }
 
+fn argv_has_flag(name: &str) -> bool {
+    let long = format!("--{name}");
+    let eq = format!("--{name}=");
+    std::env::args().any(|a| a == long || a.starts_with(&eq))
+}
+
+fn parse_u32_auto(s: &str) -> Result<u32, String> {
+    let t = s.trim();
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u32::from_str_radix(h, 16).map_err(|e| e.to_string())
+    } else {
+        t.parse()
+            .map_err(|e: std::num::ParseIntError| e.to_string())
+    }
+}
+
 fn default_bind() -> SocketAddr {
     "127.0.0.1:8080".parse().unwrap()
 }
 
 fn default_modbus_bind() -> SocketAddr {
     "127.0.0.1:502".parse().unwrap()
-}
-
-pub fn default_static_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/dist")
 }
 
 fn env_first(keys: &[&str]) -> Option<String> {
@@ -276,6 +415,19 @@ mod tests {
             mode: StdMode::Servo,
             serial: None,
             baud: None,
+            image: None,
+            flash_offset: 0,
+            flash_size: "4mb".into(),
+            keep_nvs: false,
+            no_verify: false,
+            force: false,
+            usb_jtag: false,
+            send: Vec::new(),
+            until: None,
+            timeout: None,
+            reset: false,
+            exit_rs485: false,
+            raw: false,
             bind: None,
             modbus_bind: None,
             relay_tcp: None,
@@ -302,5 +454,38 @@ mod tests {
         assert!(args.is_mock());
         assert_eq!(args.baud(), 115200);
         assert_eq!(args.bind_addr(), default_bind());
+    }
+
+    #[test]
+    fn parse_flash_and_console_modes() {
+        use clap::Parser;
+        let flash = Args::try_parse_from([
+            "ossm-std",
+            "--mode",
+            "flash",
+            "--serial",
+            "/dev/bus/usb/001/005",
+            "--image",
+            "fw.bin",
+            "--flash-offset",
+            "0x10000",
+        ])
+        .unwrap();
+        assert_eq!(flash.mode, StdMode::Flash);
+        assert_eq!(flash.flash_offset, 0x10000);
+        let console = Args::try_parse_from([
+            "ossm-std",
+            "--mode",
+            "console",
+            "--serial",
+            "/dev/ttyACM0",
+            "--send",
+            "get pin",
+            "--exit-rs485",
+        ])
+        .unwrap();
+        assert_eq!(console.mode, StdMode::Console);
+        assert_eq!(console.send, vec!["get pin"]);
+        assert!(console.exit_rs485);
     }
 }

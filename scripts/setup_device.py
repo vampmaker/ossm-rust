@@ -1,17 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "pyserial>=3.5",
-#     "python-dotenv>=1.0.0",
-#     "typer>=0.12.0",
-#     "rich>=13.7.0",
-#     "bleak>=0.21.0",
-#     "websockets>=12.0",
-#     "httpx2>=0.1.0",
-#     "pydantic>=2.0.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """
 Post-flashing setup script for OSSM ESP32-C6 / ESP32-S3 firmware.
 Configures WiFi credentials, Modbus GPIO pins, and initial motor parameters over USB serial.

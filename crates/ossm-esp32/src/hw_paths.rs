@@ -1,94 +1,86 @@
-//! Firmware-only pin/net CLI path helpers (GPIO / WiFi). Motor paths stay in `ossm_core::paths`.
+//! Firmware-only shell CLI path helpers (GPIO / WiFi). Motor paths stay in `ossm_core::paths`.
 
 use alloc::format;
 use alloc::string::String;
 
 use ossm_core::paths::{parse_bool, PathError};
 
-use crate::storage::{NetworkConfiguration, PinConfiguration};
+use crate::storage::ShellConfig;
 
 pub const HW_PATHS_CATALOG: &str = "\
-pin — full PinConfiguration JSON
-  pin.modbus_tx / modbus_rx / modbus_de_re     GPIO 0..48
-  pin.modbus_timeout_ms                        0..1000 (0 = default ~10 ms)
-  pin.modbus_rx_timeout_us                     0..200000 (0 = auto)
-  pin.modbus_scan_delay_us                     0..200000 (0 = t3.5)
-  pin.modbus_inter_frame_delay_us              0..200000 (0 = auto)
-  pin.ble_enabled / modbus_debug               true|false (debug: reboot)
-  pin.operating_mode                           servo|rtu_relay|rs485
-  pin.modbus_baud                              1200..3000000 (default 115200)
-
-net — full NetworkConfiguration JSON
-  net.wifi_enabled / dhcp_enabled              true|false
-  net.ssid / password / hostname               string (quote if spaces)
-  net.static_ip / static_mask / static_gateway / static_dns   IPv4
+shell — full ShellConfig JSON
+  shell.modbus_tx / modbus_rx / modbus_de_re   GPIO 0..48
+  shell.modbus_timeout_ms                      0..1000 (0 = default ~10 ms)
+  shell.modbus_rx_timeout_us                   0..200000 (0 = auto)
+  shell.modbus_scan_delay_us                   0..200000 (0 = t3.5)
+  shell.modbus_inter_frame_delay_us            0..200000 (0 = auto)
+  shell.ble_enabled / modbus_debug             true|false (debug: reboot)
+  shell.operating_mode                         servo|rtu_relay|rs485
+  shell.modbus_baud                            1200..3000000 (default 115200)
+  shell.wifi_enabled / dhcp_enabled            true|false
+  shell.ssid / password / hostname             string (quote if spaces)
+  shell.static_ip / static_mask / static_gateway / static_dns   IPv4
+  aliases: pin.* and net.* (ACK is shell.<key>)
 
 inject — RAM fault injection (modbus_debug only)
   get inject                                   mode nbytes
   set inject <off|leading|trailing|both> <nbytes 0..64>";
 
-pub fn pin_field(pin: &PinConfiguration, key: &str) -> Result<String, PathError> {
+pub fn shell_field(shell: &ShellConfig, key: &str) -> Result<String, PathError> {
     match key {
-        "modbus_tx" => Ok(format!("{}", pin.modbus_tx)),
-        "modbus_rx" => Ok(format!("{}", pin.modbus_rx)),
-        "modbus_de_re" => Ok(format!("{}", pin.modbus_de_re)),
-        "modbus_timeout_ms" => Ok(format!("{}", pin.modbus_timeout_ms)),
-        "modbus_rx_timeout_us" => Ok(format!("{}", pin.modbus_rx_timeout_us)),
-        "modbus_scan_delay_us" => Ok(format!("{}", pin.modbus_scan_delay_us)),
-        "modbus_inter_frame_delay_us" => Ok(format!("{}", pin.modbus_inter_frame_delay_us)),
-        "ble_enabled" => Ok(bool_str(pin.ble_enabled)),
-        "modbus_debug" => Ok(bool_str(pin.modbus_debug)),
-        "operating_mode" => Ok(pin.operating_mode.clone()),
-        "modbus_baud" => Ok(format!("{}", pin.modbus_baud)),
-        _ => Err(PathError::UnknownKey),
-    }
-}
-
-pub fn net_field(net: &NetworkConfiguration, key: &str) -> Result<String, PathError> {
-    match key {
-        "wifi_enabled" => Ok(bool_str(net.wifi_enabled)),
-        "dhcp_enabled" => Ok(bool_str(net.dhcp_enabled)),
-        "ssid" => Ok(net.ssid.clone()),
+        "modbus_tx" => Ok(format!("{}", shell.modbus_tx)),
+        "modbus_rx" => Ok(format!("{}", shell.modbus_rx)),
+        "modbus_de_re" => Ok(format!("{}", shell.modbus_de_re)),
+        "modbus_timeout_ms" => Ok(format!("{}", shell.modbus_timeout_ms)),
+        "modbus_rx_timeout_us" => Ok(format!("{}", shell.modbus_rx_timeout_us)),
+        "modbus_scan_delay_us" => Ok(format!("{}", shell.modbus_scan_delay_us)),
+        "modbus_inter_frame_delay_us" => Ok(format!("{}", shell.modbus_inter_frame_delay_us)),
+        "ble_enabled" => Ok(bool_str(shell.ble_enabled)),
+        "modbus_debug" => Ok(bool_str(shell.modbus_debug)),
+        "operating_mode" => Ok(shell.operating_mode.clone()),
+        "modbus_baud" => Ok(format!("{}", shell.modbus_baud)),
+        "wifi_enabled" => Ok(bool_str(shell.wifi_enabled)),
+        "dhcp_enabled" => Ok(bool_str(shell.dhcp_enabled)),
+        "ssid" => Ok(shell.ssid.clone()),
         "password" => Ok(String::from("(hidden)")),
-        "hostname" => Ok(net.hostname.clone()),
-        "static_ip" => Ok(net.static_ip.clone()),
-        "static_mask" => Ok(net.static_mask.clone()),
-        "static_gateway" => Ok(net.static_gateway.clone()),
-        "static_dns" => Ok(net.static_dns.clone()),
+        "hostname" => Ok(shell.hostname.clone()),
+        "static_ip" => Ok(shell.static_ip.clone()),
+        "static_mask" => Ok(shell.static_mask.clone()),
+        "static_gateway" => Ok(shell.static_gateway.clone()),
+        "static_dns" => Ok(shell.static_dns.clone()),
         _ => Err(PathError::UnknownKey),
     }
 }
 
-pub fn set_pin(pin: &mut PinConfiguration, key: &str, value: &str) -> Result<(), PathError> {
+pub fn set_shell(shell: &mut ShellConfig, key: &str, value: &str) -> Result<(), PathError> {
     match key {
         "modbus_tx" | "modbus_rx" | "modbus_de_re" => {
             let gpio = parse_gpio(value)?;
             match key {
-                "modbus_tx" => pin.modbus_tx = gpio,
-                "modbus_rx" => pin.modbus_rx = gpio,
-                _ => pin.modbus_de_re = gpio,
+                "modbus_tx" => shell.modbus_tx = gpio,
+                "modbus_rx" => shell.modbus_rx = gpio,
+                _ => shell.modbus_de_re = gpio,
             }
             Ok(())
         }
         "modbus_timeout_ms" => {
-            let v = parse_u32_max(value, 1000)?;
-            pin.modbus_timeout_ms = v;
+            shell.modbus_timeout_ms = parse_u32_max(value, 1000)?;
             Ok(())
         }
         "modbus_rx_timeout_us" | "modbus_scan_delay_us" | "modbus_inter_frame_delay_us" => {
             let v = parse_u32_max(value, 200_000)?;
             match key {
-                "modbus_rx_timeout_us" => pin.modbus_rx_timeout_us = v,
-                "modbus_scan_delay_us" => pin.modbus_scan_delay_us = v,
-                _ => pin.modbus_inter_frame_delay_us = v,
+                "modbus_rx_timeout_us" => shell.modbus_rx_timeout_us = v,
+                "modbus_scan_delay_us" => shell.modbus_scan_delay_us = v,
+                _ => shell.modbus_inter_frame_delay_us = v,
             }
             Ok(())
         }
         "ble_enabled" | "modbus_debug" => {
             let v = parse_bool(value).ok_or(PathError::InvalidValue)?;
             match key {
-                "ble_enabled" => pin.ble_enabled = v,
-                _ => pin.modbus_debug = v,
+                "ble_enabled" => shell.ble_enabled = v,
+                _ => shell.modbus_debug = v,
             }
             Ok(())
         }
@@ -96,7 +88,7 @@ pub fn set_pin(pin: &mut PinConfiguration, key: &str, value: &str) -> Result<(),
             if crate::storage::parse_operating_mode(value).is_none() {
                 return Err(PathError::InvalidValue);
             }
-            pin.operating_mode = String::from(value);
+            shell.operating_mode = String::from(value);
             Ok(())
         }
         "modbus_baud" => {
@@ -104,49 +96,43 @@ pub fn set_pin(pin: &mut PinConfiguration, key: &str, value: &str) -> Result<(),
             if v != 0 && v < 1200 {
                 return Err(PathError::InvalidValue);
             }
-            pin.modbus_baud = if v == 0 { 115_200 } else { v };
+            shell.modbus_baud = if v == 0 { 115_200 } else { v };
             Ok(())
         }
-        _ => Err(PathError::UnknownKey),
-    }
-}
-
-pub fn set_net(net: &mut NetworkConfiguration, key: &str, value: &str) -> Result<(), PathError> {
-    match key {
         "wifi_enabled" => {
-            net.wifi_enabled = parse_bool(value).ok_or(PathError::InvalidValue)?;
+            shell.wifi_enabled = parse_bool(value).ok_or(PathError::InvalidValue)?;
             Ok(())
         }
         "dhcp_enabled" => {
-            net.dhcp_enabled = parse_bool(value).ok_or(PathError::InvalidValue)?;
+            shell.dhcp_enabled = parse_bool(value).ok_or(PathError::InvalidValue)?;
             Ok(())
         }
         "ssid" => {
-            net.ssid = String::from(value);
+            shell.ssid = String::from(value);
             Ok(())
         }
         "password" => {
-            net.password = String::from(value);
+            shell.password = String::from(value);
             Ok(())
         }
         "hostname" => {
-            net.hostname = String::from(value);
+            shell.hostname = String::from(value);
             Ok(())
         }
         "static_ip" => {
-            net.static_ip = String::from(value);
+            shell.static_ip = String::from(value);
             Ok(())
         }
         "static_mask" => {
-            net.static_mask = String::from(value);
+            shell.static_mask = String::from(value);
             Ok(())
         }
         "static_gateway" => {
-            net.static_gateway = String::from(value);
+            shell.static_gateway = String::from(value);
             Ok(())
         }
         "static_dns" => {
-            net.static_dns = String::from(value);
+            shell.static_dns = String::from(value);
             Ok(())
         }
         _ => Err(PathError::UnknownKey),

@@ -1,0 +1,24 @@
+{
+  "app": {
+    "title": "OSSM WASM"
+  },
+  "connection": {
+    "mode": "Mode",
+    "serial": "Local Serial",
+    "rs485": "RS-485 WebSocket",
+    "modbusWs": "Modbus WebSocket",
+    "remoteApi": "Remote API",
+    "mock": "Mock",
+    "baud": "Baud",
+    "wsUrl": "WebSocket",
+    "modbusWsUrl": "Modbus WebSocket",
+    "apiUrl": "API base URL",
+    "connect": "Connect",
+    "disconnect": "Disconnect",
+    "homing": "Homing…",
+    "motorReady": "Motor ready"
+  },
+  "telemetry": {
+    "title": "Live Telemetry"
+  }
+}

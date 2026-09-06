@@ -1,17 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "websockets>=12.0",
-#     "python-dotenv>=1.0.0",
-#     "httpx2>=0.1.0",
-#     "pyserial>=3.5",
-#     "bleak>=0.21.0",
-#     "typer>=0.12.0",
-#     "rich>=13.7.0",
-#     "pydantic>=2.0.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """
 Automated Funscript Playback & Streaming verification script for OSSM firmware.
 Tests .funscript parsing, trajectory scaling, chunked waypoint streaming, and device buffer state.

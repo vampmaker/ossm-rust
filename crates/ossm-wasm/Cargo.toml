@@ -1,0 +1,27 @@
+[package]
+name = "ossm-wasm"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Browser shell: Engine tick, AIM30 RTU, and control RPC for a dedicated worker"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ossm-core = { path = "../ossm-core" }
+ossm-common = { path = "../ossm-common" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rmodbus = { version = "0.9", default-features = false, features = ["fixedvec"] }
+fixedvec = "0.2"
+log = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+pollster = "0.4"

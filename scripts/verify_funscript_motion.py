@@ -1,17 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "websockets>=12.0",
-#     "python-dotenv>=1.0.0",
-#     "rich>=13.7.0",
-#     "pyserial>=3.5",
-#     "httpx2>=0.1.0",
-#     "bleak>=0.21.0",
-#     "typer>=0.12.0",
-#     "pydantic>=2.0.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """
 verify_funscript_motion.py
 
@@ -35,7 +22,7 @@ from rich.table import Table
 from rich.panel import Panel
 
 sys.path.insert(0, str(Path(__file__).parent))
-from ossm import DeviceBackend
+from ossm import DeviceBackend, load_env
 
 console = Console()
 
@@ -91,7 +78,9 @@ def print_ascii_curve(samples: List[Dict[str, Any]]):
 
 
 async def run_verification(mode: str):
-    backend = DeviceBackend(mode=mode)
+    load_env()
+    ip = os.environ.get("DEVICE_IP", "").strip().strip('"')
+    backend = DeviceBackend(mode=mode, ip=ip or "127.0.0.1")
     console.print(f"[bold cyan]Connecting to OSSM device via '{mode.upper()}' mode...[/bold cyan]")
 
     funscript_doc = generate_large_funscript()
@@ -111,80 +100,116 @@ async def run_verification(mode: str):
     min_y = 1.0
 
     if mode == "wifi":
-        from websockets.sync.client import connect as ws_connect
+        import websockets
+
         ws_url = f"ws://{backend.ip}/ws/command"
-        ws = ws_connect(ws_url, open_timeout=5.0)
+        console.print(f"[dim]WebSocket {ws_url} (protocol pings disabled)[/dim]")
+        full_cfg: dict = {}
+        try:
+            async with websockets.connect(
+                ws_url, open_timeout=5.0, ping_interval=None, ping_timeout=None
+            ) as ws:
 
-        def ws_rpc(method: str, params: Any = None, req_id: int = 1):
-            req = {"jsonrpc": "2.0", "method": method, "id": req_id}
-            if params is not None:
-                req["params"] = params
-            ws.send(json.dumps(req))
-            while True:
-                msg = ws.recv()
-                data = json.loads(msg)
-                if data.get("id") == req_id:
-                    return data
+                async def ws_rpc(method: str, params: Any = None, req_id: int = 1):
+                    req = {"jsonrpc": "2.0", "method": method, "id": req_id}
+                    if params is not None:
+                        req["params"] = params
+                    await ws.send(json.dumps(req))
+                    deadline = time.time() + 10.0
+                    while time.time() < deadline:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=max(0.1, deadline - time.time()))
+                        data = json.loads(msg)
+                        if data.get("id") == req_id:
+                            return data
+                    raise TimeoutError(f"RPC {method} id={req_id} timed out")
 
-        ws_rpc("reset-timestamp", req_id=10)
-        state_res = ws_rpc("get-state", req_id=9)
-        full_cfg = state_res.get("result", {}).get("config", {})
-        full_cfg.update({"streaming": True, "paused": False, "depth": 1.0})
-        ws_rpc("set-config", params=full_cfg, req_id=11)
-        initial_chunk = waypoints[:20]
-        ws_rpc("set-waypoints", params={"waypoints": initial_chunk, "reset-timestamp": True}, req_id=12)
-        next_wp_idx = len(initial_chunk)
+                console.print("[dim]RPC reset-timestamp...[/dim]")
+                await ws_rpc("reset-timestamp", req_id=10)
+                console.print("[dim]RPC get-state...[/dim]")
+                state_res = await ws_rpc("get-state", req_id=9)
+                full_cfg = dict(state_res.get("result", {}).get("config", {}))
+                full_cfg.update({"streaming": True, "paused": False, "depth": 1.0})
+                console.print("[dim]RPC set-config streaming...[/dim]")
+                await ws_rpc("set-config", params=full_cfg, req_id=11)
+                initial_chunk = waypoints[:20]
+                console.print("[dim]RPC set-waypoints...[/dim]")
+                await ws_rpc(
+                    "set-waypoints",
+                    params={"waypoints": initial_chunk, "reset-timestamp": True},
+                    req_id=12,
+                )
+                next_wp_idx = len(initial_chunk)
 
-        ws_rpc("subscribe-state", params={"interval_ms": 100}, req_id=13)
-        console.print("[bold green]Streaming live waypoints and capturing WebSocket high-frequency push telemetry...[/bold green]")
+                await ws_rpc("subscribe-state", params={"interval_ms": 100}, req_id=13)
+                console.print(
+                    "[bold green]Streaming live waypoints and capturing WebSocket high-frequency push telemetry...[/bold green]"
+                )
 
-        start_time = time.time()
-        while (time.time() - start_time) < (total_duration_s + 1.0):
+                start_time = time.time()
+                pending_append = False
+                while (time.time() - start_time) < (total_duration_s + 1.0):
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=0.3)
+                        data = json.loads(msg)
+                        if data.get("id") == 99:
+                            pending_append = False
+                            continue
+                        if data.get("method") == "state":
+                            params = data.get("params", {})
+                            y_val = params.get("y", 0.0)
+                            pos_val = params.get("position", 0.0)
+                            stream_info = params.get("stream", {})
+                            buffered = stream_info.get("buffered", 0)
+                            stream_time = stream_info.get("stream_time", 0.0)
+                            underrun = stream_info.get("underrun", False)
+
+                            if underrun and next_wp_idx < total_waypoints:
+                                underruns_detected += 1
+
+                            max_y = max(max_y, y_val)
+                            min_y = min(min_y, y_val)
+
+                            telemetry_samples.append({
+                                "wall_t": round(time.time() - start_time, 2),
+                                "stream_time": round(stream_time, 2),
+                                "y": round(y_val, 3),
+                                "pos": round(pos_val, 3),
+                                "buffered": buffered,
+                                "underrun": underrun,
+                                "update_history": (params.get("loop_stats") or {}).get(
+                                    "update_history", []
+                                ),
+                                "position_history": params.get("position_history", []),
+                            })
+
+                            if (
+                                buffered < 30
+                                and next_wp_idx < total_waypoints
+                                and not pending_append
+                            ):
+                                chunk = waypoints[next_wp_idx : next_wp_idx + 20]
+                                await ws.send(json.dumps({
+                                    "jsonrpc": "2.0",
+                                    "method": "append-waypoints",
+                                    "params": chunk,
+                                    "id": 99,
+                                }))
+                                next_wp_idx += len(chunk)
+                                pending_append = True
+                    except TimeoutError:
+                        continue
+                    except Exception as e:
+                        console.print(f"[red]WS recv error: {type(e).__name__}: {e}[/red]")
+                        break
+
+                await ws_rpc("unsubscribe-state", req_id=100)
+                full_cfg.update({"streaming": False, "paused": True})
+                await ws_rpc("set-config", params=full_cfg, req_id=101)
+        finally:
             try:
-                msg = ws.recv(timeout=0.3)
-                data = json.loads(msg)
-                if data.get("method") == "state":
-                    params = data.get("params", {})
-                    y_val = params.get("y", 0.0)
-                    pos_val = params.get("position", 0.0)
-                    stream_info = params.get("stream", {})
-                    buffered = stream_info.get("buffered", 0)
-                    stream_time = stream_info.get("stream_time", 0.0)
-                    underrun = stream_info.get("underrun", False)
-
-                    if underrun and next_wp_idx < total_waypoints:
-                        underruns_detected += 1
-
-                    max_y = max(max_y, y_val)
-                    min_y = min(min_y, y_val)
-
-                    telemetry_samples.append({
-                        "wall_t": round(time.time() - start_time, 2),
-                        "stream_time": round(stream_time, 2),
-                        "y": round(y_val, 3),
-                        "pos": round(pos_val, 3),
-                        "buffered": buffered,
-                        "underrun": underrun,
-                        "update_history": params.get("update_history", []),
-                        "position_history": params.get("position_history", []),
-                    })
-
-                    if buffered < 30 and next_wp_idx < total_waypoints:
-                        chunk = waypoints[next_wp_idx : next_wp_idx + 20]
-                        ws.send(json.dumps({
-                            "jsonrpc": "2.0",
-                            "method": "append-waypoints",
-                            "params": chunk,
-                            "id": 99,
-                        }))
-                        next_wp_idx += len(chunk)
+                await backend.set_config({"streaming": False, "paused": True})
             except Exception:
-                continue
-
-        ws_rpc("unsubscribe-state", req_id=100)
-        full_cfg.update({"streaming": False, "paused": True})
-        ws_rpc("set-config", params=full_cfg, req_id=101)
-        ws.close()
+                pass
 
     else:
         # 0. Reset timestamp explicitly
@@ -228,7 +253,9 @@ async def run_verification(mode: str):
                 "pos": round(pos_val, 3),
                 "buffered": buffered,
                 "underrun": underrun,
-                "update_history": state_data.get("update_history", []),
+                "update_history": (state_data.get("loop_stats") or {}).get(
+                    "update_history", []
+                ),
                 "position_history": state_data.get("position_history", []),
             })
 

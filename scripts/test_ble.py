@@ -1,17 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "bleak>=0.21.0",
-#     "python-dotenv>=1.0.0",
-#     "typer>=0.12.0",
-#     "rich>=13.7.0",
-#     "websockets>=12.0",
-#     "httpx2>=0.1.0",
-#     "pyserial>=3.5",
-#     "pydantic>=2.0.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """
 OSSM BLE Verification & Motor Test Script
 Connects to the OSSM device via Bluetooth Low Energy (BLE),
@@ -46,7 +33,7 @@ async def run_tests():
         motor_config = status.get("config", {})
         motor_state = status.get("state", {})
         print(f"Motor Config: bpm={motor_config.get('bpm')}, depth={motor_config.get('depth')}, paused={motor_config.get('paused')}")
-        print(f"Motor State: position={motor_state.get('position')}, ups={motor_state.get('ups')}, t={motor_state.get('t')}")
+        print(f"Motor State: position={motor_state.get('position')}, ups={(motor_state.get('loop_stats') or {}).get('ups')}, t={motor_state.get('t')}")
         assert "bpm" in motor_config, "Motor config missing bpm field!"
         assert "position" in motor_state, "Motor state missing position field (GATT state characteristic not populated)!"
 

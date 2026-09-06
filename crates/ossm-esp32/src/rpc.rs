@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::context::AppContext;
 use crate::http_api::{RpcRequest, SubscribeParams, WaypointsInput};
 use crate::motion::{MotionCommand, MotorControllerConfig};
-use crate::storage::NetworkConfiguration;
+use crate::storage::ShellConfig;
 
 pub enum RpcAction {
     Respond(String),
@@ -27,6 +27,30 @@ async fn err_response(id: &serde_json::Value, code: i32, message: &'static str) 
     })
     .unwrap_or(None);
     RpcAction::Respond(encoded.unwrap_or_else(|| String::from(INTERNAL_JSON)))
+}
+
+fn encode_snapshot_result(
+    id: &serde_json::Value,
+    app_context: AppContext,
+    buf: &mut [u8],
+) -> Option<String> {
+    let state = app_context.load_snapshot();
+    ossm_core::rpc::write_result(id, state.as_ref(), buf).and_then(|n| bytes_to_string(&buf[..n]))
+}
+
+/// Encode `StateResponse` while the scratchpad is already held. The Arc is
+/// created inside the closure and dropped before this async fn returns.
+async fn respond_snapshot(id: &serde_json::Value, app_context: AppContext) -> RpcAction {
+    if let Some(Some(s)) =
+        crate::buffers::try_with_scratchpad(|buf| encode_snapshot_result(id, app_context, buf))
+    {
+        return RpcAction::Respond(s);
+    }
+    match crate::buffers::with_scratchpad(|buf| encode_snapshot_result(id, app_context, buf)).await
+    {
+        Some(s) => RpcAction::Respond(s),
+        None => err_response(id, -32603, "Serialization failed").await,
+    }
 }
 
 async fn respond<T: Serialize + ?Sized>(id: &serde_json::Value, result: &T) -> RpcAction {
@@ -63,10 +87,7 @@ pub async fn dispatch_rpc(request: &RpcRequest, app_context: AppContext) -> RpcA
             let status = app_context.load_snapshot().stream;
             respond(&id, &status).await
         }
-        "get-state" | "get_state" => {
-            let state = app_context.load_snapshot();
-            respond(&id, &*state).await
-        }
+        "get-state" | "get_state" => respond_snapshot(&id, app_context).await,
         "set-config" | "set_config" => {
             if blocked {
                 return err_response(&id, -32001, "not servo mode").await;
@@ -137,13 +158,20 @@ pub async fn dispatch_rpc(request: &RpcRequest, app_context: AppContext) -> RpcA
                 .await;
             respond(&id, "ok").await
         }
-        "get-network-config" | "get_network_config" => {
-            let conf = app_context.storage.net();
+        "get-shell-config" | "get_shell_config" => {
+            let conf = app_context.storage.shell();
             respond(&id, &conf).await
         }
-        "set-network-config" | "set_network_config" => {
-            if let Ok(conf) = request.parse_params::<NetworkConfiguration>() {
-                app_context.storage.set_net(conf.clone());
+        "set-shell-config" | "set_shell_config" => {
+            if let Ok(conf) = request.parse_params::<ShellConfig>() {
+                if conf.modbus_timeout_ms > 1000
+                    || conf.modbus_scan_delay_us > 200_000
+                    || conf.modbus_inter_frame_delay_us > 200_000
+                    || crate::storage::parse_operating_mode(&conf.operating_mode).is_none()
+                {
+                    return err_response(&id, -32602, "Invalid params").await;
+                }
+                app_context.storage.set_shell(conf.clone());
                 return respond(&id, &conf).await;
             }
             err_response(&id, -32602, "Invalid params").await

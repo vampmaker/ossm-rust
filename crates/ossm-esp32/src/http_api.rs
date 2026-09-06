@@ -28,7 +28,7 @@ use crate::modbus_rtu::{self, InjectJunkMode};
 use crate::motion::MotorControllerConfig;
 use crate::rpc::{self, RpcAction};
 use crate::rs485;
-use crate::storage::{parse_operating_mode, NetworkConfiguration, PinConfiguration};
+use crate::storage::{parse_operating_mode, ShellConfig};
 
 pub use ossm_core::{PausedControl, RpcRequest, SubscribeParams, WaypointsInput};
 
@@ -43,13 +43,16 @@ const NO_GZIP_HTML: &[u8] = b"\
 
 pub const HTTP_BUFFER_SIZE: usize = 2048;
 pub const TCP_BUFFER_SIZE: usize = 1024;
-pub const WEB_TASK_POOL_SIZE: usize = 1;
+pub const WEB_TASK_POOL_SIZE: usize = 2;
 const TCP_POOL_SIZE: usize = 10;
 const Q_ACCEPTORS: usize = 4;
 const WS_MAX: usize = 3;
 const MODBUS_WS_MAX: usize = 2;
 const RS485_WS_MAX: usize = 2;
-const MODBUS_TCP_POOL: usize = 2;
+/// Socket buffers for :502. `accept()` parks one buffer in listen, so this must
+/// stay larger than session tasks + channel depth or SYN gets Connection refused.
+const MODBUS_TCP_BUFFERS_N: usize = 4;
+const MODBUS_TCP_SESSIONS: usize = 2;
 const MODBUS_TCP_BUFFER_SIZE: usize = 512;
 const MAX_BODY_LEN: usize = 1024;
 
@@ -77,7 +80,7 @@ static TCP_BUFFERS: StaticCell<TcpBuffers<TCP_POOL_SIZE, TCP_BUFFER_SIZE, TCP_BU
     StaticCell::new();
 static TCP_FACTORY: StaticCell<Tcp<'static>> = StaticCell::new();
 static MODBUS_TCP_BUFFERS: StaticCell<
-    TcpBuffers<MODBUS_TCP_POOL, MODBUS_TCP_BUFFER_SIZE, MODBUS_TCP_BUFFER_SIZE>,
+    TcpBuffers<MODBUS_TCP_BUFFERS_N, MODBUS_TCP_BUFFER_SIZE, MODBUS_TCP_BUFFER_SIZE>,
 > = StaticCell::new();
 static MODBUS_TCP_FACTORY: StaticCell<Tcp<'static>> = StaticCell::new();
 static SOCKET_QUEUE: Channel<CriticalSectionRawMutex, (SyncTcpSocket, usize), Q_ACCEPTORS> =
@@ -138,6 +141,34 @@ async fn write_all_conn(
     Ok(())
 }
 
+/// Gzip HTML is large; yield so WiFi/WS keep running while the body drains.
+async fn write_all_conn_yielding(
+    conn: &mut HttpConn<'_>,
+    data: &[u8],
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    const CHUNK: usize = 512;
+    let mut offset = 0;
+    while offset < data.len() {
+        let end = (offset + CHUNK).min(data.len());
+        let written = conn.write(&data[offset..end]).await?;
+        if written == 0 {
+            break;
+        }
+        offset += written;
+        if offset < data.len() {
+            Timer::after(Duration::from_micros(100)).await;
+        }
+    }
+    conn.flush().await?;
+    Ok(())
+}
+
+async fn encode_json_vec<T: serde::Serialize>(obj: &T) -> Option<Vec<u8>> {
+    let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
+    let len = serde_json_core::to_slice(obj, &mut *lease).ok()?;
+    Some(lease[..len].to_vec())
+}
+
 async fn send_json(
     conn: &mut HttpConn<'_>,
     status: u16,
@@ -163,22 +194,20 @@ async fn send_json_obj<T: serde::Serialize>(
     reason: &'static str,
     obj: &T,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
-    if let Ok(len) = serde_json_core::to_slice(obj, &mut *lease) {
-        conn.initiate_response(
-            status,
-            Some(reason),
-            &[
-                ("Content-Type", "application/json"),
-                ("Access-Control-Allow-Origin", "*"),
-                ("Connection", "close"),
-            ],
-        )
-        .await?;
-        write_all_conn(conn, &lease[..len]).await
-    } else {
-        send_json(conn, 500, "Internal Server Error", "Serialization failed").await
-    }
+    let Some(body) = encode_json_vec(obj).await else {
+        return send_json(conn, 500, "Internal Server Error", "Serialization failed").await;
+    };
+    conn.initiate_response(
+        status,
+        Some(reason),
+        &[
+            ("Content-Type", "application/json"),
+            ("Access-Control-Allow-Origin", "*"),
+            ("Connection", "close"),
+        ],
+    )
+    .await?;
+    write_all_conn(conn, &body).await
 }
 
 async fn cors_preflight(
@@ -240,7 +269,7 @@ async fn serve_html(conn: &mut HttpConn<'_>) -> Result<(), HttpError<edge_nal_em
             ],
         )
         .await?;
-        write_all_conn(conn, APP_HTML_GZ).await
+        write_all_conn_yielding(conn, APP_HTML_GZ).await
     } else {
         conn.initiate_response(
             200,
@@ -260,133 +289,173 @@ async fn get_config(
     conn: &mut HttpConn<'_>,
     ctx: AppContext,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let config = ctx.load_snapshot().config.clone();
+    let config = ctx.load_snapshot().config;
     send_json_obj(conn, 200, "OK", &config).await
 }
 
-async fn post_config(
-    conn: &mut HttpConn<'_>,
+struct RestErr {
+    status: u16,
+    reason: &'static str,
+    msg: &'static str,
+}
+
+async fn post_config_apply(
     ctx: AppContext,
     body: Vec<u8>,
-) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+) -> Result<MotorControllerConfig, RestErr> {
     if motion_blocked(ctx) {
-        return send_json(conn, 409, "Conflict", "not servo mode").await;
+        return Err(RestErr {
+            status: 409,
+            reason: "Conflict",
+            msg: "not servo mode",
+        });
     }
     if body.len() > 1024 {
-        return send_json(conn, 400, "Bad Request", "Request too large").await;
+        return Err(RestErr {
+            status: 400,
+            reason: "Bad Request",
+            msg: "Request too large",
+        });
     }
-    let config_res = serde_json::from_slice::<MotorControllerConfig>(&body);
+    let config = serde_json::from_slice::<MotorControllerConfig>(&body).map_err(|_| RestErr {
+        status: 400,
+        reason: "Bad Request",
+        msg: "Bad Request",
+    })?;
+    match ctx.try_enqueue_config(config).await {
+        Ok(applied) => Ok(applied),
+        Err("Stale causal version") => Err(RestErr {
+            status: 409,
+            reason: "Conflict",
+            msg: "Stale causal version",
+        }),
+        Err(msg) => Err(RestErr {
+            status: 503,
+            reason: "Service Unavailable",
+            msg,
+        }),
+    }
+}
 
-    match config_res {
-        Ok(config) => match ctx.try_enqueue_config(config).await {
-            Ok(applied) => send_json_obj(conn, 200, "OK", &applied).await,
-            Err("Stale causal version") => {
-                send_json(conn, 409, "Conflict", "Stale causal version").await
-            }
-            Err(msg) => send_json(conn, 503, "Service Unavailable", msg).await,
-        },
-        Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
+async fn post_paused_apply(
+    ctx: AppContext,
+    body: Vec<u8>,
+) -> Result<MotorControllerConfig, RestErr> {
+    if motion_blocked(ctx) {
+        return Err(RestErr {
+            status: 409,
+            reason: "Conflict",
+            msg: "not servo mode",
+        });
     }
+    if body.len() > MAX_BODY_LEN {
+        return Err(RestErr {
+            status: 400,
+            reason: "Bad Request",
+            msg: "Request too large",
+        });
+    }
+    let control = serde_json::from_slice::<PausedControl>(&body).map_err(|_| RestErr {
+        status: 400,
+        reason: "Bad Request",
+        msg: "Bad Request",
+    })?;
+    let mut config = ctx.load_snapshot().config;
+    if let Some(paused) = control.paused {
+        config.paused = paused;
+    }
+    if let Some(position) = control.position.or(control.paused_position) {
+        config.paused_position = position.clamp(0.0, 1.0);
+    }
+    if let Some(adjust) = control.adjust {
+        config.paused_position = (config.paused_position + adjust).clamp(0.0, 1.0);
+    }
+    match ctx
+        .try_enqueue_paused(config.paused, Some(config.paused_position))
+        .await
+    {
+        Ok(applied) => Ok(applied),
+        Err("Stale causal version") => Err(RestErr {
+            status: 409,
+            reason: "Conflict",
+            msg: "Stale causal version",
+        }),
+        Err(msg) => Err(RestErr {
+            status: 503,
+            reason: "Service Unavailable",
+            msg,
+        }),
+    }
+}
+
+async fn send_rest_err(
+    conn: &mut HttpConn<'_>,
+    err: RestErr,
+) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+    send_json(conn, err.status, err.reason, err.msg).await
 }
 
 async fn get_state(
     conn: &mut HttpConn<'_>,
     ctx: AppContext,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let state = ctx.load_snapshot();
-    send_json_obj(conn, 200, "OK", state.as_ref()).await
-}
-
-async fn post_paused(
-    conn: &mut HttpConn<'_>,
-    ctx: AppContext,
-    body: Vec<u8>,
-) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    if motion_blocked(ctx) {
-        return send_json(conn, 409, "Conflict", "not servo mode").await;
-    }
-    if body.len() > MAX_BODY_LEN {
-        return send_json(conn, 400, "Bad Request", "Request too large").await;
-    }
-    match serde_json::from_slice::<PausedControl>(&body) {
-        Ok(control) => {
-            let mut config = ctx.load_snapshot().config.clone();
-            if let Some(paused) = control.paused {
-                config.paused = paused;
-            }
-            if let Some(position) = control.position.or(control.paused_position) {
-                config.paused_position = position.clamp(0.0, 1.0);
-            }
-            if let Some(adjust) = control.adjust {
-                config.paused_position = (config.paused_position + adjust).clamp(0.0, 1.0);
-            }
-            match ctx.try_enqueue_config(config).await {
-                Ok(applied) => send_json_obj(conn, 200, "OK", &applied).await,
-                Err("Stale causal version") => {
-                    send_json(conn, 409, "Conflict", "Stale causal version").await
-                }
-                Err(msg) => send_json(conn, 503, "Service Unavailable", msg).await,
+    let body = {
+        let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
+        let state = ctx.load_snapshot();
+        match serde_json_core::to_slice(state.as_ref(), &mut *lease) {
+            Ok(len) => lease[..len].to_vec(),
+            Err(_) => {
+                return send_json(conn, 500, "Internal Server Error", "Serialization failed").await;
             }
         }
-        Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
-    }
+    };
+    conn.initiate_response(
+        200,
+        Some("OK"),
+        &[
+            ("Content-Type", "application/json"),
+            ("Access-Control-Allow-Origin", "*"),
+            ("Connection", "close"),
+        ],
+    )
+    .await?;
+    write_all_conn(conn, &body).await
 }
 
-async fn get_pin_config(
+async fn get_shell_config(
     conn: &mut HttpConn<'_>,
     ctx: AppContext,
 ) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let config = ctx.storage.pin();
+    let config = ctx.storage.shell();
     send_json_obj(conn, 200, "OK", &config).await
 }
 
-async fn post_pin_config(
-    conn: &mut HttpConn<'_>,
-    ctx: AppContext,
-    body: Vec<u8>,
-) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
+async fn post_shell_apply(ctx: AppContext, body: Vec<u8>) -> Result<ShellConfig, RestErr> {
     if body.len() > MAX_BODY_LEN {
-        return send_json(conn, 400, "Bad Request", "Request too large").await;
+        return Err(RestErr {
+            status: 400,
+            reason: "Bad Request",
+            msg: "Request too large",
+        });
     }
-    match serde_json::from_slice::<PinConfiguration>(&body) {
-        Ok(config) => {
-            if config.modbus_timeout_ms > 1000
-                || config.modbus_scan_delay_us > 200_000
-                || config.modbus_inter_frame_delay_us > 200_000
-                || parse_operating_mode(&config.operating_mode).is_none()
-            {
-                return send_json(conn, 400, "Bad Request", "Invalid pin config").await;
-            }
-            ctx.storage.set_pin(config.clone());
-            send_json_obj(conn, 200, "OK", &config).await
-        }
-        Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
+    let config = serde_json::from_slice::<ShellConfig>(&body).map_err(|_| RestErr {
+        status: 400,
+        reason: "Bad Request",
+        msg: "Bad Request",
+    })?;
+    if config.modbus_timeout_ms > 1000
+        || config.modbus_scan_delay_us > 200_000
+        || config.modbus_inter_frame_delay_us > 200_000
+        || parse_operating_mode(&config.operating_mode).is_none()
+    {
+        return Err(RestErr {
+            status: 400,
+            reason: "Bad Request",
+            msg: "Invalid shell config",
+        });
     }
-}
-
-async fn get_network_config(
-    conn: &mut HttpConn<'_>,
-    ctx: AppContext,
-) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let config = ctx.storage.net();
-    send_json_obj(conn, 200, "OK", &config).await
-}
-
-async fn post_network_config(
-    conn: &mut HttpConn<'_>,
-    ctx: AppContext,
-    body: Vec<u8>,
-) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    if body.len() > MAX_BODY_LEN {
-        return send_json(conn, 400, "Bad Request", "Request too large").await;
-    }
-    match serde_json::from_slice::<NetworkConfiguration>(&body) {
-        Ok(config) => {
-            ctx.storage.set_net(config.clone());
-            send_json_obj(conn, 200, "OK", &config).await
-        }
-        Err(_) => send_json(conn, 400, "Bad Request", "Bad Request").await,
-    }
+    ctx.storage.set_shell(config.clone());
+    Ok(config)
 }
 
 async fn post_restart(
@@ -490,8 +559,14 @@ async fn handle_rest(
         (Method::Post, "/config") => {
             let (_, body) = conn.split();
             let payload = read_body_limited(body, MAX_BODY_LEN).await?;
-            let _gate = REST_GATE.lock().await;
-            post_config(conn, ctx, payload).await
+            let result = {
+                let _gate = REST_GATE.lock().await;
+                post_config_apply(ctx, payload).await
+            };
+            match result {
+                Ok(applied) => send_json_obj(conn, 200, "OK", &applied).await,
+                Err(err) => send_rest_err(conn, err).await,
+            }
         }
         (Method::Options, "/config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
         (Method::Get, "/state") => get_state(conn, ctx).await,
@@ -499,26 +574,30 @@ async fn handle_rest(
         (Method::Post, "/paused") => {
             let (_, body) = conn.split();
             let payload = read_body_limited(body, MAX_BODY_LEN).await?;
-            let _gate = REST_GATE.lock().await;
-            post_paused(conn, ctx, payload).await
+            let result = {
+                let _gate = REST_GATE.lock().await;
+                post_paused_apply(ctx, payload).await
+            };
+            match result {
+                Ok(applied) => send_json_obj(conn, 200, "OK", &applied).await,
+                Err(err) => send_rest_err(conn, err).await,
+            }
         }
         (Method::Options, "/paused") => cors_preflight(conn, "POST, OPTIONS").await,
-        (Method::Get, "/pin-config") => get_pin_config(conn, ctx).await,
-        (Method::Post, "/pin-config") => {
+        (Method::Get, "/shell-config") => get_shell_config(conn, ctx).await,
+        (Method::Post, "/shell-config") => {
             let (_, body) = conn.split();
             let payload = read_body_limited(body, MAX_BODY_LEN).await?;
-            let _gate = REST_GATE.lock().await;
-            post_pin_config(conn, ctx, payload).await
+            let result = {
+                let _gate = REST_GATE.lock().await;
+                post_shell_apply(ctx, payload).await
+            };
+            match result {
+                Ok(config) => send_json_obj(conn, 200, "OK", &config).await,
+                Err(err) => send_rest_err(conn, err).await,
+            }
         }
-        (Method::Options, "/pin-config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
-        (Method::Get, "/network-config") => get_network_config(conn, ctx).await,
-        (Method::Post, "/network-config") => {
-            let (_, body) = conn.split();
-            let payload = read_body_limited(body, MAX_BODY_LEN).await?;
-            let _gate = REST_GATE.lock().await;
-            post_network_config(conn, ctx, payload).await
-        }
-        (Method::Options, "/network-config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
+        (Method::Options, "/shell-config") => cors_preflight(conn, "GET, POST, OPTIONS").await,
         (Method::Post, "/restart") => post_restart(conn).await,
         (Method::Options, "/restart") => cors_preflight(conn, "POST, OPTIONS").await,
         (Method::Get, "/modbus-inject") => get_modbus_inject(conn, ctx).await,
@@ -842,9 +921,13 @@ async fn run_ws_session(mut socket: TcpSocket<'static>, ctx: AppContext) {
                 },
                 SelectEither::Second(()) => {
                     next_push += Duration::from_millis(push_interval_ms);
-                    let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
-                    if let Some(len) = rpc::build_state_notification_into(ctx, &mut *lease) {
-                        if ws_send(&mut tx, FrameType::Text(false), None, &lease[..len])
+                    let body = {
+                        let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
+                        rpc::build_state_notification_into(ctx, &mut *lease)
+                            .map(|len| lease[..len].to_vec())
+                    };
+                    if let Some(body) = body {
+                        if ws_send(&mut tx, FrameType::Text(false), None, &body)
                             .await
                             .is_err()
                         {
@@ -932,11 +1015,7 @@ async fn run_rs485_ws_session(mut socket: TcpSocket<'static>) {
                 FrameType::Binary(_) | FrameType::Text(_) => {
                     if let Some((typ, payload)) = rs485::decode_packet(&buf[..len]) {
                         match typ {
-                            rs485::PKT_TX => {
-                                if rs485::try_send_tx(payload).is_err() {
-                                    break;
-                                }
-                            }
+                            rs485::PKT_TX if rs485::try_send_tx(payload).is_err() => break,
                             rs485::PKT_CFG => {
                                 if let Ok(baud) = rs485::apply_cfg_json(payload) {
                                     let json = alloc::format!("{{\"baud\":{}}}", baud);
@@ -991,7 +1070,7 @@ async fn modbus_ws_session_task() {
     }
 }
 
-static MODBUS_TCP_SOCKET_CH: Channel<CriticalSectionRawMutex, SyncTcpSocket, MODBUS_TCP_POOL> =
+static MODBUS_TCP_SOCKET_CH: Channel<CriticalSectionRawMutex, SyncTcpSocket, MODBUS_TCP_SESSIONS> =
     Channel::new();
 
 async fn read_exact(socket: &mut TcpSocket<'static>, buf: &mut [u8]) -> bool {
@@ -1056,7 +1135,8 @@ async fn handle_modbus_tcp_client(mut socket: TcpSocket<'static>) {
             }
         }
     }
-    let _ = socket.close(Close::Both).await;
+    // Same as WS: close(Both) re-enters smoltcp after a bad peer and can take down :502.
+    drop(socket);
 }
 
 #[embassy_executor::task(pool_size = 2)]
@@ -1069,7 +1149,7 @@ async fn modbus_tcp_session_task() {
 
 async fn modbus_tcp_server_main(stack: &'static Stack<'static>) {
     let spawner = unsafe { embassy_executor::Spawner::for_current_executor().await };
-    for _ in 0..MODBUS_TCP_POOL {
+    for _ in 0..MODBUS_TCP_SESSIONS {
         spawner.spawn(modbus_tcp_session_task().unwrap());
     }
 
@@ -1177,7 +1257,7 @@ async fn http_server_main(stack: &'static Stack<'static>, ctx: AppContext) {
             acceptor_loop(2, acceptor),
             acceptor_loop(3, acceptor),
         ),
-        dispatcher_loop(ctx),
+        embassy_futures::join::join(dispatcher_loop(ctx), dispatcher_loop(ctx)),
     )
     .await;
 }

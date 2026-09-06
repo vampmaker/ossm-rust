@@ -4,52 +4,94 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::{header, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Router;
 use ossm_core::rpc::RpcAction;
-use ossm_core::{CoreError, MotorControllerConfig, PausedControl, RpcRequest, StateResponse};
+use ossm_core::{CoreError, MotorControllerConfig, PausedControl, RpcRequest};
 use serde::Serialize;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 use crate::engine_task::{EngineHandle, EngineMsg};
+use crate::link_stats::{micros_now, SharedLinkStats};
 
 #[derive(Clone)]
 pub struct AppState {
     pub engine: EngineHandle,
-    pub static_dir: PathBuf,
+    pub static_dir: Option<PathBuf>,
+    pub runtime: crate::runtime_config::RuntimeConfigResponse,
+    pub link: SharedLinkStats,
     pub restart: Arc<dyn Fn() + Send + Sync>,
 }
+
+const EMBEDDED_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html"));
 
 pub fn router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
-    let static_dir = state.static_dir.clone();
-    Router::new()
+    let override_dir = state.static_dir.clone();
+    let mut app = Router::new()
         .route("/", get(index))
         .route("/config", get(get_config).post(post_config))
         .route("/state", get(get_state))
+        .route("/runtime-config", get(get_runtime_config))
+        .route("/link-stats", get(get_link_stats))
         .route("/paused", post(post_paused))
         .route("/restart", post(post_restart))
         .route("/ws/command", get(ws_upgrade))
-        .fallback_service(ServeDir::new(static_dir))
-        .layer(cors)
-        .with_state(state)
+        .with_state(state);
+    if let Some(dir) = override_dir {
+        app = app.fallback_service(ServeDir::new(dir));
+    }
+    app.layer(cors)
+}
+
+fn cors_headers() -> [(header::HeaderName, &'static str); 3] {
+    [
+        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS"),
+        (header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type"),
+    ]
 }
 
 async fn index(State(state): State<AppState>) -> Response {
-    let path = state.static_dir.join("index.html");
-    match tokio::fs::read_to_string(path).await {
-        Ok(html) => Html(html).into_response(),
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "frontend/dist/index.html missing — run npm run build in frontend/",
+    if let Some(dir) = &state.static_dir {
+        let path = dir.join("index.html");
+        match tokio::fs::read(&path).await {
+            Ok(html) => (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                    (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS"),
+                    (header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type"),
+                ],
+                html,
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                cors_headers(),
+                "webui-std index.html missing in --static-dir",
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS"),
+                (header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type"),
+            ],
+            EMBEDDED_HTML,
         )
-            .into_response(),
+            .into_response()
     }
 }
 
@@ -60,6 +102,8 @@ fn json_with_cors<T: Serialize>(status: StatusCode, body: T) -> Response {
         [
             (header::CONTENT_TYPE, "application/json"),
             (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS"),
+            (header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type"),
             (header::CONNECTION, "close"),
         ],
         bytes,
@@ -68,7 +112,7 @@ fn json_with_cors<T: Serialize>(status: StatusCode, body: T) -> Response {
 }
 
 async fn get_config(State(state): State<AppState>) -> Response {
-    let snap = state.engine.snap.borrow().clone();
+    let snap = *state.engine.snap.borrow();
     json_with_cors(StatusCode::OK, snap.config)
 }
 
@@ -88,15 +132,24 @@ async fn post_config(State(state): State<AppState>, body: axum::body::Bytes) -> 
     }
 }
 
-async fn get_state(State(state): State<AppState>) -> Json<StateResponse> {
-    Json(state.engine.snap.borrow().clone())
+async fn get_state(State(state): State<AppState>) -> Response {
+    json_with_cors(StatusCode::OK, *state.engine.snap.borrow())
+}
+
+async fn get_runtime_config(State(state): State<AppState>) -> Response {
+    json_with_cors(StatusCode::OK, &state.runtime)
+}
+
+async fn get_link_stats(State(state): State<AppState>) -> Response {
+    let stats = state.link.poll(micros_now());
+    json_with_cors(StatusCode::OK, ossm_core::LinkStatsSer(&stats))
 }
 
 async fn post_paused(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
     let Ok(control) = serde_json::from_slice::<PausedControl>(&body) else {
         return json_with_cors(StatusCode::BAD_REQUEST, "Bad Request");
     };
-    let mut config = state.engine.snap.borrow().config.clone();
+    let mut config = state.engine.snap.borrow().config;
     if let Some(paused) = control.paused {
         config.paused = paused;
     }
@@ -106,11 +159,8 @@ async fn post_paused(State(state): State<AppState>, body: axum::body::Bytes) -> 
     if let Some(adjust) = control.adjust {
         config.paused_position = (config.paused_position + adjust).clamp(0.0, 1.0);
     }
-    match try_set(&state, config).await {
+    match try_pause(&state, config.paused, Some(config.paused_position)).await {
         Ok(applied) => json_with_cors(StatusCode::OK, applied),
-        Err(CoreError::StaleVersion) => {
-            json_with_cors(StatusCode::CONFLICT, "Stale causal version")
-        }
         Err(_) => json_with_cors(StatusCode::SERVICE_UNAVAILABLE, "Command queue full"),
     }
 }
@@ -136,6 +186,25 @@ async fn try_set(
         .await
         .map_err(|_| CoreError::InvalidConfig)?;
     rx.await.map_err(|_| CoreError::InvalidConfig)?
+}
+
+async fn try_pause(
+    state: &AppState,
+    paused: bool,
+    position: Option<f32>,
+) -> Result<MotorControllerConfig, CoreError> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .engine
+        .tx
+        .send(EngineMsg::SetPaused {
+            paused,
+            position,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| CoreError::InvalidConfig)?;
+    rx.await.map_err(|_| CoreError::InvalidConfig)
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -222,7 +291,7 @@ async fn run_ws(mut socket: WebSocket, state: AppState) {
                 }
             }
             _ = ticker.tick(), if subscribed => {
-                let snap = state.engine.snap.borrow().clone();
+                let snap = *state.engine.snap.borrow();
                 let mut buf = vec![0u8; 4096];
                 if let Some(n) = ossm_core::rpc::build_state_notification_into(&snap, &mut buf) {
                     let text = String::from_utf8_lossy(&buf[..n]).into_owned();

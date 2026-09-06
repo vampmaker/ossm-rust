@@ -196,18 +196,30 @@ async fn execute_command(command: CliCommand, app_context: AppContext) {
             esp_hal::system::software_reset();
         }
         CliCommand::GetState => {
-            let state = app_context.load_snapshot();
-            let _ = crate::buffers::serialize_to_scratchpad(state.as_ref(), |json| {
+            crate::buffers::with_scratchpad(|buf| {
+                let n = {
+                    let state = app_context.load_snapshot();
+                    serde_json_core::to_slice(state.as_ref(), buf).ok()?
+                };
+                let json = core::str::from_utf8(&buf[..n]).ok()?;
                 console::write_line(json);
+                Some(())
             })
             .await;
         }
         CliCommand::GetStatus => {
-            let state = app_context.load_snapshot();
-            let config = state.config.clone();
-            let st = serde_json::json!({ "state": state.as_ref(), "config": config });
-            let _ = crate::buffers::serialize_to_scratchpad(&st, |json| {
+            crate::buffers::with_scratchpad(|buf| {
+                let n = {
+                    let snap = app_context.load_snapshot();
+                    let dump = ossm_core::CliStatusDump {
+                        state: snap.as_ref(),
+                        config: &snap.config,
+                    };
+                    serde_json_core::to_slice(&dump, buf).ok()?
+                };
+                let json = core::str::from_utf8(&buf[..n]).ok()?;
                 console::write_line(json);
+                Some(())
             })
             .await;
         }
@@ -241,42 +253,29 @@ async fn execute_get(app_context: AppContext, path: &str) {
     };
 
     match section {
-        "pin" => match key {
+        "shell" | "pin" | "net" => match key {
             None => {
-                let config = app_context.storage.pin();
+                let config = app_context.storage.shell();
                 let _ = crate::buffers::serialize_to_scratchpad(&config, |json| {
                     console::write_line(json);
                 })
                 .await;
             }
-            Some(k) => match hw_paths::pin_field(&app_context.storage.pin(), k) {
-                Ok(v) => log_get(&format!("pin.{}", k), v.as_str()),
-                Err(e) => log_path_err(&format!("pin.{}", k), e),
-            },
-        },
-        "net" => match key {
-            None => {
-                let config = app_context.storage.net();
-                let _ = crate::buffers::serialize_to_scratchpad(&config, |json| {
-                    console::write_line(json);
-                })
-                .await;
-            }
-            Some(k) => match hw_paths::net_field(&app_context.storage.net(), k) {
-                Ok(v) => log_get(&format!("net.{}", k), v.as_str()),
-                Err(e) => log_path_err(&format!("net.{}", k), e),
+            Some(k) => match hw_paths::shell_field(&app_context.storage.shell(), k) {
+                Ok(v) => log_get(&format!("shell.{}", k), v.as_str()),
+                Err(e) => log_path_err(&format!("shell.{}", k), e),
             },
         },
         "motor" => match key {
             None => {
-                let config = app_context.load_snapshot().config.clone();
+                let config = app_context.load_snapshot().config;
                 let _ = crate::buffers::serialize_to_scratchpad(&config, |json| {
                     console::write_line(json);
                 })
                 .await;
             }
             Some(k) => {
-                let config = app_context.load_snapshot().config.clone();
+                let config = app_context.load_snapshot().config;
                 match paths::motor_field(&config, k) {
                     Ok(v) => log_get(&format!("motor.{}", k), v.as_str()),
                     Err(e) => log_path_err(&format!("motor.{}", k), e),
@@ -292,10 +291,7 @@ async fn execute_get(app_context: AppContext, path: &str) {
             let msg = format!("{} {}", mode.as_str(), nbytes);
             log_get("inject", msg.as_str());
         }
-        _ => log::error!(
-            "Unknown section: {} (try: pin, net, motor, inject)",
-            section
-        ),
+        _ => log::error!("Unknown section: {} (try: shell, motor, inject)", section),
     }
 }
 
@@ -306,50 +302,31 @@ async fn execute_set(app_context: AppContext, path: &str, value: &str) {
     };
 
     match section {
-        "pin" => set_pin(app_context, key, value),
-        "net" => set_net(app_context, key, value),
+        "shell" | "pin" | "net" => set_shell(app_context, key, value),
         "motor" => set_motor(app_context, key, value).await,
         "inject" => set_inject(value),
-        _ => log::error!(
-            "Unknown section: {} (try: pin, net, motor, inject)",
-            section
-        ),
+        _ => log::error!("Unknown section: {} (try: shell, motor, inject)", section),
     }
 }
 
-fn set_pin(app_context: AppContext, key: Option<&str>, value: &str) {
+fn set_shell(app_context: AppContext, key: Option<&str>, value: &str) {
     let Some(key) = key else {
-        log_path_err("pin", PathError::ScalarRequired);
+        log_path_err("shell", PathError::ScalarRequired);
         return;
     };
-    let full_path = format!("pin.{}", key);
-    let mut config = app_context.storage.pin();
-    match hw_paths::set_pin(&mut config, key, value) {
+    let full_path = format!("shell.{}", key);
+    let mut config = app_context.storage.shell();
+    match hw_paths::set_shell(&mut config, key, value) {
         Ok(()) => {
-            app_context.storage.set_pin(config);
-            log_set(full_path.as_str(), value);
-        }
-        Err(e) => log_path_err(full_path.as_str(), e),
-    }
-}
-
-fn set_net(app_context: AppContext, key: Option<&str>, value: &str) {
-    let Some(key) = key else {
-        log::error!("Use scalar path, e.g. set net.ssid \"MyNetwork\"");
-        return;
-    };
-    let full_path = format!("net.{}", key);
-    let mut config = app_context.storage.net();
-    match hw_paths::set_net(&mut config, key, value) {
-        Ok(()) => {
-            match key {
-                "ssid" => app_context.storage.set_ssid(value),
-                "password" => {
-                    app_context.storage.set_password(value);
-                    log_set(full_path.as_str(), "(hidden)");
-                    return;
-                }
-                _ => app_context.storage.set_net(config),
+            if key == "password" {
+                app_context.storage.set_password(value);
+                log_set(full_path.as_str(), "(hidden)");
+                return;
+            }
+            if key == "ssid" {
+                app_context.storage.set_ssid(value);
+            } else {
+                app_context.storage.set_shell(config);
             }
             log_set(full_path.as_str(), value);
         }
@@ -375,11 +352,20 @@ async fn set_motor(app_context: AppContext, key: Option<&str>, value: &str) {
 
     let key = key.unwrap();
     let full_path = format!("motor.{}", key);
-    let mut config = app_context.load_snapshot().config.clone();
+    let mut config = app_context.load_snapshot().config;
     match paths::apply_motor_field(&mut config, key, value) {
         Ok(()) => {
-            let _ = app_context.try_enqueue_config(config).await;
-            log_set(full_path.as_str(), value);
+            let enqueued = if key == "paused" || key == "paused_position" {
+                app_context
+                    .try_enqueue_paused(config.paused, Some(config.paused_position))
+                    .await
+                    .is_ok()
+            } else {
+                app_context.try_enqueue_config(config).await.is_ok()
+            };
+            if enqueued {
+                log_set(full_path.as_str(), value);
+            }
         }
         Err(e) => log_path_err(full_path.as_str(), e),
     }

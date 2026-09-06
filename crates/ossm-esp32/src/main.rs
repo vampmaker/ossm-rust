@@ -15,6 +15,7 @@ use esp_hal::interrupt::Priority;
 use esp_hal::timer::timg::TimerGroup;
 #[cfg(feature = "esp32c6")]
 use esp_rtos::embassy::InterruptExecutor;
+#[cfg(feature = "esp32c6")]
 use static_cell::StaticCell;
 
 mod ble_api;
@@ -30,15 +31,17 @@ mod modbus_rtu;
 mod motion;
 mod motor;
 mod motor_57aim30;
+mod peripheral_bank;
 mod rpc;
-mod uart_owner;
 mod rs485;
 mod storage;
+mod uart_owner;
 mod wifi;
 
 use context::AppContext;
 #[cfg(feature = "esp32c6")]
 use motion::CommandConsumer;
+use peripheral_bank::PeripheralBank;
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -62,6 +65,91 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(console_task(peripherals.USB_DEVICE, peripherals.UART0, uart_pins).unwrap());
 
+    let mut peripheral_bank =
+        PeripheralBank::new(peripherals.UART1, peripherals.UHCI0, peripherals.DMA_CH0);
+    #[cfg(feature = "esp32c6")]
+    peripheral_bank_insert_pins!(
+        peripheral_bank,
+        peripherals,
+        GPIO0,
+        GPIO1,
+        GPIO2,
+        GPIO3,
+        GPIO4,
+        GPIO5,
+        GPIO6,
+        GPIO7,
+        GPIO8,
+        GPIO9,
+        GPIO10,
+        GPIO11,
+        GPIO12,
+        GPIO13,
+        GPIO14,
+        GPIO15,
+        GPIO18,
+        GPIO19,
+        GPIO20,
+        GPIO21,
+        GPIO22,
+        GPIO23,
+        GPIO24,
+        GPIO25,
+        GPIO26,
+        GPIO27,
+        GPIO28,
+        GPIO29,
+        GPIO30
+    );
+    #[cfg(feature = "esp32s3")]
+    peripheral_bank_insert_pins!(
+        peripheral_bank,
+        peripherals,
+        GPIO0,
+        GPIO1,
+        GPIO2,
+        GPIO3,
+        GPIO4,
+        GPIO5,
+        GPIO6,
+        GPIO7,
+        GPIO8,
+        GPIO9,
+        GPIO10,
+        GPIO11,
+        GPIO12,
+        GPIO13,
+        GPIO14,
+        GPIO15,
+        GPIO16,
+        GPIO17,
+        GPIO18,
+        GPIO19,
+        GPIO20,
+        GPIO21,
+        GPIO26,
+        GPIO27,
+        GPIO28,
+        GPIO29,
+        GPIO30,
+        GPIO31,
+        GPIO32,
+        GPIO33,
+        GPIO34,
+        GPIO35,
+        GPIO36,
+        GPIO37,
+        GPIO38,
+        GPIO39,
+        GPIO40,
+        GPIO41,
+        GPIO42,
+        GPIO45,
+        GPIO46,
+        GPIO47,
+        GPIO48
+    );
+
     let init = context::init_app_context(peripherals.FLASH);
     let app_context = init.ctx;
     let motion_consumer = init.motion_consumer;
@@ -79,27 +167,21 @@ async fn main(spawner: Spawner) -> ! {
             let exec = MOTOR_EXEC.init(InterruptExecutor::new(sw_interrupt.software_interrupt1));
             exec.start(Priority::Priority3)
         };
-        motor_spawner.spawn(
-            uart_owner_task(
-                app_context,
-                motion_consumer,
-                peripherals.UART1,
-                peripherals.UHCI0,
-                peripherals.DMA_CH0,
-            )
-            .unwrap(),
-        );
+        motor_spawner
+            .spawn(uart_owner_task(app_context, motion_consumer, peripheral_bank).unwrap());
     }
 
     #[cfg(feature = "esp32s3")]
     {
+        use core::mem::MaybeUninit;
         use esp_hal::system::Stack;
 
-        static CORE1_STACK: StaticCell<Stack<{ 24 * 1024 }>> = StaticCell::new();
-        let stack = CORE1_STACK.init(Stack::new());
-        let uart = peripherals.UART1;
-        let uhci = peripherals.UHCI0;
-        let dma_ch = peripherals.DMA_CH0;
+        // Reclaimed 2nd-stage bootloader DRAM (~72 KiB). Keeps the Core-1 stack
+        // out of RWDATA so `.stack` does not overflow `dram_seg`.
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut CORE1_STACK: MaybeUninit<Stack<{ 24 * 1024 }>> = MaybeUninit::uninit();
+        // SAFETY: dram2 is unused after the bootloader; this block runs once.
+        let stack = unsafe { (*(&raw mut CORE1_STACK)).write(Stack::new()) };
         esp_rtos::start_second_core(
             peripherals.CPU_CTRL,
             sw_interrupt.software_interrupt1,
@@ -108,9 +190,7 @@ async fn main(spawner: Spawner) -> ! {
                 motor_57aim30::run_uart_owner_blocking(
                     app_context,
                     motion_consumer,
-                    uart,
-                    uhci,
-                    dma_ch,
+                    peripheral_bank,
                 );
             },
         );
@@ -159,11 +239,9 @@ async fn console_task(
 async fn uart_owner_task(
     app_context: AppContext,
     motion_consumer: CommandConsumer,
-    uart: esp_hal::peripherals::UART1<'static>,
-    uhci: esp_hal::peripherals::UHCI0<'static>,
-    dma_ch: esp_hal::peripherals::DMA_CH0<'static>,
+    peripheral_bank: PeripheralBank,
 ) {
-    uart_owner::run_uart_owner(app_context, motion_consumer, uart, uhci, dma_ch).await;
+    uart_owner::run_uart_owner(app_context, motion_consumer, peripheral_bank).await;
 }
 
 #[embassy_executor::task]
@@ -187,14 +265,14 @@ async fn nvs_saver_task(app_context: AppContext) {
         if !app_context.storage.pin().is_servo() {
             continue;
         }
-        let config = app_context.load_snapshot().config.clone();
+        let config = app_context.load_snapshot().config;
         let should_save = match &last_saved {
             None => {
-                last_saved = Some(config.clone());
+                last_saved = Some(config);
                 false
             }
-            Some(prev) if persistent_motor_changed(prev, &config) => {
-                last_saved = Some(config.clone());
+            Some(prev) if prev.persistent_motor_changed(&config) => {
+                last_saved = Some(config);
                 true
             }
             Some(_) => false,
@@ -204,19 +282,4 @@ async fn nvs_saver_task(app_context: AppContext) {
             app_context.storage.set_motor_config(config);
         }
     }
-}
-
-/// Pause toggles are ephemeral — flashing NVS for them mid-BLE is harmful.
-fn persistent_motor_changed(
-    a: &crate::motion::MotorControllerConfig,
-    b: &crate::motion::MotorControllerConfig,
-) -> bool {
-    a.bpm != b.bpm
-        || a.depth != b.depth
-        || a.depth_top != b.depth_top
-        || a.reversed != b.reversed
-        || a.wave_func != b.wave_func
-        || (a.sharpness - b.sharpness).abs() > f32::EPSILON
-        || a.spline_points != b.spline_points
-        || a.streaming != b.streaming
 }

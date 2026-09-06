@@ -1,13 +1,24 @@
 [workspace]
 resolver = "2"
-members = ["crates/ossm-core", "crates/ossm-esp32", "crates/ossm-std"]
+members = [
+    "crates/ossm-core",
+    "crates/ossm-esp32",
+    "crates/ossm-std",
+    "crates/ossm-wasm",
+    "crates/ossm-common",
+]
 default-members = ["crates/ossm-esp32"]
 
+# Host crates (`ossm-std`, `ossm-wasm`). Firmware `cargo b-c6 --release` /
+# `cargo b-s3 --release` inject debug + overflow-checks via `.cargo/config.toml`.
 [profile.release]
-opt-level = 2
-debug = true
+debug = false
 overflow-checks = true
-lto = false
+
+[patch.crates-io]
+# Termux/Android usbfs cannot mmap URB buffers (EPERM). Upstream nusb warns
+# on every EndpointRead allocate; skip mmap after the first failure.
+nusb = { path = "vendor/nusb" }
 
 [profile.dev]
 debug = true

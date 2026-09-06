@@ -1,4 +1,6 @@
-use crate::state::{ModbusStats, MotionCommand};
+use ossm_common::{LinkStats, LoopStats};
+
+use crate::state::MotionCommand;
 
 pub enum Command {
     Motion(MotionCommand),
@@ -12,11 +14,15 @@ pub enum Command {
         position: f32,
     },
     SetMotorConnected(bool),
-    SetModbusStats(ModbusStats),
+    SetLoopStats(LoopStats),
+    SetLinkStats(LinkStats),
 }
 
 impl From<MotionCommand> for Command {
     fn from(cmd: MotionCommand) -> Self {
-        Self::Motion(cmd)
+        match cmd {
+            MotionCommand::SetPaused { paused, position } => Self::SetPaused { paused, position },
+            other => Self::Motion(other),
+        }
     }
 }

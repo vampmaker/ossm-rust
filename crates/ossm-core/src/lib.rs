@@ -15,15 +15,15 @@ pub mod state;
 pub mod time;
 
 pub use command::Command;
-pub use config::MotorControllerConfig;
+pub use config::{MotorControllerConfig, SplinePoints, WaveFunc};
 pub use engine::{CycleOutput, Engine};
 pub use error::CoreError;
 pub use motion::MotorController;
 pub use rpc::{dispatch_rpc, RpcAction};
 pub use rpc_types::{PausedControl, RpcRequest, SubscribeParams, WaypointsInput, WaypointsObject};
 pub use state::{
-    LoopStats, ModbusStats, MotionCommand, StateResponse, StreamStatus, StreamWaypoint,
-    TimingWindowStats,
+    CliStatusDump, LinkStats, LinkStatsSer, LoopStats, MotionCommand, StateResponse, StreamStatus,
+    StreamWaypoint, TimingWindowStats,
 };
 pub use time::Micros;
 

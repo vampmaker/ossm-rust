@@ -21,14 +21,21 @@ jobs:
           node-version: 20
           cache: 'npm'
           cache-dependency-path: |
-            frontend/package-lock.json
-            flasher/package-lock.json
-            motor-control/package-lock.json
+            web/package-lock.json
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: uv sync
+        run: uv sync
 
       - name: Setup standard Rust
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
+          targets: wasm32-unknown-unknown,x86_64-pc-windows-gnu,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,arm-unknown-linux-musleabi,aarch64-apple-darwin
 
       - name: Install espup
         run: |
@@ -39,8 +46,8 @@ jobs:
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
 
-      - name: Install espflash
-        run: cargo binstall -y espflash
+      - name: Install espflash and wasm-bindgen
+        run: cargo binstall -y espflash wasm-bindgen-cli@0.2.127
 
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
@@ -60,7 +67,7 @@ jobs:
       - name: Run release script
         run: |
           source ~/export-esp.sh
-          ./scripts/release.sh
+          uv run scripts/release.py
 
       - name: Prepare ELF files and Zip
         run: |

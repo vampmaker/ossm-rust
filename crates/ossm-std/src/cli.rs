@@ -160,14 +160,18 @@ async fn execute(
             writeln_out(stdout, &format!("{path} set to {shown}")).await
         }
         Line::GetState => {
-            let snap = engine.snap.borrow().clone();
+            let snap = *engine.snap.borrow();
             let json = serde_json::to_string(&snap).map_err(|e| e.to_string())?;
             writeln_out(stdout, &json).await
         }
         Line::GetStatus => {
-            let snap = engine.snap.borrow().clone();
-            let body = serde_json::json!({ "state": snap, "config": snap.config });
-            writeln_out(stdout, &body.to_string()).await
+            let snap = *engine.snap.borrow();
+            let dump = ossm_core::CliStatusDump {
+                state: &snap,
+                config: &snap.config,
+            };
+            let json = serde_json::to_string(&dump).map_err(|e| e.to_string())?;
+            writeln_out(stdout, &json).await
         }
         Line::ResetTimestamp => {
             apply(engine, MotionCommand::ResetTimestamp.into()).await?;

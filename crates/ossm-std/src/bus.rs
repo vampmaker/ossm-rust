@@ -1,28 +1,56 @@
 //! Pluggable Modbus RTU bus: local serial, Modbus TCP, `/ws/modbus`, `/ws/rs485`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use ossm_common::PllConfig;
 use ossm_core::modbus::{aim30, calc_crc16};
 use rmodbus::{client::ModbusRequest, ModbusProto};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{client_async, WebSocketStream};
 
+use crate::link_stats::{instant_to_mono, micros_now, SharedLinkStats};
 use crate::modbus_rx::{expected_response_len, parse_fc03_u16, RxAccumulator};
-use crate::serial::SerialPort;
+use crate::serial::{encode_position, is_crc_miss, AckSample, LatestWins, SerialPort};
 
 const RS485_TX: u8 = 0;
 const RS485_RX: u8 = 1;
 const RS485_CFG: u8 = 2;
 
-pub enum ModbusBus {
+pub struct WriteTiming {
+    pub t_tx_us: u64,
+    pub t_rx_us: Option<u64>,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum ModbusBusInner {
     Serial(SerialPort),
     Tcp(RelayTcp),
     ModbusWs(WsPipe),
     Rs485Ws(Rs485Ws),
+    Stream(NetStream),
+}
+
+#[derive(Clone)]
+struct NetStream {
+    slave: u8,
+    usb_serial_pll: bool,
+    slot: Arc<LatestWins>,
+    wakeup: Arc<Notify>,
+    ack: Arc<Mutex<Option<AckSample>>>,
+    notify: Arc<Notify>,
+    alive: Arc<AtomicBool>,
+}
+
+pub struct ModbusBus {
+    pub link: SharedLinkStats,
+    inner: ModbusBusInner,
 }
 
 pub struct RelayTcp {
@@ -45,30 +73,40 @@ pub struct Rs485Ws {
 }
 
 impl ModbusBus {
-    pub fn serial(port: SerialPort) -> Self {
-        Self::Serial(port)
+    pub fn serial(mut port: SerialPort, link: SharedLinkStats) -> Self {
+        port.attach_link(link.clone());
+        Self {
+            link,
+            inner: ModbusBusInner::Serial(port),
+        }
     }
 
-    pub async fn relay_tcp(host: &str) -> Result<Self, String> {
+    pub async fn relay_tcp(host: &str, link: SharedLinkStats) -> Result<Self, String> {
         let mut tcp = RelayTcp {
             host: host.to_string(),
             stream: None,
             tid: 1,
         };
         tcp.connect().await?;
-        Ok(Self::Tcp(tcp))
+        Ok(Self {
+            link,
+            inner: ModbusBusInner::Tcp(tcp),
+        })
     }
 
-    pub async fn relay_ws(url: &str) -> Result<Self, String> {
+    pub async fn relay_ws(url: &str, link: SharedLinkStats) -> Result<Self, String> {
         let mut ws = WsPipe {
             url: url.to_string(),
             ws: None,
         };
         ws.connect().await?;
-        Ok(Self::ModbusWs(ws))
+        Ok(Self {
+            link,
+            inner: ModbusBusInner::ModbusWs(ws),
+        })
     }
 
-    pub async fn rs485_ws(url: &str, baud: u32) -> Result<Self, String> {
+    pub async fn rs485_ws(url: &str, baud: u32, link: SharedLinkStats) -> Result<Self, String> {
         let mut ws = Rs485Ws {
             url: url.to_string(),
             baud,
@@ -77,26 +115,59 @@ impl ModbusBus {
             last_rx: None,
         };
         ws.connect().await?;
-        Ok(Self::Rs485Ws(ws))
+        Ok(Self {
+            link,
+            inner: ModbusBusInner::Rs485Ws(ws),
+        })
     }
 
     pub async fn exchange_rtu(&mut self, frame: &[u8]) -> Result<Vec<u8>, String> {
-        match self {
-            Self::Serial(p) => p.exchange_rtu(frame).await,
-            Self::Tcp(t) => t.exchange_rtu(frame).await,
-            Self::ModbusWs(w) => w.exchange_rtu(frame).await,
-            Self::Rs485Ws(w) => w.exchange_rtu(frame).await,
+        let t0 = Instant::now();
+        let result = match &mut self.inner {
+            ModbusBusInner::Serial(p) => p.exchange_rtu(frame).await,
+            ModbusBusInner::Tcp(t) => t.exchange_rtu(frame).await,
+            ModbusBusInner::ModbusWs(w) => w.exchange_rtu(frame).await,
+            ModbusBusInner::Rs485Ws(w) => w.exchange_rtu(frame).await,
+            ModbusBusInner::Stream(_) => Err("stream worker owns the bus".into()),
+        };
+        let now_us = micros_now();
+        let rtt_us = t0.elapsed().as_micros().min(u16::MAX as u128) as u16;
+        match &result {
+            Ok(rsp) => self.link.record_success(
+                now_us,
+                rtt_us,
+                None,
+                None,
+                frame.len() as u32,
+                rsp.len() as u32,
+            ),
+            Err(_e) => self.link.record_failure(now_us),
         }
+        result
     }
 
-    pub async fn write_position_radians(&mut self, position: f32) -> Result<(), String> {
+    pub async fn write_position_radians(&mut self, position: f32) -> Result<WriteTiming, String> {
+        if let Some(p) = self.as_serial_mut() {
+            let t = p.write_position_radians(position).await?;
+            return Ok(WriteTiming {
+                t_tx_us: instant_to_mono(t.t_tx),
+                t_rx_us: t.t_rx.map(instant_to_mono),
+            });
+        }
         let counts = aim30::write_counts_for_radians(position);
         let regs = aim30::pack_position_i32(counts);
+        let t_tx_us = instant_to_mono(Instant::now());
         match self.write_holdings(aim30::REG_POSITION, &regs).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(WriteTiming {
+                t_tx_us,
+                t_rx_us: Some(instant_to_mono(Instant::now())),
+            }),
             Err(e) if e.starts_with("no CRC-valid response") => {
                 tracing::debug!("{e}");
-                Ok(())
+                Ok(WriteTiming {
+                    t_tx_us,
+                    t_rx_us: None,
+                })
             }
             Err(e) => Err(e),
         }
@@ -267,18 +338,144 @@ impl ModbusBus {
     }
 
     fn slave(&self) -> u8 {
-        match self {
-            Self::Serial(p) => p.slave_id(),
-            Self::Tcp(_) | Self::ModbusWs(_) | Self::Rs485Ws(_) => 1,
+        match &self.inner {
+            ModbusBusInner::Serial(p) => p.slave_id(),
+            ModbusBusInner::Stream(s) => s.slave,
+            ModbusBusInner::Tcp(_) | ModbusBusInner::ModbusWs(_) | ModbusBusInner::Rs485Ws(_) => 1,
+        }
+    }
+
+    pub fn as_serial(&self) -> Option<&SerialPort> {
+        match &self.inner {
+            ModbusBusInner::Serial(p) => Some(p),
+            _ => None,
         }
     }
 
     pub fn as_serial_mut(&mut self) -> Option<&mut SerialPort> {
-        match self {
-            Self::Serial(p) => Some(p),
+        match &mut self.inner {
+            ModbusBusInner::Serial(p) => Some(p),
             _ => None,
         }
     }
+
+    pub fn is_usb_host(&self) -> bool {
+        self.as_serial().is_some_and(|p| p.is_usb_host())
+    }
+
+    pub fn pll_config(&self) -> PllConfig {
+        match &self.inner {
+            ModbusBusInner::Serial(_) => PllConfig::usb_serial(),
+            ModbusBusInner::Stream(s) if s.usb_serial_pll => PllConfig::usb_serial(),
+            _ => PllConfig::network(),
+        }
+    }
+
+    /// After homing: move the bus into a tokio task so engine ticks do not await RTT.
+    /// USB-host already has its own thread; this is a no-op there.
+    pub fn spawn_stream_worker(&mut self) {
+        if self.is_usb_host() {
+            return;
+        }
+        if matches!(self.inner, ModbusBusInner::Stream(_)) {
+            return;
+        }
+        let usb_serial_pll = matches!(self.inner, ModbusBusInner::Serial(_));
+        let slave = self.slave();
+        let stream = NetStream {
+            slave,
+            usb_serial_pll,
+            slot: Arc::new(LatestWins::new()),
+            wakeup: Arc::new(Notify::new()),
+            ack: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        let worker = stream.clone();
+        let link = self.link.clone();
+        let inner = std::mem::replace(&mut self.inner, ModbusBusInner::Stream(stream));
+        tokio::spawn(async move {
+            let mut bus = ModbusBus { link, inner };
+            net_stream_loop(&mut bus, worker).await;
+        });
+    }
+
+    pub fn has_async_stream(&self) -> bool {
+        self.is_usb_host() || matches!(self.inner, ModbusBusInner::Stream(_))
+    }
+
+    pub fn stream_worker_alive(&self) -> bool {
+        match &self.inner {
+            ModbusBusInner::Stream(s) => s.alive.load(Ordering::Relaxed),
+            ModbusBusInner::Serial(p) => p.usb_worker_alive(),
+            _ => true,
+        }
+    }
+
+    pub fn ack_notify(&self) -> Option<Arc<Notify>> {
+        match &self.inner {
+            ModbusBusInner::Stream(s) => Some(s.notify.clone()),
+            ModbusBusInner::Serial(p) => p.ack_notify(),
+            _ => None,
+        }
+    }
+
+    pub fn take_ack_sample(&self) -> Option<AckSample> {
+        match &self.inner {
+            ModbusBusInner::Stream(s) => s.ack.lock().ok().and_then(|mut g| g.take()),
+            ModbusBusInner::Serial(p) => p.take_ack_sample(),
+            _ => None,
+        }
+    }
+
+    pub fn submit_position(&mut self, position: f32) -> Result<(), String> {
+        if let ModbusBusInner::Serial(p) = &mut self.inner {
+            return p.submit_position(position);
+        }
+        let ModbusBusInner::Stream(s) = &self.inner else {
+            return Err("submit_position requires a stream worker".into());
+        };
+        if !s.alive.load(Ordering::Relaxed) {
+            return Err("stream worker ended".into());
+        }
+        let tx = encode_position(s.slave, position)?;
+        s.slot.submit(tx);
+        s.wakeup.notify_one();
+        Ok(())
+    }
+}
+
+async fn net_stream_loop(bus: &mut ModbusBus, stream: NetStream) {
+    loop {
+        if !stream.alive.load(Ordering::Relaxed) {
+            break;
+        }
+        let wait = stream.wakeup.notified();
+        let Some(frame) = stream.slot.take() else {
+            wait.await;
+            continue;
+        };
+        drop(wait);
+        let t_tx = Instant::now();
+        let t_rx = match bus.exchange_rtu(&frame).await {
+            Ok(_) => Some(Instant::now()),
+            Err(e) if is_crc_miss(&e) => None,
+            Err(e) => {
+                tracing::debug!("stream worker: {e}");
+                stream.alive.store(false, Ordering::Relaxed);
+                publish_net_ack(&stream, t_tx, None);
+                break;
+            }
+        };
+        publish_net_ack(&stream, t_tx, t_rx);
+    }
+}
+
+fn publish_net_ack(stream: &NetStream, t_tx: Instant, t_rx: Option<Instant>) {
+    if let Ok(mut g) = stream.ack.lock() {
+        *g = Some(AckSample { t_tx, t_rx });
+    }
+    stream.notify.notify_one();
 }
 
 impl RelayTcp {

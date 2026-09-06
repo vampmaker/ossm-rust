@@ -87,7 +87,6 @@ struct StateNotification<'a> {
     method: &'static str,
     cmd: &'static str,
     params: &'a StateResponse,
-    state: &'a StateResponse,
 }
 
 pub fn build_state_notification_into(state: &StateResponse, out: &mut [u8]) -> Option<usize> {
@@ -96,7 +95,6 @@ pub fn build_state_notification_into(state: &StateResponse, out: &mut [u8]) -> O
         method: "state",
         cmd: "state",
         params: state,
-        state,
     };
     serde_json_core::to_slice(&notif, out).ok()
 }

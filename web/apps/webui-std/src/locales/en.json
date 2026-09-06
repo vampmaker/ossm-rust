@@ -1,0 +1,28 @@
+{
+  "app": {
+    "title": "OSSM Desktop"
+  },
+  "details": {
+    "title": "Host & Telemetry",
+    "subtitle": "Live motor telemetry and resolved ossm-std startup settings (read-only).",
+    "motorConfig": "Active motor config",
+    "runtimeConfig": "Process runtime settings",
+    "mode": "Mode",
+    "mock": "Mock",
+    "transport": "Transport",
+    "serial": "Serial",
+    "baud": "Baud",
+    "slaveId": "Slave ID",
+    "bind": "HTTP bind",
+    "modbusBind": "Modbus TCP bind",
+    "relayTcp": "Relay TCP",
+    "relayWs": "Relay WebSocket",
+    "rs485Ws": "RS-485 WebSocket",
+    "configPath": "Config file",
+    "staticDir": "Static dir",
+    "repl": "REPL",
+    "noRepl": "No REPL",
+    "loading": "Loading runtime settings…",
+    "readOnlyHint": "Serial, bind, and relay settings are CLI/env startup options. Restart ossm-std to change them."
+  }
+}

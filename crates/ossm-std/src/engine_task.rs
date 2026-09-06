@@ -1,18 +1,23 @@
 use std::time::{Duration, Instant};
 
+use ossm_common::{LoopStatsWindow, Pll, PllConfig, Wake};
 use ossm_core::paths::{self, PathError};
 use ossm_core::rpc::RpcAction;
 use ossm_core::{Command, CoreError, Engine, MotorControllerConfig, StateResponse};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
-use crate::bus::ModbusBus;
+use crate::link_stats::{instant_to_mono, micros_now, mono_deadline, mono_us, SharedLinkStats};
 use crate::persist::{persistent_motor_changed, Persist, SavedConfig};
-use crate::usb_pll::FramePll;
 
 pub enum EngineMsg {
     TrySetConfig {
         cfg: MotorControllerConfig,
         reply: oneshot::Sender<Result<MotorControllerConfig, CoreError>>,
+    },
+    SetPaused {
+        paused: bool,
+        position: Option<f32>,
+        reply: oneshot::Sender<MotorControllerConfig>,
     },
     Rpc {
         req: Vec<u8>,
@@ -41,6 +46,7 @@ pub struct EngineTaskOpts {
     pub saved: SavedConfig,
     pub mock: bool,
     pub serial: Option<crate::bus::ModbusBus>,
+    pub link: SharedLinkStats,
 }
 
 pub async fn run_engine_task(
@@ -48,12 +54,13 @@ pub async fn run_engine_task(
     snap_tx: watch::Sender<StateResponse>,
     mut opts: EngineTaskOpts,
 ) {
-    let mut engine = Engine::new(opts.saved.motor.clone());
+    let mut engine = Engine::new(opts.saved.motor);
 
-    let _ = snap_tx.send(engine.snapshot().clone());
+    let _ = snap_tx.send(*engine.snapshot());
 
     let mut write_bus = false;
     if opts.mock {
+        opts.link.set_link_info(ossm_common::LinkTransport::Mock);
         engine.apply(Command::HomingComplete {
             pos_min: 0.0,
             pos_max: 100.0,
@@ -100,19 +107,21 @@ pub async fn run_engine_task(
                 if let Err(e) = port.apply_run_gains().await {
                     tracing::warn!("run gains: {e}");
                 }
+                port.spawn_stream_worker();
                 write_bus = true;
             }
             Err(e) => {
                 tracing::error!("homing failed: {e}");
                 engine.apply(Command::SetMotorConnected(false));
+                opts.link.set_connected(false);
                 engine.flush_snapshot();
             }
         }
     }
 
-    let mut last_saved_motor = engine.snapshot().config.clone();
+    let mut last_saved_motor = engine.snapshot().config;
     let mut last_persist = Instant::now();
-    let _ = snap_tx.send(engine.snapshot().clone());
+    let _ = snap_tx.send(*engine.snapshot());
 
     run_motion_loop(
         &mut rx,
@@ -135,58 +144,75 @@ async fn run_motion_loop(
     last_persist: &mut Instant,
     write_bus: bool,
 ) {
-    let mut pll = FramePll::new();
-    let use_pll = write_bus && matches!(&opts.serial, Some(ModbusBus::Serial(_)));
+    let cfg = opts
+        .serial
+        .as_ref()
+        .map(|b| b.pll_config())
+        .unwrap_or_else(PllConfig::network);
+    let mut pll = Pll::new(cfg);
+    let dummy_notify = std::sync::Arc::new(Notify::new());
     let mut last_pll_log = Instant::now();
+    let mut loop_window = LoopStatsWindow::new();
+    let mut last_tick_us = micros_now();
+    loop_window.reset_clock(last_tick_us);
+
     loop {
+        let notify = opts
+            .serial
+            .as_ref()
+            .and_then(|b| b.ack_notify())
+            .unwrap_or_else(|| dummy_notify.clone());
+        let wake = if write_bus {
+            pll.next_wake(mono_us())
+        } else {
+            Wake::At(mono_us().saturating_add(5_000))
+        };
+        let cap = Duration::from_micros(u64::from(
+            pll.info().period_us.max(2_500).saturating_add(2_000),
+        ));
         tokio::select! {
             msg = rx.recv() => {
                 let Some(msg) = msg else { break; };
                 handle_msg(engine, msg, &opts.persist);
             }
-            _ = wait_next_tx(use_pll, &mut pll) => {
+            _ = wait_wake(wake, &notify, cap) => {
+                drain_acks(opts, &mut pll);
                 let now = micros_now();
+                let dt_ms = (now.saturating_sub(last_tick_us)) as f32 / 1000.0;
+                last_tick_us = now;
+                loop_window.record(now, dt_ms, engine.snapshot().position);
+                if let Some(stats) = loop_window.take_flushed() {
+                    engine.apply(Command::SetLoopStats(stats));
+                }
+                if let Some(stats) = opts.link.take_flushed() {
+                    engine.apply(Command::SetLinkStats(stats));
+                }
+
                 let out = engine.tick(now);
                 if write_bus && travel_homed(engine) {
-                    if use_pll {
-                        let Some(port) = opts.serial.as_mut().and_then(|b| b.as_serial_mut()) else {
-                            break;
-                        };
-                        match port.write_position_radians(out.position).await {
-                            Ok(timing) => {
-                                engine.apply(Command::SetMotorConnected(true));
-                                pll.on_done(timing.t_tx, timing.t_rx);
-                            }
-                            Err(e) => {
-                                tracing::debug!("serial write: {e}");
-                                engine.apply(Command::SetMotorConnected(false));
-                                pll.on_done(Instant::now(), None);
-                            }
-                        }
-                        if last_pll_log.elapsed() >= Duration::from_secs(1) {
-                            last_pll_log = Instant::now();
-                            let snap = engine.snapshot();
-                            tracing::info!(
-                                psi = pll.psi_us(),
-                                phase_mag = pll.phase_mag(),
-                                period = pll.period_us(),
-                                e = pll.last_err_us(),
-                                i = pll.integral_us(),
-                                write_lead = pll.write_lead_us(),
-                                rtt_ewma = pll.rtt_ewma_us(),
-                                ups = snap.ups,
-                                dt_avg_ms = snap.dt_avg_ms,
-                                dt_max_ms = snap.dt_max_ms,
-                                "pll"
-                            );
-                        }
-                    } else if let Some(port) = opts.serial.as_mut() {
-                        if let Err(e) = port.write_position_radians(out.position).await {
-                            tracing::debug!("bus write: {e}");
-                            engine.apply(Command::SetMotorConnected(false));
-                        } else {
-                            engine.apply(Command::SetMotorConnected(true));
-                        }
+                    if let Err(e) = stream_position(opts, &mut pll, out.position).await {
+                        tracing::debug!("stream write: {e}");
+                        engine.apply(Command::SetMotorConnected(false));
+                    } else {
+                        engine.apply(Command::SetMotorConnected(true));
+                    }
+                    drain_acks(opts, &mut pll);
+                    opts.link.set_pacing(pll.info());
+                    if last_pll_log.elapsed() >= Duration::from_secs(1) {
+                        last_pll_log = Instant::now();
+                        let snap = engine.snapshot();
+                        let info = pll.info();
+                        tracing::info!(
+                            state = info.state.as_str(),
+                            period_us = info.period_us,
+                            delay_us = info.delay_us,
+                            rtt_min_us = info.rtt_min_us,
+                            rtt_ewma_us = info.rtt_ewma_us,
+                            ups = snap.loop_stats.ups,
+                            dt_avg_ms = snap.loop_stats.dt_avg_ms,
+                            dt_max_ms = snap.loop_stats.dt_max_ms,
+                            "motion"
+                        );
                     }
                 } else {
                     engine.apply(Command::SetMotorConnected(opts.mock));
@@ -197,11 +223,73 @@ async fn run_motion_loop(
     }
 }
 
-async fn wait_next_tx(use_pll: bool, pll: &mut FramePll) {
-    if use_pll {
-        pll.wait_tx().await;
-    } else {
-        tokio::task::yield_now().await;
+async fn wait_wake(wake: Wake, notify: &Notify, cap: Duration) {
+    match wake {
+        Wake::Now => {}
+        Wake::OnAck => {
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep(cap) => {}
+            }
+        }
+        Wake::At(t) => {
+            let now = Instant::now();
+            let deadline = mono_deadline(t).min(now + cap);
+            if deadline > now {
+                let left = deadline.saturating_duration_since(now);
+                if left > Duration::from_millis(2) {
+                    tokio::time::sleep(left - Duration::from_millis(1)).await;
+                }
+                while Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+fn drain_acks(opts: &EngineTaskOpts, pll: &mut Pll) {
+    if let Some(bus) = opts.serial.as_ref() {
+        if let Some(sample) = bus.take_ack_sample() {
+            let t_tx = instant_to_mono(sample.t_tx);
+            match sample.t_rx {
+                Some(t_rx) => pll.on_ack(t_tx, instant_to_mono(t_rx)),
+                None => pll.on_timeout(t_tx, mono_us()),
+            }
+        }
+    }
+}
+
+async fn stream_position(
+    opts: &mut EngineTaskOpts,
+    pll: &mut Pll,
+    position: f32,
+) -> Result<(), String> {
+    let Some(bus) = opts.serial.as_mut() else {
+        return Ok(());
+    };
+    if bus.has_async_stream() {
+        if !bus.stream_worker_alive() {
+            return Err("stream worker ended".into());
+        }
+        bus.submit_position(position)?;
+        pll.on_tx(mono_us());
+        return Ok(());
+    }
+    match bus.write_position_radians(position).await {
+        Ok(t) => {
+            pll.on_tx(t.t_tx_us);
+            match t.t_rx_us {
+                Some(rx) => pll.on_ack(t.t_tx_us, rx),
+                None => pll.on_timeout(t.t_tx_us, mono_us()),
+            }
+            Ok(())
+        }
+        Err(e) => {
+            pll.on_timeout(mono_us(), mono_us());
+            opts.link.record_failure(micros_now());
+            Err(e)
+        }
     }
 }
 
@@ -217,17 +305,19 @@ fn after_tick(
     last_saved_motor: &mut MotorControllerConfig,
     last_persist: &mut Instant,
 ) {
-    let _ = snap_tx.send(engine.snapshot().clone());
+    let _ = snap_tx.send(*engine.snapshot());
 
     if last_persist.elapsed() >= Duration::from_secs(2) {
         *last_persist = Instant::now();
-        let cfg = engine.snapshot().config.clone();
+        let cfg = engine.snapshot().config;
         if persistent_motor_changed(last_saved_motor, &cfg) {
-            *last_saved_motor = cfg.clone();
-            let saved = SavedConfig { motor: cfg };
-            if let Err(e) = opts.persist.save(&saved) {
-                tracing::warn!("persist motor: {e}");
-            }
+            *last_saved_motor = cfg;
+            let persist = opts.persist.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = persist.save_motor(cfg) {
+                    tracing::warn!("persist motor: {e}");
+                }
+            });
         }
     }
 }
@@ -243,7 +333,7 @@ async fn pump_loop(
             return;
         };
         handle_msg(engine, msg, persist);
-        let _ = snap_tx.send(engine.snapshot().clone());
+        let _ = snap_tx.send(*engine.snapshot());
     }
 }
 
@@ -251,6 +341,14 @@ fn handle_msg(engine: &mut Engine, msg: EngineMsg, persist: &Persist) {
     match msg {
         EngineMsg::TrySetConfig { cfg, reply } => {
             let _ = reply.send(engine.try_set_config(cfg));
+        }
+        EngineMsg::SetPaused {
+            paused,
+            position,
+            reply,
+        } => {
+            engine.apply(Command::SetPaused { paused, position });
+            let _ = reply.send(engine.snapshot().config);
         }
         EngineMsg::Rpc { req, reply } => {
             let mut out = vec![0u8; 4096];
@@ -285,26 +383,12 @@ fn path_set(
             CoreError::StaleVersion => PathError::StaleVersion,
             _ => PathError::InvalidValue,
         })?;
-        let saved = SavedConfig {
-            motor: engine.snapshot().config.clone(),
-        };
-        let _ = persist.save(&saved);
+        let _ = persist.save_motor(engine.snapshot().config);
         return Ok(String::from(value));
     }
     let shown = paths::set(engine, path, value)?;
     if section == "motor" {
-        let saved = SavedConfig {
-            motor: engine.snapshot().config.clone(),
-        };
-        let _ = persist.save(&saved);
+        let _ = persist.save_motor(engine.snapshot().config);
     }
     Ok(shown)
-}
-
-fn micros_now() -> ossm_core::Micros {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as ossm_core::Micros)
-        .unwrap_or(0)
 }

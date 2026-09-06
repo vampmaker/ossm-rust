@@ -1,18 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "websockets>=12.0",
-#     "python-dotenv>=1.0.0",
-#     "httpx>=0.27.0",
-#     "httpx2>=0.1.0",
-#     "pyserial>=3.5",
-#     "bleak>=0.21.0",
-#     "typer>=0.12.0",
-#     "rich>=13.7.0",
-#     "pydantic>=2.0.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """Smoke-test OSSM Modbus WebSocket relay at /ws/modbus (binary RTU frames)."""
 
 from __future__ import annotations
@@ -51,7 +37,7 @@ def build_fc03(unit: int, start: int, count: int) -> bytes:
 
 async def wait_http(ip: str, timeout_s: float = 45.0) -> None:
     deadline = time.monotonic() + timeout_s
-    url = f"http://{ip}/pin-config"
+    url = f"http://{ip}/shell-config"
     while time.monotonic() < deadline:
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
@@ -64,22 +50,55 @@ async def wait_http(ip: str, timeout_s: float = 45.0) -> None:
     raise TimeoutError(f"Device HTTP not reachable at {url}")
 
 
+async def wait_mode(ip: str, want: str, timeout_s: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.get(f"http://{ip}/shell-config")
+                if r.status_code == 200:
+                    last = r.json().get("operating_mode")
+                    if last == want:
+                        return
+        except Exception:
+            pass
+        await asyncio.sleep(0.4)
+    raise TimeoutError(f"operating_mode did not become {want!r} (last={last!r})")
+
+
+async def live_set_mode(wifi: DeviceBackend, ip: str, mode: str) -> None:
+    pin = await wifi.get_pin_config()
+    pin["operating_mode"] = mode
+    await wifi.set_pin_config(pin)
+    await wait_mode(ip, mode)
+
+
 async def run_ws_modbus_test(ip: str) -> None:
     url = f"ws://{ip}/ws/modbus"
     frame = build_fc03(1, 0, 26)
     print(f"Connecting to {url}...")
-    async with websockets.connect(url, open_timeout=5, close_timeout=2) as ws:
-        await ws.send(frame)
-        resp = await asyncio.wait_for(ws.recv(), timeout=2.0)
-        if isinstance(resp, str):
-            resp = resp.encode("latin1")
-        assert isinstance(resp, (bytes, bytearray)), f"expected binary, got {type(resp)}"
-        assert len(resp) >= 5, f"short response: {resp!r}"
-        assert resp[0] == 1 and resp[1] == 0x03, f"bad header: {resp[:4].hex()}"
-        assert calc_crc16(resp[:-2]) == struct.unpack("<H", resp[-2:])[0], "CRC mismatch"
-        byte_count = resp[2]
-        assert byte_count == 52, f"expected 52 data bytes, got {byte_count}"
-        print(f"✓ WS Modbus FC03 OK ({len(resp)} bytes)")
+    last: Exception | None = None
+    for i in range(10):
+        try:
+            async with websockets.connect(url, open_timeout=5, close_timeout=2) as ws:
+                await ws.send(frame)
+                resp = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                if isinstance(resp, str):
+                    resp = resp.encode("latin1")
+                assert isinstance(resp, (bytes, bytearray)), f"expected binary, got {type(resp)}"
+                assert len(resp) >= 5, f"short response: {resp!r}"
+                assert resp[0] == 1 and resp[1] == 0x03, f"bad header: {resp[:4].hex()}"
+                assert calc_crc16(resp[:-2]) == struct.unpack("<H", resp[-2:])[0], "CRC mismatch"
+                byte_count = resp[2]
+                assert byte_count == 52, f"expected 52 data bytes, got {byte_count}"
+                print(f"✓ WS Modbus FC03 OK ({len(resp)} bytes)")
+                return
+        except Exception as e:
+            last = e
+            print(f"   WS FC03 attempt {i + 1}/10 failed: {e}")
+            await asyncio.sleep(0.8)
+    raise AssertionError(f"WS Modbus FC03 failed after 10 attempts: {last}")
 
 
 async def main() -> None:
@@ -87,12 +106,12 @@ async def main() -> None:
     parser.add_argument(
         "--switch-mode",
         action="store_true",
-        help="Switch device to rtu_relay via serial and restart before testing",
+        help="Live-switch device to rtu_relay via HTTP /shell-config (no reboot)",
     )
     parser.add_argument(
         "--restore-servo",
         action="store_true",
-        help="Restore operating_mode=servo via serial after tests",
+        help="Live-switch operating_mode=servo via HTTP after tests",
     )
     args = parser.parse_args()
     load_env()
@@ -100,15 +119,12 @@ async def main() -> None:
     if not ip:
         raise SystemExit("DEVICE_IP missing in .env")
 
-    serial = DeviceBackend(mode="serial")
-    if args.switch_mode:
-        print(" -> Switching operating_mode to rtu_relay via serial...")
-        await serial.set_pin_config({"operating_mode": "rtu_relay"})
-        await serial.restart_device()
-        await asyncio.sleep(12)
-        await wait_http(ip)
-
+    await wait_http(ip)
     wifi = DeviceBackend(mode="wifi", ip=ip)
+    if args.switch_mode:
+        print(" -> Switching operating_mode to rtu_relay (live HTTP)...")
+        await live_set_mode(wifi, ip, "rtu_relay")
+
     pin = await wifi.get_pin_config()
     mode = pin.get("operating_mode", "servo")
     print(f"operating_mode={mode}")
@@ -128,12 +144,9 @@ async def main() -> None:
         raise
 
     if args.restore_servo:
-        print(" -> Restoring operating_mode=servo via serial...")
-        await serial.set_pin_config({"operating_mode": "servo"})
-        await serial.restart_device()
-        await asyncio.sleep(12)
-        await wait_http(ip)
-        pin2 = await DeviceBackend(mode="wifi", ip=ip).get_pin_config()
+        print(" -> Restoring operating_mode=servo (live HTTP)...")
+        await live_set_mode(wifi, ip, "servo")
+        pin2 = await wifi.get_pin_config()
         assert pin2.get("operating_mode", "servo") == "servo"
         print("✓ Restored servo mode")
 

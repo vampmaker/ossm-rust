@@ -3,7 +3,7 @@ use core::sync::atomic::Ordering;
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_hal::delay::Delay;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
-use esp_hal::gpio::{AnyPin, Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::uart::uhci::{Uhci, UhciRx, UhciTx};
 use esp_hal::uart::{Config, Uart};
 use fixedvec::FixedVec;
@@ -12,21 +12,74 @@ use rmodbus::{client::ModbusRequest, guess_response_frame_len, ModbusProto};
 
 use crate::context::AppContext;
 use crate::error::{FirmwareError, Result};
-use crate::uart_owner;
 use crate::modbus_rtu::{
     apply_capture_inject, classify_modbus_rx_miss, classify_recovered, find_modbus_response,
     get_inject_junk, InjectJunkMode,
 };
-use crate::motion::{CommandConsumer, LoopStats, ModbusStats, TimingWindowStats};
+use crate::motion::{CommandConsumer, LinkStats, LoopStats};
 use crate::motor::Motor;
+use crate::peripheral_bank::PeripheralBank;
 use crate::storage::PinConfiguration;
+use crate::uart_owner;
+use ossm_common::{LinkStatsWindow, LoopStatsWindow};
 use ossm_core::modbus::aim30;
-use ossm_core::{Command, Engine, Micros};
+use ossm_core::{Command, Engine, Micros, StateResponse, StreamStatus};
 
 pub const TARGET_BAUD_RATE: u32 = 115200;
+/// FC16/FC06 ACK length; production UHCI pkt_thres is set once to this.
+const FC16_ACK_LEN: u16 = 8;
+/// While paused, refresh position at 2 Hz so AIM30 hold can be measured.
+const PAUSE_FC16_KEEPALIVE_US: u64 = 500_000;
 
 fn now_us() -> Micros {
     Instant::now().as_micros()
+}
+
+#[derive(Clone, Copy)]
+struct PublishedPose {
+    version: u32,
+    position: f32,
+    speed: f32,
+    y: f32,
+    shaped_y: f32,
+    t: f32,
+    x: f32,
+    motor_connected: bool,
+    pos_min: f32,
+    pos_max: f32,
+    stream: StreamStatus,
+}
+
+impl PublishedPose {
+    fn from_snapshot(snap: &StateResponse) -> Self {
+        Self {
+            version: snap.config.version,
+            position: snap.position,
+            speed: snap.speed,
+            y: snap.y,
+            shaped_y: snap.shaped_y,
+            t: snap.t,
+            x: snap.x,
+            motor_connected: snap.motor_connected,
+            pos_min: snap.pos_min,
+            pos_max: snap.pos_max,
+            stream: snap.stream,
+        }
+    }
+
+    fn changed(&self, snap: &StateResponse) -> bool {
+        self.version != snap.config.version
+            || self.position != snap.position
+            || self.speed != snap.speed
+            || self.y != snap.y
+            || self.shaped_y != snap.shaped_y
+            || self.t != snap.t
+            || self.x != snap.x
+            || self.motor_connected != snap.motor_connected
+            || self.pos_min != snap.pos_min
+            || self.pos_max != snap.pos_max
+            || self.stream != snap.stream
+    }
 }
 
 fn drain_motion(engine: &mut Engine, consumer: &mut CommandConsumer) {
@@ -63,49 +116,7 @@ pub struct ModbusRTUMaster<'d> {
     timeout_symbols: u8,
     debug: bool,
 
-    last_stats_window: Instant,
-    current_successes: u32,
-    current_failures: u32,
-    current_round_trip_us: alloc::vec::Vec<u16>,
-    current_slave_latency_us: alloc::vec::Vec<u16>,
-    current_rx_duration_us: alloc::vec::Vec<u16>,
-    pub latest_stats: ModbusStats,
-}
-
-fn compute_timing_stats(samples: &mut [u16]) -> TimingWindowStats {
-    if samples.is_empty() {
-        return TimingWindowStats::default();
-    }
-    samples.sort_unstable();
-    let n = samples.len();
-    let min = samples[0];
-    let max = samples[n - 1];
-    let pct5 = samples[(n * 5) / 100];
-    let pct10 = samples[(n * 10) / 100];
-    let pct50 = samples[(n * 50) / 100];
-    let pct90 = samples[(n * 90) / 100];
-    let pct95 = samples[(n * 95) / 100];
-
-    let sum: u32 = samples.iter().map(|&x| x as u32).sum();
-    let mean = (sum / n as u32) as u16;
-
-    let dev_sum: u32 = samples
-        .iter()
-        .map(|&x| (x as i32 - mean as i32).unsigned_abs())
-        .sum();
-    let mdev = (dev_sum / n as u32) as u16;
-
-    TimingWindowStats {
-        min,
-        max,
-        pct5,
-        pct10,
-        pct50,
-        pct90,
-        pct95,
-        mean,
-        mdev,
-    }
+    link_window: LinkStatsWindow,
 }
 
 impl<'d> ModbusRTUMaster<'d> {
@@ -150,13 +161,12 @@ impl<'d> ModbusRTUMaster<'d> {
             baudrate,
             timeout_symbols,
             debug,
-            last_stats_window: Instant::now(),
-            current_successes: 0,
-            current_failures: 0,
-            current_round_trip_us: alloc::vec::Vec::with_capacity(350),
-            current_slave_latency_us: alloc::vec::Vec::with_capacity(350),
-            current_rx_duration_us: alloc::vec::Vec::with_capacity(350),
-            latest_stats: ModbusStats::default(),
+            link_window: {
+                let mut w = LinkStatsWindow::new();
+                w.set_link_info(ossm_common::LinkTransport::Uart);
+                w.set_connected(true);
+                w
+            },
         }
     }
 
@@ -191,16 +201,13 @@ impl<'d> ModbusRTUMaster<'d> {
     /// triggers an `RX_TOUT` (RX FIFO idle timeout) interrupt after observing line silence of
     /// `timeout_symbols` symbol times after the last received byte.
     ///
-    /// At 115200 baud (1 symbol ≈ 86.8 µs), setting `timeout_symbols = 3` (260 µs) provides fast
-    /// end-of-frame detection without splitting variable-length frames. Furthermore, because the
-    /// hardware already waits `timeout_symbols` of silence on the wire before `UhciRx::read`
-    /// returns, we subtract that duration (`hardware_silence_us`) from the inter-frame delay
-    /// ($t_{3.5}$) so the bus is not kept silent twice. This restores full Modbus polling
-    /// performance (>350 UPS) while retaining zero dropped bytes under GDMA.
+    /// At 115200 baud (1 symbol ≈ 86.8 µs), `timeout_symbols` is raised so hardware
+    /// idle covers $t_{3.5}$ (350 µs → 5 symbols). That drops the software busy-wait
+    /// IFD on the C6 interrupt executor. `UhciRx::read` already returns after that
+    /// silence, so remaining IFD is 0.
     fn get_default_rx_inter_byte_timeout(baudrate: u32) -> Result<Duration> {
         // Modbus RTU spec (>19200 bps): fixed t1.5 = 750µs.
-        // With correct hardware timeout_symbols=3 (260µs FIFO idle threshold),
-        // the software timeout of 750µs is sufficient — no re-arm race occurs.
+        // Hardware idle covers t3.5; software 750µs is the per-read guard only.
         match baudrate {
             9600 => Ok(Duration::from_micros(4000)),
             19200 => Ok(Duration::from_micros(2500)),
@@ -239,55 +246,27 @@ impl<'d> ModbusRTUMaster<'d> {
         }
     }
 
-    fn record_sample(&mut self, timing: FrameTiming) {
-        self.current_successes = self.current_successes.saturating_add(1);
-        if self.current_round_trip_us.len() < 350 {
-            self.current_round_trip_us.push(timing.round_trip_us);
-            self.current_slave_latency_us.push(timing.slave_latency_us);
-            self.current_rx_duration_us.push(timing.rx_duration_us);
-        }
-        self.maybe_flush_stats();
+    fn record_sample(&mut self, now: Micros, timing: FrameTiming, tx_len: u32, rx_len: u32) {
+        self.link_window.record_success(
+            now,
+            timing.round_trip_us,
+            Some(timing.slave_latency_us),
+            Some(timing.rx_duration_us),
+            tx_len,
+            rx_len,
+        );
     }
 
-    fn record_failure(&mut self) {
-        self.current_failures = self.current_failures.saturating_add(1);
-        self.maybe_flush_stats();
+    fn record_failure(&mut self, now: Micros) {
+        self.link_window.record_failure(now);
     }
 
-    fn maybe_flush_stats(&mut self) {
-        if Instant::now().duration_since(self.last_stats_window) >= Duration::from_secs(1) {
-            let total = self.current_successes + self.current_failures;
-            let success_rate = if total > 0 {
-                (self.current_successes as f32 / total as f32) * 100.0
-            } else {
-                0.0
-            };
-
-            let round_trip = compute_timing_stats(self.current_round_trip_us.as_mut_slice());
-            let slave_latency = compute_timing_stats(self.current_slave_latency_us.as_mut_slice());
-            let rx_duration = compute_timing_stats(self.current_rx_duration_us.as_mut_slice());
-
-            self.latest_stats = ModbusStats {
-                successful_requests: self.current_successes,
-                failed_requests: self.current_failures,
-                success_rate,
-                round_trip,
-                slave_latency,
-                rx_duration,
-            };
-
-            self.current_successes = 0;
-            self.current_failures = 0;
-            self.current_round_trip_us.clear();
-            self.current_slave_latency_us.clear();
-            self.current_rx_duration_us.clear();
-            self.last_stats_window = Instant::now();
-        }
+    pub fn take_link_stats(&mut self) -> Option<LinkStats> {
+        self.link_window.take_flushed()
     }
 
-    pub fn get_stats(&mut self) -> ModbusStats {
-        self.maybe_flush_stats();
-        self.latest_stats
+    pub fn link_has_exchanges(&self) -> bool {
+        self.link_window.total_exchanges() > 0
     }
 
     async fn dma_write_all(&mut self, req: &[u8]) -> Result<()> {
@@ -327,7 +306,7 @@ impl<'d> ModbusRTUMaster<'d> {
         &mut self,
         req: &[u8],
         resp: &mut [u8],
-    ) -> Result<(usize, FrameTiming)> {
+    ) -> Result<(usize, FrameTiming, Micros)> {
         let t0 = Instant::now();
         let deadline = t0 + self.read_timeout;
 
@@ -354,13 +333,8 @@ impl<'d> ModbusRTUMaster<'d> {
         let cap = dma_rx.capacity();
         dma_rx.set_length(cap);
         let expected_len = expected_modbus_response_len(req);
-        // UHCI finalizes DMA descriptors on length-EOF (pkt_thres) and/or UART idle-EOF.
-        // Using pkt_thres=1024 meant an 8-byte Modbus reply never hit length-EOF; if idle-EOF
-        // did not fire in time, software cancel left descriptors un-finalized and
-        // read_received_data() returned 0 (false "empty" with a live motor).
-        // Debug mode keeps the large capture buffer and 5ms deadline, but must complete the
-        // transfer the same way as production so RX bytes are visible.
-        configure_uhci0_pkt_thres(expected_len);
+        // pkt_thres is set at UART init (FC16 ACK = 8) or around FC03 reads.
+        // Do not rewrite it every exchange.
 
         let mut rx_transfer = uhci_rx.read(dma_rx).map_err(|(_, rx, buf)| {
             self.uhci_rx = Some(rx);
@@ -492,6 +466,8 @@ impl<'d> ModbusRTUMaster<'d> {
             .inter_frame_delay
             .as_micros()
             .saturating_sub(hardware_silence_us as u64);
+        // Default symbols cover t3.5, so this is 0. Busy-wait only if the user
+        // shortened hardware idle below the IFD override.
         if remaining_ifd_us > 0 {
             Delay::new().delay_micros(remaining_ifd_us as u32);
         }
@@ -522,7 +498,7 @@ impl<'d> ModbusRTUMaster<'d> {
             rx_duration_us,
         };
 
-        Ok((len, timing))
+        Ok((len, timing, t5.as_micros()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -555,15 +531,27 @@ impl<'d> ModbusRTUMaster<'d> {
 
     pub async fn modbus_request(&mut self, req: &[u8], resp: &mut [u8]) -> Result<usize> {
         match self.modbus_request_inner(req, resp).await {
-            Ok((len, timing)) => {
-                self.record_sample(timing);
+            Ok((len, timing, now)) => {
+                self.record_sample(now, timing, req.len() as u32, len as u32);
                 Ok(len)
             }
             Err(e) => {
-                self.record_failure();
+                self.record_failure(now_us());
                 Err(e)
             }
         }
+    }
+
+    /// Relay path: raise UHCI `pkt_thres` to the expected FC03/FC16 length for this frame.
+    pub async fn relay_request(&mut self, req: &[u8], resp: &mut [u8]) -> Result<usize> {
+        if !self.debug {
+            configure_uhci0_pkt_thres(expected_modbus_response_len(req));
+        }
+        let result = self.modbus_request(req, resp).await;
+        if !self.debug {
+            configure_uhci0_pkt_thres(FC16_ACK_LEN);
+        }
+        result
     }
 
     pub async fn read_holding_registers(
@@ -582,9 +570,16 @@ impl<'d> ModbusRTUMaster<'d> {
         request
             .generate_get_holdings(addr, count, &mut frame_buf)
             .map_err(|_| FirmwareError::Modbus("request"))?;
-        let len = self
+        if !self.debug {
+            configure_uhci0_pkt_thres(expected_modbus_response_len(frame_buf.as_slice()));
+        }
+        let req_res = self
             .modbus_request(frame_buf.as_slice(), &mut response_buf)
-            .await?;
+            .await;
+        if !self.debug {
+            configure_uhci0_pkt_thres(FC16_ACK_LEN);
+        }
+        let len = req_res?;
 
         let mut result_vec = FixedVec::new(result);
         request
@@ -611,6 +606,7 @@ impl<'d> ModbusRTUMaster<'d> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn write_holding_registers(&mut self, addr: u16, values: &[u16]) -> Result<()> {
         let mut request = ModbusRequest::new(self.device_id, ModbusProto::Rtu);
         let mut request_buf = fixedvec::alloc_stack!([u8; 256]);
@@ -630,6 +626,20 @@ impl<'d> ModbusRTUMaster<'d> {
     }
 
     pub fn set_baudrate(&mut self, baudrate: u32) -> Result<()> {
+        self.baudrate = baudrate;
+        let timeout = if self.debug {
+            Duration::from_millis(5)
+        } else {
+            Self::compute_timeout(baudrate, self.timeout_override_ms)?
+        };
+        self.read_timeout = timeout;
+        self.write_timeout = timeout;
+        self.inter_frame_delay =
+            Self::compute_inter_frame_delay(baudrate, self.inter_frame_delay_override_us)?;
+        if self.rx_timeout_override_us == 0 {
+            self.timeout_symbols =
+                timeout_symbols_covering_ifd(baudrate, self.inter_frame_delay.as_micros());
+        }
         let rx_config = esp_hal::uart::RxConfig::default().with_timeout(self.timeout_symbols);
         let config = Config::default().with_baudrate(baudrate).with_rx(rx_config);
         if let Some(ref mut tx) = self.uhci_tx {
@@ -653,16 +663,6 @@ impl<'d> ModbusRTUMaster<'d> {
                 u1.tout_conf().read().rx_tout_en().bit(),
             );
         }
-        self.baudrate = baudrate;
-        let timeout = if self.debug {
-            Duration::from_millis(5)
-        } else {
-            Self::compute_timeout(baudrate, self.timeout_override_ms)?
-        };
-        self.read_timeout = timeout;
-        self.write_timeout = timeout;
-        self.inter_frame_delay =
-            Self::compute_inter_frame_delay(baudrate, self.inter_frame_delay_override_us)?;
         Ok(())
     }
 
@@ -697,15 +697,23 @@ impl<'d> Modbus57AIM30Motor<'d> {
         }
     }
 
-    pub fn get_stats(&mut self) -> ModbusStats {
-        self.client.get_stats()
+    pub fn take_link_stats(&mut self) -> Option<LinkStats> {
+        self.client.take_link_stats()
+    }
+
+    pub fn link_has_exchanges(&self) -> bool {
+        self.client.link_has_exchanges()
     }
 
     async fn write_position_raw(&mut self, position: i32) -> Result<()> {
-        let data = aim30::pack_position_i32(position);
-        self.client
-            .write_holding_registers(aim30::REG_POSITION, &data)
-            .await
+        let req = aim30::pack_position_fc16(self.client.device_id, position);
+        let mut resp = [0u8; FC16_ACK_LEN as usize];
+        let len = self.client.modbus_request(&req, &mut resp).await?;
+        let frame = &resp[..len.min(resp.len())];
+        if len < 8 || frame[1] != 0x10 || !crate::modbus_rtu::verify_rtu_crc(frame) {
+            return Err(FirmwareError::Modbus("parse"));
+        }
+        Ok(())
     }
 
     async fn wait_stable_position(&mut self, timeout_ms: u32) -> Result<f32> {
@@ -843,7 +851,38 @@ impl<'d> Motor for Modbus57AIM30Motor<'d> {
         );
 
         log::info!("Homing motor");
-        self.set_max_power(aim30::POWER_HOMING).await?;
+        let want = aim30::encode_max_power(aim30::POWER_HOMING);
+        let mut power_ok = false;
+        for attempt in 1..=8 {
+            if uart_owner::stop_requested() {
+                return Err(FirmwareError::Modbus("stopped"));
+            }
+            match self.set_max_power(aim30::POWER_HOMING).await {
+                Ok(()) => {
+                    power_ok = true;
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("set_max_power POWER_HOMING ({attempt}/8): {e}");
+                    if uart_owner::sleep_or_stop(200).await {
+                        return Err(FirmwareError::Modbus("stopped"));
+                    }
+                }
+            }
+        }
+        if !power_ok {
+            return Err(FirmwareError::Modbus("POWER_HOMING failed after retries"));
+        }
+        let mut got = [0u16; 1];
+        self.client
+            .read_holding_registers(aim30::REG_POWER, 1, &mut got)
+            .await?;
+        if got[0] != want {
+            log::error!("REG_POWER readback {} want {want} (POWER_HOMING)", got[0]);
+            return Err(FirmwareError::Modbus("POWER_HOMING readback mismatch"));
+        }
+        log::info!("REG_POWER={want} after POWER_HOMING");
+
         self.set_acceleration(aim30::ACCEL_HOMING).await?;
         self.reset_position().await?;
         log::info!("Writing position to -100.0");
@@ -878,10 +917,6 @@ impl<'d> Motor for Modbus57AIM30Motor<'d> {
     fn pos_max(&self) -> f32 {
         self.pos_max
     }
-
-    async fn cycle(&mut self) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -891,33 +926,35 @@ pub struct ModbusScanResult {
 }
 
 pub(crate) fn init_uart_and_modbus(
-    uart_periph: esp_hal::peripherals::UART1<'static>,
-    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
-    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
     pin_config: &PinConfiguration,
+    bank: &mut PeripheralBank,
 ) -> Result<ModbusRTUMaster<'static>> {
-    let tx_pin = unsafe { AnyPin::steal(pin_config.modbus_tx as u8) };
+    let (uart_periph, uhci_periph, dma_channel) = bank.take_uart()?;
+    let tx_pin = bank.take_pin(pin_config.modbus_tx as u8)?;
     let rx_pin = Input::new(
-        unsafe { AnyPin::steal(pin_config.modbus_rx as u8) },
+        bank.take_pin(pin_config.modbus_rx as u8)?,
         InputConfig::default().with_pull(Pull::Up),
     );
-    let de_pin = unsafe { AnyPin::steal(pin_config.modbus_de_re as u8) };
+    let de_pin = bank.take_pin(pin_config.modbus_de_re as u8)?;
 
     let de_re = Output::new(de_pin, Level::Low, OutputConfig::default());
-    let timeout_symbols = if pin_config.modbus_rx_timeout_us == 0 {
-        2u8
-    } else {
-        (pin_config.modbus_rx_timeout_us / 87).clamp(2, 127) as u8
-    };
-    let rx_config = esp_hal::uart::RxConfig::default().with_timeout(timeout_symbols);
     let baud = if pin_config.modbus_baud == 0 {
         TARGET_BAUD_RATE
     } else {
         pin_config.modbus_baud
     };
-    let uart_config = Config::default()
-        .with_baudrate(baud)
-        .with_rx(rx_config);
+    let timeout_symbols = if pin_config.modbus_rx_timeout_us == 0 {
+        let ifd_us = if pin_config.modbus_inter_frame_delay_us == 0 {
+            default_ifd_us(baud)
+        } else {
+            u64::from(pin_config.modbus_inter_frame_delay_us)
+        };
+        timeout_symbols_covering_ifd(baud, ifd_us)
+    } else {
+        (pin_config.modbus_rx_timeout_us / 87).clamp(2, 127) as u8
+    };
+    let rx_config = esp_hal::uart::RxConfig::default().with_timeout(timeout_symbols);
+    let uart_config = Config::default().with_baudrate(baud).with_rx(rx_config);
     let uart = Uart::new(uart_periph, uart_config)
         .map_err(|_| FirmwareError::Uart("init"))?
         .with_tx(tx_pin)
@@ -940,6 +977,11 @@ pub(crate) fn init_uart_and_modbus(
     let (uhci_rx, uhci_tx) = uhci.into_async().split();
 
     configure_uart1_rx_idle_threshold(timeout_symbols);
+    configure_uhci0_pkt_thres(if pin_config.modbus_debug {
+        256
+    } else {
+        FC16_ACK_LEN
+    });
 
     if pin_config.modbus_debug {
         log::info!("Modbus debug mode ON: 5ms RX deadline, base64 dumps on console (DMA RX 256 B)");
@@ -975,6 +1017,21 @@ fn configure_uhci0_pkt_thres(len: u16) {
     unsafe {
         let u0 = &*esp_hal::peripherals::UHCI0::ptr();
         u0.pkt_thres().modify(|_, w| w.pkt_thrs().bits(len));
+    }
+}
+
+/// Symbol count so UART idle-EOF silence ≥ `ifd_us` (covers software t3.5).
+fn timeout_symbols_covering_ifd(baudrate: u32, ifd_us: u64) -> u8 {
+    let symbols = ifd_us.saturating_mul(baudrate as u64).div_ceil(10_000_000);
+    symbols.clamp(2, 127) as u8
+}
+
+fn default_ifd_us(baudrate: u32) -> u64 {
+    match baudrate {
+        9600 => 4000,
+        19200 => 2000,
+        38400 => 1000,
+        _ => 350,
     }
 }
 
@@ -1157,9 +1214,27 @@ pub async fn run_motor(
         .set_speed_ring_ratio(aim30::RING_RATIO_RUN as f32)
         .await;
 
-    let mut last_stats_log = Instant::now();
+    let mut last_stats_log_us = now_us();
     let mut last_error_log = Instant::now() - Duration::from_secs(1);
     let mut pending_stats: Option<LoopStats> = None;
+    let mut loop_window = LoopStatsWindow::new();
+    let mut last_tick_us = now_us();
+    loop_window.reset_clock(last_tick_us);
+    let mut last_pub = PublishedPose {
+        version: u32::MAX,
+        position: f32::NAN,
+        speed: f32::NAN,
+        y: f32::NAN,
+        shaped_y: f32::NAN,
+        t: f32::NAN,
+        x: f32::NAN,
+        motor_connected: false,
+        pos_min: f32::NAN,
+        pos_max: f32::NAN,
+        stream: StreamStatus::default(),
+    };
+    let mut last_fc16_counts: Option<i32> = None;
+    let mut last_fc16_us: Micros = 0;
 
     loop {
         if uart_owner::stop_requested() {
@@ -1168,50 +1243,89 @@ pub async fn run_motor(
                 position: None,
             });
             drain_motion(engine, motion_consumer);
-            let out = engine.tick(now_us());
+            let now = now_us();
+            let dt_ms = (now.saturating_sub(last_tick_us)) as f32 / 1000.0;
+            loop_window.record(now, dt_ms, engine.snapshot().position);
+            if let Some(stats) = loop_window.take_flushed() {
+                engine.apply(Command::SetLoopStats(stats));
+            }
+            if let Some(stats) = motor.take_link_stats() {
+                engine.apply(Command::SetLinkStats(stats));
+            }
+            let connected = motor.link_has_exchanges();
+            if engine.snapshot().motor_connected != connected {
+                engine.apply(Command::SetMotorConnected(connected));
+            }
+            let out = engine.tick(now);
             let _ = motor.write_position(out.position, out.speed).await;
             app_context.update_snapshot(engine.snapshot());
             log::info!("Motor loop stopped for UART1 role switch");
             return Ok(());
         }
 
-        let log_stats = Instant::now().duration_since(last_stats_log) >= Duration::from_secs(5);
-
         drain_motion(engine, motion_consumer);
 
-        let modbus_stats = motor.get_stats();
-        engine.apply(Command::SetModbusStats(modbus_stats));
-        engine.apply(Command::SetMotorConnected(
-            modbus_stats.successful_requests > 0,
-        ));
-        let out = engine.tick(now_us());
+        let now = now_us();
+        let log_stats = now.saturating_sub(last_stats_log_us) >= 5_000_000;
+        let dt_ms = (now.saturating_sub(last_tick_us)) as f32 / 1000.0;
+        last_tick_us = now;
+        loop_window.record(now, dt_ms, engine.snapshot().position);
+        let mut stats_dirty = false;
+        if let Some(stats) = loop_window.take_flushed() {
+            engine.apply(Command::SetLoopStats(stats));
+            stats_dirty = true;
+        }
+        if let Some(stats) = motor.take_link_stats() {
+            engine.apply(Command::SetLinkStats(stats));
+            stats_dirty = true;
+        }
+        let connected = motor.link_has_exchanges();
+        if engine.snapshot().motor_connected != connected {
+            engine.apply(Command::SetMotorConnected(connected));
+        }
+        let out = engine.tick(now);
         let position = out.position;
         let speed = out.speed;
+        let snap = engine.snapshot();
         let stats_opt = if log_stats {
-            Some(engine.last_loop_stats())
+            Some(snap.loop_stats)
         } else {
             None
         };
-        app_context.update_snapshot(engine.snapshot());
+        // Paused pose is static (t/x stay 0). Skip CS+copy_from so idle UPS
+        // keeps the ~20 Hz headroom vs moving. Stats / config / pose still publish.
+        if stats_dirty || last_pub.changed(snap) {
+            app_context.update_snapshot(snap);
+            last_pub = PublishedPose::from_snapshot(snap);
+        }
 
         if let Some(st) = stats_opt {
             pending_stats = Some(st);
         }
 
         if let Some(st) = pending_stats.take() {
-            last_stats_log = Instant::now();
+            last_stats_log_us = now;
             if st.ups > 0 {
                 log::info!(
                     "Motor loop stats (1s): UPS={}, dt(ms) min/avg/max/mdev = {:.2} / {:.2} / {:.2} / {:.2}",
                     st.ups,
-                    st.min_dt_ms,
-                    st.avg_dt_ms,
-                    st.max_dt_ms,
-                    st.mdev_dt_ms,
+                    st.dt_min_ms,
+                    st.dt_avg_ms,
+                    st.dt_max_ms,
+                    st.dt_mdev_ms,
                 );
             }
         }
 
+        let counts = aim30::write_counts_for_radians(position);
+        let skip_fc16 = snap.config.paused
+            && last_fc16_counts == Some(counts)
+            && now.saturating_sub(last_fc16_us) < PAUSE_FC16_KEEPALIVE_US;
+        if skip_fc16 {
+            // Yield so skipping the ~3 ms FC16 does not spin the interrupt executor.
+            Timer::after(Duration::from_micros(250)).await;
+            continue;
+        }
         if let Err(e) = motor.write_position(position, speed).await {
             if Instant::now().duration_since(last_error_log) >= Duration::from_secs(1) {
                 last_error_log = Instant::now();
@@ -1220,14 +1334,8 @@ pub async fn run_motor(
             Timer::after_millis(10).await;
             continue;
         }
-        if let Err(e) = motor.cycle().await {
-            if Instant::now().duration_since(last_error_log) >= Duration::from_secs(1) {
-                last_error_log = Instant::now();
-                log::warn!("Motor cycle error: {}, retrying...", e);
-            }
-            Timer::after_millis(10).await;
-            continue;
-        }
+        last_fc16_counts = Some(counts);
+        last_fc16_us = now;
     }
 }
 
@@ -1242,23 +1350,12 @@ fn core1_executor() -> &'static mut esp_rtos::embassy::Executor {
 pub fn run_uart_owner_blocking(
     app_context: AppContext,
     motion_consumer: crate::motion::CommandConsumer,
-    uart_periph: esp_hal::peripherals::UART1<'static>,
-    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
-    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
+    peripheral_bank: crate::peripheral_bank::PeripheralBank,
 ) {
     let executor = core1_executor();
     executor.run(|spawner| {
         spawner
-            .spawn(
-                core1_uart_owner_task(
-                    app_context,
-                    motion_consumer,
-                    uart_periph,
-                    uhci_periph,
-                    dma_channel,
-                )
-                .unwrap(),
-            );
+            .spawn(core1_uart_owner_task(app_context, motion_consumer, peripheral_bank).unwrap());
     });
 }
 
@@ -1267,16 +1364,7 @@ pub fn run_uart_owner_blocking(
 async fn core1_uart_owner_task(
     app_context: AppContext,
     motion_consumer: crate::motion::CommandConsumer,
-    uart_periph: esp_hal::peripherals::UART1<'static>,
-    uhci_periph: esp_hal::peripherals::UHCI0<'static>,
-    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
+    peripheral_bank: crate::peripheral_bank::PeripheralBank,
 ) {
-    crate::uart_owner::run_uart_owner(
-        app_context,
-        motion_consumer,
-        uart_periph,
-        uhci_periph,
-        dma_channel,
-    )
-    .await;
+    crate::uart_owner::run_uart_owner(app_context, motion_consumer, peripheral_bank).await;
 }

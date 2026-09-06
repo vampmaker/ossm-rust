@@ -10,7 +10,7 @@ use embassy_time::{Duration, Timer};
 use crate::motion::{
     CommandProducer, MotionCommand, MotorControllerConfig, StateResponse, COMMAND_QUEUE_SIZE,
 };
-use crate::storage::{NetworkConfiguration, PinConfiguration, StorageManager};
+use crate::storage::{NetworkConfiguration, PinConfiguration, ShellConfig, StorageManager};
 use heapless::spsc::Queue;
 
 pub type SnapshotRef = Arc<StateResponse>;
@@ -23,16 +23,14 @@ pub type SnapshotHandle = &'static SnapshotStore;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StorageCaches {
-    pin: PinConfiguration,
-    net: NetworkConfiguration,
+    shell: ShellConfig,
     motor: MotorControllerConfig,
 }
 
 pub type StorageCacheStore = BlockingMutex<CriticalSectionRawMutex, RefCell<StorageCaches>>;
 
 pub(crate) enum StoragePersist {
-    Pin(PinConfiguration),
-    Net(NetworkConfiguration),
+    Shell(ShellConfig),
     Motor(MotorControllerConfig),
 }
 
@@ -99,16 +97,44 @@ impl AppContext {
         if config.version == 0 || config.version == current_version {
             config.version = current_version.wrapping_add(1);
         }
-        if self
-            .enqueue_motion(MotionCommand::SetConfig(config.clone()))
-            .await
-        {
+        if self.enqueue_motion(MotionCommand::SetConfig(config)).await {
+            return Ok(config);
+        }
+        for _ in 0..50 {
+            Timer::after(Duration::from_millis(5)).await;
+            if self.enqueue_motion(MotionCommand::SetConfig(config)).await {
+                return Ok(config);
+            }
+        }
+        Err("Command queue full")
+    }
+
+    /// Pause without cloning a full config RMW. Causal version still bumps.
+    pub async fn try_enqueue_paused(
+        &self,
+        paused: bool,
+        position: Option<f32>,
+    ) -> core::result::Result<MotorControllerConfig, &'static str> {
+        let mut config = self.load_snapshot().config;
+        config.paused = paused;
+        if let Some(p) = position {
+            config.paused_position = p;
+        }
+        config.version = config.version.wrapping_add(1);
+        let cmd = MotionCommand::SetPaused {
+            paused: config.paused,
+            position: Some(config.paused_position),
+        };
+        if self.enqueue_motion(cmd).await {
             return Ok(config);
         }
         for _ in 0..50 {
             Timer::after(Duration::from_millis(5)).await;
             if self
-                .enqueue_motion(MotionCommand::SetConfig(config.clone()))
+                .enqueue_motion(MotionCommand::SetPaused {
+                    paused: config.paused,
+                    position: Some(config.paused_position),
+                })
                 .await
             {
                 return Ok(config);
@@ -119,40 +145,48 @@ impl AppContext {
 }
 
 impl StorageHandle {
+    pub fn shell(&self) -> ShellConfig {
+        self.caches.lock(|c| c.borrow().shell.clone())
+    }
+
     pub fn pin(&self) -> PinConfiguration {
-        self.caches.lock(|c| c.borrow().pin.clone())
+        self.shell().pin_slice()
     }
 
     pub fn net(&self) -> NetworkConfiguration {
-        self.caches.lock(|c| c.borrow().net.clone())
+        self.shell().net_slice()
     }
 
     pub fn motor_config(&self) -> MotorControllerConfig {
-        self.caches.lock(|c| c.borrow().motor.clone())
+        self.caches.lock(|c| c.borrow().motor)
     }
 
-    pub fn set_pin(&self, config: PinConfiguration) {
+    pub fn set_shell(&self, config: ShellConfig) {
         let mut config = config;
         config.normalize_operating_mode();
-        let old = self.caches.lock(|c| c.borrow().pin.clone());
+        let old = self.caches.lock(|c| c.borrow().shell.clone());
         let restart = old.uart_needs_restart(&config);
-        self.caches.lock(|c| c.borrow_mut().pin = config.clone());
-        let _ = self.cmd.try_send(StoragePersist::Pin(config));
+        self.caches.lock(|c| c.borrow_mut().shell = config.clone());
+        let _ = self.cmd.try_send(StoragePersist::Shell(config));
         if restart {
             crate::uart_owner::request_restart();
         }
     }
 
+    pub fn set_pin(&self, config: PinConfiguration) {
+        let mut shell = self.shell();
+        shell.apply_pin(config);
+        self.set_shell(shell);
+    }
+
     pub fn set_net(&self, config: NetworkConfiguration) {
-        self.caches.lock(|c| {
-            let caches = &mut *c.borrow_mut();
-            caches.net = config.clone();
-        });
-        let _ = self.cmd.try_send(StoragePersist::Net(config));
+        let mut shell = self.shell();
+        shell.apply_net(config);
+        self.set_shell(shell);
     }
 
     pub fn set_motor_config(&self, config: MotorControllerConfig) {
-        self.caches.lock(|c| c.borrow_mut().motor = config.clone());
+        self.caches.lock(|c| c.borrow_mut().motor = config);
         let _ = self.cmd.try_send(StoragePersist::Motor(config));
     }
 
@@ -186,9 +220,8 @@ pub fn init_app_context(flash: esp_hal::peripherals::FLASH<'static>) -> AppConte
     static STORAGE_CMD: static_cell::StaticCell<StorageCmdChannel> = static_cell::StaticCell::new();
 
     let mut storage_manager = StorageManager::new(flash);
-    let pin = storage_manager.get_pin_configuration().unwrap_or_default();
-    let net = storage_manager
-        .get_network_configuration()
+    let shell = storage_manager
+        .get_shell_configuration()
         .unwrap_or_default();
     let motor = storage_manager
         .get_motor_config()
@@ -203,8 +236,7 @@ pub fn init_app_context(flash: esp_hal::peripherals::FLASH<'static>) -> AppConte
     let motion_cmd = CMD_PRODUCER.init(Mutex::new(producer));
 
     let caches = CACHES.init(BlockingMutex::new(RefCell::new(StorageCaches {
-        pin,
-        net,
+        shell,
         motor,
     })));
     let storage_cmd = STORAGE_CMD.init(Channel::new());
@@ -231,14 +263,9 @@ pub fn init_app_context(flash: esp_hal::peripherals::FLASH<'static>) -> AppConte
 pub async fn storage_task(mut manager: StorageManager, cmd: &'static StorageCmdChannel) {
     loop {
         match cmd.receive().await {
-            StoragePersist::Pin(config) => {
-                if let Err(e) = manager.set_pin_configuration(&config) {
-                    log::error!("Failed to persist pin config: {}", e);
-                }
-            }
-            StoragePersist::Net(config) => {
-                if let Err(e) = manager.set_network_configuration(&config) {
-                    log::error!("Failed to persist network config: {}", e);
+            StoragePersist::Shell(config) => {
+                if let Err(e) = manager.set_shell_configuration(&config) {
+                    log::error!("Failed to persist shell config: {}", e);
                 }
             }
             StoragePersist::Motor(config) => {

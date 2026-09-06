@@ -1,0 +1,28 @@
+{
+  "app": {
+    "title": "OSSM 桌面版"
+  },
+  "details": {
+    "title": "主机与遥测",
+    "subtitle": "实时电机遥测与已解析的 ossm-std 启动设置（只读）。",
+    "motorConfig": "当前电机配置",
+    "runtimeConfig": "进程运行时设置",
+    "mode": "模式",
+    "mock": "模拟",
+    "transport": "传输",
+    "serial": "串口",
+    "baud": "波特率",
+    "slaveId": "从站 ID",
+    "bind": "HTTP 绑定",
+    "modbusBind": "Modbus TCP 绑定",
+    "relayTcp": "中继 TCP",
+    "relayWs": "中继 WebSocket",
+    "rs485Ws": "RS-485 WebSocket",
+    "configPath": "配置文件",
+    "staticDir": "静态目录",
+    "repl": "REPL",
+    "noRepl": "禁用 REPL",
+    "loading": "正在加载运行时设置…",
+    "readOnlyHint": "串口、绑定和中继设置为 CLI/环境变量启动项。修改后需重启 ossm-std。"
+  }
+}

@@ -4,6 +4,10 @@
 /Cargo.lock
 /release
 
+web/**/node_modules/
+web/**/dist/
+web/apps/webui-wasm/src/pkg/
+
 repo.key
 repo.key.pub
 servercert.pem
@@ -17,5 +21,7 @@ prvtkey.pem
 assets/wiring_diagram.png
 assets/wiring_diagram_zh.png
 components_*.lock
+.venv/
+.macos-sdk/
 __pycache__/
 screenshots/

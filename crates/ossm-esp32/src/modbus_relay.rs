@@ -96,7 +96,7 @@ pub async fn run_relay(mut master: ModbusRTUMaster<'static>) -> Result<()> {
         match embassy_futures::select::select(REQ_CH.receive(), uart_owner::wait_stop()).await {
             embassy_futures::select::Either::First(req) => {
                 let mut resp_buf = [0u8; FRAME_CAP];
-                let result = match master.modbus_request(&req, &mut resp_buf).await {
+                let result = match master.relay_request(&req, &mut resp_buf).await {
                     Ok(len) => {
                         let mut out = HVec::new();
                         if out.extend_from_slice(&resp_buf[..len]).is_ok() {
@@ -114,7 +114,7 @@ pub async fn run_relay(mut master: ModbusRTUMaster<'static>) -> Result<()> {
     }
 
     mark_active(false);
-    while let Ok(_) = REQ_CH.try_receive() {
+    while REQ_CH.try_receive().is_ok() {
         let _ = RESP_CH.try_send(Err(FirmwareError::Modbus("relay inactive")));
     }
     log::info!("Modbus RTU relay stopped");

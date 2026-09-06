@@ -1,660 +1,321 @@
-# OSSM-Rust
+# OSSM-Rust — 用户手册
 
-同一套 57AIM30 运动 Engine 有**两条互不共用控制器的路径**，请只选 **一条**：
+OSSM-Rust 专为基于 **57AIM30** 伺服电机打造的开源往复机（Open Source Sex Machine）提供驱动控制。它提供直观的 Web 操作界面，支持往复频率（速度）、行程深度以及冲程波形调节，并支持自定义运动曲线与动作序列录制。
 
-| | **路径 A — `ossm-std`** | **路径 B — `ossm-esp32`** |
-| --- | --- | --- |
-| **是什么** | Linux 桌面进程。电脑本身就是设备。 | ESP32-C6 / ESP32-S3 固件。WiFi / BLE / USB CLI。 |
-| **硬件** | 电脑 + USB-RS485 适配器（自动 DE/RE）。**无需单片机。** | ESP32 开发板 + TTL MAX3485（DI / RO / DE+RE）。 |
-| **接线** | 适配器 A/B/GND 接电机。24 V 动力 + 5 V 逻辑。 | ESP32 GPIO 接 MAX3485；ESP32 5 V / GND 给电机逻辑。 |
-| **配置** | `--serial` / `--bind` / `--config`（或 `.env`）。HTTP 在 `127.0.0.1:8080`。 | NVS `pin.*` / `net.*`（烧录器、网页或 USB CLI）。 |
-| **界面** | `http://127.0.0.1:8080`（脚本设 `DEVICE_IP=127.0.0.1:8080`） | 设备 WiFi IP 或 `http://ossm.local` |
+系统支持三种运行方案，根据您的实际需求选择其中**一种**即可，无需配置其他方案。
 
-两条路径的电机插头与 24 V 供电相同。
-
-> [!TIP]
-> **电机插头（两条路径通用）**
-> • **前侧 6 针动力：** 绿色 **KF2EDGK-3.81 6P** — 24 V。
-> • **后侧 10 针通信/逻辑：** 白色 **PHB2.0 2×5P** — 5 V + RS-485。切勿把 24 V 接到后侧插座。
-
----
-
-## 路径 A：桌面（`ossm-std`）——无需单片机
-
-### A.1 硬件
-
-| 组件 | 说明 |
-| --- | --- |
-| **Linux 电脑** | 运行 `ossm-std`（stable Rust）。 |
-| **USB-RS485 适配器** | 必须**自动 DE/RE**。不支持 TX 环回、也不支持由主机驱动 DE/RE（ossm-std 不剥离 TX 回显）。常见设备 `/dev/ttyUSB0`。 |
-| **电机** | `57AIM30`（不要 `57AIM30H`）。 |
-| **24 V 直流电源** | 前侧端子，驱动轴。 |
-| **5 V USB 充电器** | 后侧逻辑 5 V / COM（若适配器 5 V 脚电流足够也可用）。 |
-| **线缆** | DC 5.5×2.1/2.5 mm 母头、**KF2EDGK-3.81 6P**、**PHB2.0 2×5P**。 |
-
-### A.2 接线
-
-<div align="center">
-  <img src="./assets/wiring_diagram_std_zh.svg" alt="ossm-std USB-RS485 接线（无 ESP32）" width="100%"/>
-</div>
-
-| 电机 | --> | 主机侧 |
-| --- | --- | --- |
-| 前侧 **+V** / **GND** | --> | 24 V 适配器正极 / 负极 |
-| 后侧 **10: 5V** / **6: COM** | --> | 5 V 充电器 5 V / GND |
-| 后侧 **2: 485A** / **3: 485B** | --> | USB-RS485 **A** / **B** |
-| 后侧 **COM** | --> | USB-RS485 **GND**（信号参考） |
+如果您希望进行二次开发，或需要查阅完整的 HTTP / WebSocket / BLE API，请参阅[开发者指南（Developer Guide）](DEVELOPERS.md)。`/state` 将电机循环遥测（`loop_stats`）与总线链路统计（`link_stats`）分开；`ossm-std` 另提供 `GET /link-stats`。
 
 > [!CAUTION]
-> 通电前核对 24 V 极性。禁止把 24 V 接到后侧 10 针插座。
-
-### A.3 配置
-
-命令行优先于环境变量（`.env` 可用 `DEVICE_PORT`、`DEVICE_BAUD`），再落到默认值。电机 JSON 为 `--config`（默认 `ossm-config.json`）。没有 `pin.*` / `net.*`。
-
-```bash
-# 仅界面、无电机：
-cargo +stable run -p ossm-std -- --mock --bind 127.0.0.1:8080
-
-# USB-RS485（始终回零）：
-cargo +stable run -p ossm-std -- --serial /dev/ttyUSB0 --baud 115200 \
-  --bind 127.0.0.1:8080 --config ossm-config.json
-```
-
-打开 `http://127.0.0.1:8080`。脚本：`DEVICE_IP=127.0.0.1:8080`。
-
-`--mode servo`（默认）作为 RTU 主机。`--mode rtu-relay` 则提供 Modbus TCP `--modbus-bind`（默认 `127.0.0.1:502`）和 `/ws/modbus`，不再占用运动。`--mock` 使用虚拟 `0..100` 行程。
+> 本机运行时推力极大。每次使用前，请务必确保运动行程范围内没有任何人或障碍物，并将电源开关置于触手可及的位置。电机启动时默认处于**暂停**状态，且每次开机都会自动寻找行程极限（回零校准）——请务必等待其完成首次慢速寻边扫描后再开始使用。
 
 ---
 
-## 路径 B：ESP32 固件（`ossm-esp32`）
+## 1. 选择运行方案
 
-### B.1 硬件
+| | **方案 A — 电脑或手机** | **方案 B — ESP32（独立运行）** | **方案 C — 浏览器直连** |
+| --- | --- | --- | --- |
+| **运行载体** | Linux 电脑，或安装了 Termux 的安卓手机 | 与电机直连的 WiFi 开发板 | Chrome / Edge 浏览器标签页 |
+| **额外硬件** | USB-RS485 转换器 | ESP32-C6 或 ESP32-S3 开发板 + MAX3485 模块 | USB-RS485 转换器，或方案 B 中的 ESP32 |
+| **需要电脑在旁？** | 是（电脑或手机本身即运行设备） | 否（配置完成后可完全独立脱机运行） | 是 |
+| **配置难度** | 低：插好线，运行一条命令即可 | 中等：烧录固件，输入 WiFi 配置 | 低：但控制期间浏览器标签页必须保持打开 |
+| **控制方式** | `http://127.0.0.1:8080` | 局域网内的任意手机或电脑浏览器 | 打开控制台的同一浏览器标签页 |
 
-| 组件 | 规格描述 | 选型建议与备注 |
-| --- | --- | --- |
-| **微控制器** | ESP32-C6 或 ESP32-S3 开发板（USB-C） | 很多板有**两个 Type-C 口**：<br>• **USB / Native / JTAG** — USB Serial/JTAG。烧录与固件 CLI（Linux 上多为 `/dev/ttyACM*`）。<br>• **UART / COM** — USB-UART 接到 UART0（C6：GPIO16 TX / GPIO17 RX）。仅控制台日志。不是电机总线，也不能用于网页烧录器。 |
-| **电机** | 57AIM30（不要 `57AIM30H`） | 1500 RPM，0.96 N·m。 |
-| **RS-485 收发器** | MAX3485 TTL 模块 | 接在 ESP32 UART 与电机之间。 |
-| **24 V 直流电源** | 电机动力 | 按负载选择功率。 |
-| **5 V USB 充电器** | 配置完成后给 ESP32 供电 | USB-C。电机逻辑 5 V 来自 ESP32 的 5 V 脚。 |
-| **线缆** | DC 母头、**KF2EDGK-3.81 6P**、**PHB2.0 2×5P**、杜邦线 | 电机插头与路径 A 相同。 |
+**日常使用最推荐方案 B**——它是唯一合上电脑仍能持续正常工作的方案。方案 A 和 C 更适合尝鲜试用，或者不想焊接、不愿折腾固件烧录的场景。
 
-### B.2 接线
+三种方案使用完全相同的电机、电源以及接线插头。
+
+> [!TIP]
+> **电机的两个接口**
+> - **前侧 6 针绿色端子 (KF2EDGK-3.81 6P)** — 24 V 动力电源，驱动电机轴旋转。
+> - **后侧 10 针白色插座 (PHB2.0 2×5P)** — 5 V 逻辑供电与 RS-485 差分数据线对。
+>
+> **千万不要把 24 V 接入后侧插座！** 否则会直接烧毁电机的驱动电路板。
+
+请购买标准版 **`57AIM30`**，**不要**买 `57AIM30H`——带 H 的型号通信协议不同。
+
+---
+
+## 2. 方案 A — 电脑或安卓手机
+
+无需单片机，无需烧录固件。只需一个 USB 转换器即可将电脑或手机直接与电机相连。
+
+### 所需配件
+
+| 配件 | 说明 |
+| --- | --- |
+| Linux 电脑，或安装了 [Termux](https://termux.dev/) 的安卓手机 | Termux 用户请下载 `ossm-std-linux-arm64` 版本 |
+| USB-RS485 转换器 | 必须支持**自动收发切换（自动 DE/RE）**。廉价的“TX 环回（loopback）”适配器或需要主机手动控制方向引脚的模块均无法工作。 |
+| 57AIM30 电机 | 请勿选用带 `H` 的型号 |
+| 24 V 直流电源 | 根据实际机械负载选择合适功率 |
+| 5 V USB 充电器 | 用于给电机后侧的逻辑电路供电 |
+| 线缆配件 | DC 5.5×2.1/2.5 mm 插头/插座、KF2EDGK-3.81 6P、PHB2.0 2×5P |
+
+### 接线指南
 
 <div align="center">
-  <img src="./assets/wiring_diagram_zh.svg" alt="ossm-esp32 ESP32 + MAX3485 接线" width="100%"/>
+  <img src="./assets/wiring_diagram_std_zh.svg" alt="USB-RS485 接线（无 ESP32）" width="100%"/>
 </div>
 
-**电机 24 V（前侧 6 针）**
-
-| 电机引脚 (+V) | --> | 24V 直流电源适配器（正极 `+`） |
+| 电机端 | → | 对接端 |
 | --- | --- | --- |
-| 电机引脚 (GND) | --> | 24V 直流电源适配器（负极 `-`） |
+| 前侧 **+V** / **GND** | → | 24 V 电源 **+** / **−** |
+| 后侧 **10 (5V)** / **6 (COM)** | → | 5 V 充电器 **5 V** / **GND** |
+| 后侧 **2 (485A)** / **3 (485B)** | → | USB-RS485 **A** / **B** |
+| 后侧 **COM** | → | USB-RS485 **GND**（信号地） |
 
-**RS-485 与逻辑（后侧 10 针与 ESP32）**
+> [!CAUTION]
+> 通电前请仔细核对 24 V 正负极性，并务必确认 24 V 仅接入了**前侧**动力端子。
 
-| 电机 (485A) | --> | MAX3485 **A** |
-| --- | --- | --- |
-| 电机 (485B) | --> | MAX3485 **B** |
+### 运行启动
 
-| ESP32 开发板引脚 | --> | 目标硬件引脚 | 功能作用说明 |
-| --- | --- | --- | --- |
-| 5V (或 VBUS / VIN) | --> | 电机引脚 (5V) | 电机逻辑 |
-| GND | --> | 电机引脚 (COM / GND) | 逻辑共地 |
-| 3.3V | --> | MAX3485 VCC | 收发器供电 |
-| GND | --> | MAX3485 GND | 收发器共地 |
-| GPIO 18 (UART **TX**) | --> | MAX3485 **DI** | MCU 发送 |
-| GPIO 19 (UART **RX**) | --> | MAX3485 **RO** | MCU 接收 |
-| GPIO 20 | --> | MAX3485 **DE** 与 **RE**（短接） | 方向控制 |
-
-> [!WARNING]
-> UART **必须交叉**：ESP32 **TX → DI**，ESP32 **RX → RO**。丝印 TXD/RXD 的模块常常 **TXD = RO**、**RXD = DI**——不要把 MCU TX 接到 TXD。
->
-> NVS 默认：`pin.modbus_tx=18`、`pin.modbus_rx=19`、`pin.modbus_de_re=20`。板级不同请改（ESP32-S3 的 19/20 常被 USB D−/D+ 占用）。不会自动探测 GPIO；仅在电机未以 `115200` 响应时扫描波特率 / 从站 ID。
-
-用 **USB / Native / JTAG** 给 ESP32 供电（烧录 / CLI）。**UART / COM** 只是 UART0 控制台。
-
-### 从源码编译（开发者可选）
-
-预编译固件见第三部分（烧录）。自行编译：
-
-固件为 **`esp-hal`** + Embassy + **`esp-rtos`**，`no_std`。快捷命令在 `.cargo/config.toml`：
-
-```
-cargo b-c6 --release    # ESP32-C6
-cargo b-s3 --release    # ESP32-S3
-```
-
-路径 A（`ossm-std`）使用 **stable** Rust：`cargo +stable run -p ossm-std`（见 **A.3**）。
-
-用 [espup](https://github.com/esp-rs/espup) 安装工具链：`espup install --targets esp32c6,esp32s3`（必要时 `source ~/export-esp.sh`）。
+从 **Releases** 页面下载对应系统的二进制文件：`ossm-std-linux-x64`（或 `-arm64`、`-armel`、`-macos-arm64`、`-win-x64.exe`）。
 
 ```bash
-./scripts/release.sh
+chmod +x ossm-std-linux-x64
+
+# 查找转换器对应的串口设备，通常为 /dev/ttyUSB0
+ls /dev/ttyUSB*
+
+./ossm-std-linux-x64 --serial /dev/ttyUSB0
 ```
 
-会构建前端、烧录器与两款固件。芯片特性：`esp32c6` / `esp32s3`。
+随后在浏览器中打开 **http://127.0.0.1:8080**。
 
-## 第三部分：烧录固件（仅 `ossm-esp32`）
+如果手头暂无电机，想先行体验控制界面，可带上 `--mock` 参数启动虚拟模式：`./ossm-std-linux-x64 --mock`。
 
-您无需从源码编译。预编译好的**合并**固件镜像（`ossm-esp32c6.bin` / `ossm-esp32s3.bin`）在仓库 **Releases** 中提供，并附带基于 [Web Serial API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API) 的独立网页烧录器（`flasher.html`）——无需安装命令行工具。
+常用命令行选项：
+
+| 选项 | 作用 |
+| --- | --- |
+| `--serial <device>` | 指定转换器所在的串口设备路径 |
+| `--bind 0.0.0.0:8080` | 允许局域网内其他设备访问控制界面（默认仅限本机访问 `127.0.0.1:8080`） |
+| `--config <file>` | 参数配置文件保存路径（默认为当前目录下的 `ossm-config.json`） |
+| `--mock` | 仅启动 Web 控制界面，不连接真实电机 |
+
+### 在安卓手机上运行 (Termux)
+
+从与 Termux **同一应用商店**安装配套的 **Termux:API**（仅 `pkg install termux-api` 不够）。随后执行：
+
+```bash
+pkg install termux-api
+termux-usb -l                                   # 列出连接的 USB 设备，例如 /dev/bus/usb/001/002
+./ossm-std-linux-arm64 --serial termux-usb:/dev/bus/usb/001/002 --bind 0.0.0.0:8080
+# 烧录合并固件（USB-Serial-JTAG），以及 USB 串口 CLI：
+./ossm-std-linux-arm64 --mode flash --serial termux-usb:/dev/bus/usb/001/002 --image ossm-esp32c6.bin
+./ossm-std-linux-arm64 --mode console --serial termux-usb:/dev/bus/usb/001/002 --send 'get shell'
+./ossm-std-linux-arm64 --mode console --serial termux-usb:/dev/bus/usb/001/002 --exit-rs485
+```
+
+`termux-usb:` 前缀才会走 `termux-usb` 权限再执行（需在手机上点允许）。裸 `/dev/bus/usb/…` 按 usbfs 直接打开，不会再 exec。USB-Serial-JTAG 不是自动 DE/RE 的 USB-RS485：对该芯片用 `--mode flash` / `--mode console` / `--exit-rs485`；电机 `--serial` 需要带自动方向控制的适配器。绑定到 `0.0.0.0` 后，同一局域网下的笔记本电脑可直接打开界面。电脑侧可运行 `./scripts/test_termux.py`（SSH Host `termux`）。
+
+---
+
+## 3. 方案 B — ESP32（独立脱机，支持 WiFi 与蓝牙）
+
+开发板内置固件并接入您的 WiFi 网络。配置完成后无需电脑常驻，局域网内的任意手机或电脑均可直接打开网页进行控制。
+
+### 所需配件
+
+| 配件 | 说明 |
+| --- | --- |
+| ESP32-C6 或 ESP32-S3 开发板（带 USB-C 接口） | 很多开发板配有**两个** Type-C 口——请务必阅读下方说明 |
+| MAX3485 TTL 模块 | 将单片机串口信号转换为 RS-485 差分电平 |
+| 57AIM30 电机 | 请勿选用带 `H` 的型号 |
+| 24 V 直流电源 | 电机动力供电 |
+| 5 V USB 充电器 | 设备配置完成后为 ESP32 供电 |
+| 线缆配件 | DC 电源插头/母头、KF2EDGK-3.81 6P、PHB2.0 2×5P、杜邦线 |
 
 > [!IMPORTANT]
-> **请使用 USB / Native / JTAG 口烧录！**
-> 若开发板有**两个** Type-C 口，请把烧录器插在 **USB / Native / JTAG**，不要插 **UART / COM**。原生 USB 直连芯片（Chrome / Edge，通常不必额外 USB–UART 驱动）。UART/COM 只是 UART0 控制台。
+> **该插哪个 USB 口？** 如果您的开发板有两个 Type-C 接口，通常一个标有 **USB / Native / JTAG**，另一个标有 **UART / COM**。
+> 本手册中的所有操作（固件烧录、网页配置、命令行调试）**必须使用 USB / Native / JTAG 接口**。UART / COM 接口仅用于查看底层启动日志，无法用于浏览器免驱动烧录。
 
-### 烧录器界面一览
+### 接线指南
 
-`flasher.html` 为单页布局：
+<div align="center">
+  <img src="./assets/wiring_diagram_zh.svg" alt="ESP32 与 MAX3485 接线图" width="100%"/>
+</div>
 
-| 区域 | 作用 |
-| --- | --- |
-| **状态栏**（顶部） | 连接状态，以及 **Connect**、**Monitor**、**Stop**、**Reset**、**Disconnect** |
-| **Flash Firmware**（左侧） | 拖入 / 选择 `.bin`、可选烧录地址（默认 `0x0`）、**Flash Firmware** |
-| **Device Configuration**（右侧） | WiFi、Modbus GPIO、Modbus 时序、BLE，然后 **Send Configuration** |
-| **Console**（左下） | 烧录器进度与 CLI ACK 日志 |
-| **Serial**（右下） | 设备 UART 实时输出（启动日志、WiFi IP、电机提示） |
+**电机动力供电（前侧 6 针端子）**
 
-表单内容会保存在浏览器本地（`localStorage` 键 `ossm-flasher-device-config-v1`），下次打开可复用。**Reset to defaults** 可将表单恢复为默认引脚 / 时序。
+| 电机端 | → | 24 V 电源 |
+| --- | --- | --- |
+| **+V** | → | **+** 正极 |
+| **GND** | → | **−** 负极 |
 
-语言：嵌入式控制界面、`flasher.html` 与 `motor-control.html` 均支持 **English** / **中文**（页头切换）。偏好保存在 `localStorage` 键 `ossm_locale`（`en` | `zh`）。未设置时按浏览器语言（`zh*` → 中文，否则英文）。
+**数据通信与逻辑供电（后侧 10 针插座、MAX3485、ESP32）**
 
-### 烧录步骤
+| 连接起点 | → | 连接目标 | 说明 |
+| --- | --- | --- | --- |
+| 电机 **485A** | → | MAX3485 **A** | 差分数据线对 |
+| 电机 **485B** | → | MAX3485 **B** | 差分数据线对 |
+| ESP32 **5V**（或 VBUS / VIN） | → | 电机 **5V** | 为电机逻辑电路供电 |
+| ESP32 **GND** | → | 电机 **COM / GND** | 信号共地 |
+| ESP32 **3.3V** | → | MAX3485 **VCC** | 模块供电 |
+| ESP32 **GND** | → | MAX3485 **GND** | 模块共地 |
+| ESP32 **GPIO 18** | → | MAX3485 **DI** | 单片机发送 (TX) |
+| ESP32 **GPIO 19** | → | MAX3485 **RO** | 单片机接收 (RX) |
+| ESP32 **GPIO 20** | → | MAX3485 **DE** 与 **RE**（将两引脚短接） | 收发方向控制 |
 
-1.  从 **Releases** 下载并解压最新发布包（`.zip`）。
-2.  用 USB-C **数据线**将 ESP32-C6 或 ESP32-S3 接到电脑的 **Native USB / JTAG** 口。
-3.  用 **Google Chrome** 或 **Microsoft Edge** 打开 `flasher.html`（需 Web Serial；桌面浏览器；Safari / Firefox 及多数移动浏览器不支持）。可直接双击文件或拖入标签页，无需本地 Web 服务。
-4.  点击状态栏 **Connect**，在浏览器弹窗中选择 ESP32 串口。
-    > [!TIP]
-    > **如何确认是哪一个串口？**
-    > 若列表有多个端口，可用插拔法：记下列表 → 取消 → **拔掉** ESP32 → 再点 **Connect** 看哪一项消失 → 插回 → **Connect** 并选择重新出现的端口。
-5.  在 **Flash Firmware** 区域拖入（或浏览选择）对应芯片的合并镜像：
-    - ESP32-C6 → `ossm-esp32c6.bin`
-    - ESP32-S3 → `ossm-esp32s3.bin`
-    **Flash address** 保持 `0x0`（除非您明确需要其他偏移；发布包中的合并镜像从 `0x0` 写入）。
-6.  点击 **Flash Firmware**。关注进度条与 **Console** 面板（`Flash complete` / 设备复位）。
-7.  烧录结束后工具会硬复位芯片，状态变为 **Flash complete**。通常**无需**再点 Connect —— USB 端口仍保持占用，可直接配置。
+> [!WARNING]
+> 串口信号是**交叉相连**的：开发板的 TX 连接模块的 **DI**，RX 连接模块的 **RO**。
+> 某些模块丝印标注为 TXD 和 RXD，且往往其实是 **TXD = RO**、**RXD = DI**。千万不要将开发板的 TX 直接连接到标有 TXD 的引脚上。
 
-> [!NOTE]
-> **Connect** 会进入 ROM 引导下载模式（烧录所需）。烧录成功后工具会离开 bootloader，以便在同一页面配置并监视正在运行的固件。
+GPIO 18 / 19 / 20 为出厂默认引脚。如果您的开发板将这些引脚挪作他用（例如在不少 ESP32-S3 开发板上，GPIO 19 和 20 被内置 USB 数据线占用），请换用其他空闲 GPIO，并在下一步的配置界面中填入实际使用的引脚号。
 
-## 第四部分：网络与设备配置
+### 烧录固件
 
-烧录完成后请继续留在同一 `flasher.html` 页面。填写右侧 **Device Configuration**，然后点击 **Send Configuration**。
+无需安装任何本地编译工具链或命令行程序，发布包中已内置基于浏览器的免安装网页烧录器。
 
-### 配置项
+1. 前往 **Releases** 页面下载并解压最新的发布包 `.zip`。
+2. 使用带有**数据传输**功能的 USB-C 线缆，将开发板连接到电脑的 **USB / Native / JTAG** 接口。
+3. 使用 **Chrome** 或 **Edge** 桌面浏览器打开解压出来的 `flasher.html`（直接双击文件打开即可；Safari 和 Firefox 不支持 Web Serial 硬件通信）。
+4. 点击界面上的 **Connect** 按钮，在弹出的浏览器设备列表中选择您的开发板端口。
+   > 如果列表中出现了多个端口，可先拔下开发板，重新点击 **Connect** 查看哪个端口消失了；再插回开发板，选择重新出现的那个端口即可。
+5. 在 **Flash Firmware** 区域，选择或拖入对应您芯片型号的固件镜像——`ossm-esp32c6.bin` 或 `ossm-esp32s3.bin`。烧录地址（Address）保持 `0x0` 即可。
+6. 点击 **Flash Firmware** 开始烧录，等待 Console 面板输出 **Flash complete** 提示。
+
+烧录完成后，开发板会自动复位并保持与网页的连接状态，您可以直接进入下一步的配置环节。
+
+### 配置设备参数
+
+继续停留在当前 `flasher.html` 页面。在右侧的 **Device Configuration**（设备配置）面板中填写各项参数：
 
 | 分组 | 填写内容 |
 | --- | --- |
-| **WiFi** | 开关 **Enable WiFi**；开启时填写 SSID 与密码。若仅用 BLE / USB，可关闭 WiFi。 |
-| **GPIO Pins** | Modbus **TX**（UART TX → MAX3485 DI）、**RX**（UART RX → RO）、**DE/RE**（默认 `18` / `19` / `20`）。接线不同时请改（尤其 ESP32-S3 上 19/20 可能被 USB 占用）。 |
-| **Motor / Modbus** | 可选时序：读超时 (ms)、字节间超时 (µs)、帧间静默 (µs)、扫描延迟 (µs)。填 `0` 使用固件自动默认值（115200 下：**10 ms** 帧超时、**750 µs** 字节间、**350 µs** 帧间）。界面中波特率 `115200` 与设备 ID `1` 为固定显示。 |
-| **BLE** | **Enable Bluetooth Low Energy (BLE)** — 默认开启，不需要时可关闭。 |
+| **WiFi** | 勾选 **Enable WiFi**，并填入您的 WiFi 名称（SSID）和密码。如果只打算通过蓝牙或 USB 控制，可以保持关闭。 |
+| **GPIO Pins** | TX、RX 和 DE/RE 引脚编号——若未更改接线，保持默认的 `18`、`19`、`20` 即可。 |
+| **Motor / Modbus** | 各项时序参数保持 `0` 即可。这些参数仅在排查特殊硬件兼容性问题时才会用到。 |
+| **BLE** | 保持蓝牙开启即可（除非您有特殊需求想关闭）。 |
 
-### 发送配置
+填写完毕后，点击 **Send Configuration**。工具会自动重启开发板并写入配置，随后自动切换到 **Serial** 监视面板。请留意串口日志中的 WiFi 连接信息，并**记下日志打印出的 IP 地址**。
 
-1.  保持 USB 连接。状态应为 **Flash complete**、**Connected to …** 或 **Configuration complete**（这些状态才会启用 **Send Configuration**）。若曾点过 **Disconnect**，请先再点 **Connect**。
-2.  点击 **Send Configuration**。烧录器会复位设备、等待启动，再依次发送串口 CLI（`set net.*`、`set pin.*`，最后 `reset`），并在 **Console** 中等待每条 ACK。
-3.  配置成功后会自动进入 **Serial** 监视。请留意 WiFi 连接成功日志以及类似 `http://<hostname>.local` 或分配到的 IP。**请记下该 IP**（若本机 mDNS 可用也可访问 `http://ossm.local`），随后用浏览器打开控制面板。
-4.  **Stop** 可暂停监视，**Monitor** 可再次附着，**Reset** 仅复位芯片而不发送配置，**Disconnect** 释放 Web Serial 端口。
+浏览器会自动记住您填写的配置，下次烧录新板子时无需重新输入。点击 **Reset to defaults** 可将表单还原为初始默认值。
 
-若配置失败（等待 ACK 超时），请查看 **Console** / **Serial**，确认使用的是 Native USB 口，必要时重新 **Connect** 后再试 **Send Configuration**。
+如果提示配置超时，请确认是否插在 Native USB 接口上，重新点击 **Connect** 并再次尝试 **Send Configuration**。
 
-**关于电机初始化**：每次开机固件都会经 Modbus 联系伺服。若电机在 `115200` 无响应，会扫描其他波特率 / 从站 ID。若在其他速率找到电机，会将其改写为 `115200`，并在串口日志中提示您对电机 **24V** 电源断电约 3 秒后再上电。
+### 打开控制界面
 
-## 第五部分：设备使用
+在浏览器中输入串口日志中记录的 IP 地址（例如 `http://192.168.1.123`）；若您的局域网路由器支持 mDNS 解析，也可以尝试访问 `http://ossm.local`。
 
-当设备成功连入您的局域网后，您便可通过自带的嵌入式 Web 交互控制面板、自动化控制脚本或丰富的网络 API 对其进行全方位的实时控制；同时，USB 串口命令行依然保留了完整的系统控制与诊断能力。
+> [!NOTE]
+> **接好电机后的首次通电：** 每次开机时，开发板都会主动与伺服电机通信并执行行程极限寻边（回零校准）。如果电机没有响应，固件会自动轮询扫描其他通信波特率。如果在其他波特率下发现了电机，固件会自动纠正电机的通信参数，并在串口日志中提示您将电机的 **24 V** 动力供电断开约 3 秒后再重新接通。
 
-### 嵌入式 Web 交互界面
+---
 
-固件内部集成并托管了一个精美直观的 Web 操作面板。请确保您的电脑、手机或平板电脑与 ESP32 连入同一个局域网，打开浏览器并在地址栏中输入您在第四部分记下的 ESP32 IP 地址。
+## 4. 方案 C — 浏览器直连
 
-访问示例：`http://192.168.1.123`
+全部控制逻辑都在单个浏览器标签页内运行，硬件可搭配 USB-RS485 转换器，或使用方案 B 中接好的 ESP32。
 
-在该控制面板中，您可以自由调整往复速度（BPM）、行程深度、顶/底锚定方向，利用可视化编辑器绘制复杂的样条曲线波形（Spline Wave），编排时间轴控制宏，以及在线修改软硬件设置并实现系统平滑重启。
+如果使用 ESP32，请先在其设置页面将 **Operating mode（运行模式）** 切换为 `rs485`。这会将电机控制权直接移交给浏览器，设置立即生效；若切换回 `servo` 则会恢复由 ESP32 自行控制。
 
-核心界面与连接特性包含：
-- **实时电机行程图表（可切换并持久化）**：可视化展现全行程区间（`0% – 100%`）、物理极限位置（`pos_min` / `pos_max`）、当前运动区间（左右极限点标记），以及以 30 FPS 实时展示电机运动位置的动画组件。顶部活动图标可一键切换显示/隐藏，并在浏览器中自动记忆切换状态。
-- **高韧性实时数据遥测 (`WsDataManager`)**：前端采用单所有者 WebSocket 专职通信管理器 (`client.ts`)，在行程图或设置面板打开时以高达 **30 FPS (`33ms`)** 速率经 WiFi WebSocket（`/ws/command`）实时推送状态数据与底层控制循环统计指标 (`ups`、`dt_min_ms`、`dt_max_ms`、`dt_avg_ms`、`dt_mdev_ms`)。面板关闭时，UI 会回退为 **1 Hz** 的 REST `/state` 轮询以节省 WebSocket 会话槽位。BLE 实时遥测走独立路径（`ble.ts` / GATT `CHAR_STATE` 通知），不经过该 WebSocket 管理器。固件端采用**收发分离异步任务架构** (`edge_nal::TcpSplit`) 结合堆分配字符串与 **4 缓冲区共享缓冲池 (`NET_BUFFER_POOL`)**，即使在高并发 HTTP REST 请求与持续 WebSocket 遥测并存时也不会发生缓冲区阻塞或掉线。
-- **因果配置版本号**：每次电机配置变更都会递增单调的 `version` 字段。UI 跟踪 `authoritativeVersion`，并忽略过期的后台快照，避免滑块编辑在并发 `/state` 推送下被回滚。
-- **交互式运动控制、样条编辑器与宏播放器**：调整 BPM（速度）、行程深度、顶/底锚定、行程反转、暂停/恢复模式，用交互式样条控制点设计自定义周期轨迹，或编排带导入/导出、间隙定位与循环播放的**控制宏**（波形按钮 **宏**）。**Funscript** 模式同样由客户端按时间轴驱动。
+发布包中的 `ossm-wasm.html` **必须通过本地 Web 服务打开**，直接双击文件（`file://` 协议）将无法加载运行：
 
-### 串口命令与调试
-
-### 串口命令
-
-也可通过 USB 串口（`115200` 波特，`\r\n`）控制设备。在 `flasher.html` 中请使用 **Serial** 面板（或 **Monitor**）进行交互式 CLI；**Console** 仅显示烧录 / 配置工具自身的日志。同一套命令也适用于任意串口终端。
-
-固件 `console` 任务独占 USB Serial/JTAG 与 UART0。日志输出（`log::*` / `MODBUS_DBG`）与 CLI 回显/应答共用物理链路，但走**独立路径**：优先 **`CLI_OUT_CH`** 队列与 CLI 专用 USB TX 环形缓冲。USB TX 采用 **先提交再等待**（已写入 64 字节 IN FIFO 的包不会被重写）。无 ACM 读端时进入 **Stalled** 并丢弃日志，而不是向满的端点继续塞数据；CLI ACK 走优先队列。TX 进行中仍武装 RX，晚打开串口仍能收命令。非调试模式下电机 `ups` 在 ESP32-C6 上仍约 **320 Hz**；`modbus_debug` 会增加 USB 日志量，但 homing 稳定后 `ups` 通常仅比非调试低几个百分点。
-
-配置采用类似 nmcli 的 **`get`** / **`set`** 点分路径。设备上输入 **`paths`**（或 `help get` / `help set`）查看完整目录。
-
-```
-get <path>                     - 获取配置节 JSON 或标量值
-set <path> <value>             - 设置配置（含空格的字符串请加引号）
-paths                          - 在设备上打印完整路径/取值目录
-
-# 配置节（完整 JSON）
-get pin | get net | get motor
-
-# 示例
-set net.ssid "MyNetwork"
-set net.password secret
-set net.wifi_enabled true
-set pin.modbus_tx 2
-set pin.modbus_debug false
-set motor.paused true
-set motor {"bpm":36,"depth":1.0,"wave_func":"sine","paused":true}
-
-# 配置路径目录
-pin.modbus_tx / modbus_rx / modbus_de_re          GPIO 0..48
-pin.modbus_timeout_ms                             0..1000（0 = 默认约 10 ms）
-pin.modbus_rx_timeout_us                          0..200000（0 = 自动）
-pin.modbus_scan_delay_us                          0..200000（0 = t3.5）
-pin.modbus_inter_frame_delay_us                   0..200000（0 = 自动）
-pin.ble_enabled / pin.modbus_debug                true|false（debug 需重启）
-pin.operating_mode                                servo|rtu_relay|rs485
-pin.modbus_baud                                   1200..3000000（默认 115200）
-net.wifi_enabled / net.dhcp_enabled               true|false
-net.ssid / net.password / net.hostname          字符串
-net.static_ip / static_mask / static_gateway / static_dns   IPv4
-motor.bpm                                         > 0
-motor.depth                                       0.01..1
-motor.depth_top / reversed / paused / streaming   true|false
-motor.wave_func                                   sine|thrust|spline
-motor.sharpness                                   0.01..0.99
-motor.paused_position                             0..1
-motor.spline_points                               空格分隔浮点数
-motor（批量）                                      完整 MotorControllerConfig JSON
-inject                                            get inject | set inject <off|leading|trailing|both> <nbytes 0..64>
-
-# 动作命令（非配置）
-reset                          - 软重启
-get-state / get-status         - 遥测 JSON
-reset-timestamp                - 重置运动流时间
-set-waypoints <json>           - 替换航点缓冲
-append-waypoints <json>        - 追加航点
-```
-
-设置成功时 CLI 输出 `{path} set to {value}`（如 `pin.modbus_tx set to 2`），同时写入日志。标量读取为 `{path}: {value}`。
-
-### 自动化设备测试（开发者）
-
-`scripts/` 下的实机脚本（使用 `uv run` 执行）；在 `.env` 中配置 `DEVICE_IP`：
-
-| 脚本 | 用途 |
-| --- | --- |
-| `./scripts/test_console.py` | USB CLI 晚接入、电机 `ups`（ACM 开/关）、probe-rs RTT、`MODBUS_DBG` 洪泛下 CLI |
-| `./scripts/test_modbus_debug_device.py` | 经 **probe-rs RTT** 验证 Modbus CRC 重同步 / 注入（避免 USB ACM 写阻塞） |
-| `./scripts/test_modbus_resync.py` | 纯主机 CRC/重同步镜像测试（无需硬件） |
-| `./scripts/test_rs485_transceiver.py` | 在线切换 `operating_mode=rs485`（无需重启）；经 ossm-std 测 USB 与 `/ws/rs485` |
-| `./scripts/stress_dt_max.py` | HTTP+WebSocket 负载；断言 `dt_max_ms` < 4.5 ms |
-
-### 多模 CLI 控制工具 (`ossm.py`)
-
-本仓库在 `scripts/` 目录下提供了一个功能强大的统一命令行工具 `ossm.py`。该脚本采用标准的 PEP 723 自包含格式声明，借助 [`uv`](https://docs.astral.sh/uv/) 包管理器，您无需繁琐地创建和配置 Python 虚拟环境即可直接运行。
-
-该工具支持通过三种基础通信模式与 OSSM 硬件交互：**WiFi**（HTTP REST API & WebSocket JSON-RPC 2.0）、**低功耗蓝牙 (BLE)**（`ble`）以及 **USB 串口**（`serial`）。
-
-**环境准备：** 确保您的系统已安装 [uv](https://docs.astral.sh/uv/)（安装命令：`curl -LsSf https://astral.sh/uv/install.sh | sh`）。
-
-**基本语法与常用操作示例：**
 ```bash
-# 查看所有可用命令、模式及参数描述
-./scripts/ossm.py --help
-
-# 通过 WiFi 查询设备实时状态与参数（默认采用 WiFi 模式，默认 IP 为 192.168.24.63，也可通过 -i 参数指定）
-./scripts/ossm.py status -i 192.168.1.123
-
-# 通过蓝牙 BLE 模式获取状态（系统会自动扫描并连接周边广播的 OSSM 蓝牙设备）
-./scripts/ossm.py status -m ble
-
-# 在 WiFi 模式下，设置电机以 40 BPM 速度、80% 行程深度运行样条波形
-./scripts/ossm.py run --bpm 40 --depth 0.8 --wave spline -m wifi
-
-# 通过蓝牙 BLE 立即暂停电机，或使其安全停靠在行程最底层（0.0 位置）
-./scripts/ossm.py pause --pos 0.0 -m ble
-./scripts/ossm.py resume -m ble
-
-# 切换至串口模式，查看或重新配置 RS-485 Modbus 引脚映射及蓝牙使能开关
-./scripts/ossm.py pins -m serial -p /dev/ttyACM0
-
-# 在 WiFi 模式下，查看或修改网络参数与 mDNS 主机名
-./scripts/ossm.py net -m wifi
-
-# 启动终端交互式面板（TUI Dashboard），实时监控电机坐标与速度数据流
-./scripts/ossm.py monitor -m ble
-
-# 写入示例控制宏 JSON，然后播放
-./scripts/ossm.py macro --init /tmp/warmup.json
-./scripts/ossm.py macro /tmp/warmup.json --loop --speed 1.0 -m wifi
+cd <ossm-wasm.html 所在目录>
+python3 -m http.server 8000
+# 随后在浏览器中打开 http://localhost:8000/ossm-wasm.html
 ```
 
-当作为 Python 第三方库在代码中导入时，`ossm.py` 还导出了经过 Pydantic v2 严格校验的数据模型（如 `MotorControllerConfig`、`StateResponse`、`PinConfiguration`、`NetworkConfiguration` 等）和 `DeviceBackend` 核心类，极大地简化了开发者编写自动化测试用例或高级集成应用的代码工作。
+仅支持桌面端的 Chrome 或 Edge 浏览器。USB-RS485 转换器同样必须具备自动收发方向切换功能。一旦关闭该网页标签页，电机将立即停止运行。
 
-### 高级控制：样条曲线波形 (Spline Wave)
+---
 
-`spline`（样条曲线）是一种极其强大的高级波形功能，专门用于构建完全自定义的运动轨迹。通过它，您不再被局限于传统的 `sine`（正弦波）或 `thrust`（推力波）等预设模式，而是可以自由定义一组坐标点系列，电机将沿着由这些点生成的平滑曲线精准运动。
+## 5. 控制面板操作说明
 
-这一特性为您赋予了极高的创作自由度，能够设计出复杂多变的律动节奏。固件底层采用了 Catmull-Rom 样条插值算法，可将您输入的离散控制点拟合成一条顺滑、连续、无阶跃冲突的完美曲线，且轨迹能够绝对精确地穿过您所定义的每一个端点。
+三种方案所呈现的 Web 控制界面基本一致（方案 A 和 C 仅隐藏了不适用的 WiFi 和硬件引脚配置页面）。
 
-**如何使用：**
+**核心运动控制**
 
-1.  **设定控制点：** 输入 `set-spline-points` 命令，后跟一组用空格分隔的浮点数（范围为 `0.0` 到 `1.0`，其中 `0.0` 代表完全收缩底端，`1.0` 代表完全伸展顶端）。
-2.  **激活波形：** 输入 `set-wave spline` 命令，切换控制器至自定义样条波形模式。
+- **频率 (BPM)** — 每分钟往复冲程次数（速度）。
+- **行程深度 (Depth)** — 电机运动行程占总有效行程的比例，可从微幅冲程一直调节至全行程。
+- **锚定位置 (Anchor)** — 缩短行程时，运动窗口是停留在最底端（回缩端）还是最顶端（伸展端）。
+- **行程反转 (Reverse)** — 镜像反转当前的往复运动方向。
+- **暂停 / 恢复 (Pause / Resume)** — 暂停可使机器立即悬停在当前位置，或回退至预设的停泊点。
 
-**典型轨迹配置示例：**
+**波形形态**
 
-*   **基础往复运动：** 最简的线性平滑往复。
-    `set-spline-points 0 1`
-*   **阶梯式快进慢退：** 极速推出后，分步骤阶梯式缓慢回抽。
-    `set-spline-points 0 0 1 0.8 0.5 0.2`
-*   **三角平滑波：** 匀速渐进上升与下降的匀称曲线。
-    `set-spline-points 0 0.2 0.4 0.6 0.8 1.0 0.8 0.6 0.4 0.2`
-*   **方波驻留模式：** 在底部保持静止，随后瞬间推进并在顶部保持静止。
-    `set-spline-points 0 0 0 0 0 1 1 1 1 1`
-*   **高频震颤模式：** 伴随细微回跳的抖动与震颤节律。
-    `set-spline-points 0 0.2 0.1 0.4 0.3 0.6 0.5`
+| 波形 | 运行体验 |
+| --- | --- |
+| **Sine（正弦波）** | 顺滑平稳，往复加减速均匀 |
+| **Thrust（推力波）** | 快速推进、缓慢回抽。可通过锐度（sharpness）滑块调节推进的爆发感与顿挫感 |
+| **Spline（样条波）** | 自定义曲线，通过拖拽控制点自由绘制个性化轨迹 |
+| **Macro（控制宏）** | 预设的时间轴自动化序列，随时间动态改变各项参数 |
+| **Funscript（互动脚本）** | 播放标准的 `.funscript` 振动/往复同步轨迹文件 |
 
-### HTTP API
+**样条曲线 (Spline)** 允许您在 0（完全回缩）到 1（完全伸展）之间设定若干关键点，电机会沿插值生成的平滑曲线平稳穿过所有关键点。一些常用的参考点位配置：
 
-固件内部提供了丰富的 HTTP RESTful API 接口，方便第三方应用程序进行程序化集成。所有接口均支持跨域资源共享（CORS），因此可以轻松地被部署在不同域名下的 Web App 访问调用。
+| 模式 | 控制点配置 |
+| --- | --- |
+| 基础平滑往复 | `0 1` |
+| 阶梯回抽推力波 | `0 0 1 0.8 0.5 0.2` |
+| 平缓三角波 | `0 0.2 0.4 0.6 0.8 1.0 0.8 0.6 0.4 0.2` |
+| 方波驻留模式 | `0 0 0 0 0 1 1 1 1 1` |
+| 微幅高频震颤 | `0 0.2 0.1 0.4 0.3 0.6 0.5` |
 
-#### `GET /config`
+**控制宏 (Macros)** 是一种按时间轴编排的自动化控制序列——例如前 15 秒慢速热身，随后逐步加速，运行满 1 分钟后自动停止。您可以在“控制宏”面板中直观编排并保存，支持循环播放，亦可导出和导入为 JSON 文件，便于在不同设备间分享。
 
-*   **请求方法：** `GET`
-*   **接口描述：** 获取当前电机的完整控制配置。
-*   **响应结构：** 返回一个包含当前运行配置的 JSON 对象。
+**行程监视示意图**——直观展现电机的全物理有效行程区间、当前冲程活动窗口以及电机当前实时位置标记。点击顶部导航栏中的动态波形图标即可切换显示/隐藏，切换状态会自动保存在本地。
 
-```json
-{
-  "version": 42,
-  "bpm": 60.0,
-  "depth": 1.0,
-  "depth_top": true,
-  "reversed": false,
-  "wave_func": "sine",
-  "sharpness": 0.5,
-  "spline_points": [0.0, 1.0],
-  "paused": true,
-  "paused_position": 0.5,
-  "streaming": false
-}
+**界面语言**——嵌入式网页、烧录器以及电机调试工具均支持在顶栏一键切换“English”与“中文”。
+
+---
+
+## 6. 通过 USB 串口命令控制
+
+任何支持 **115200 波特率** 的串口终端软件均可使用，也可以直接利用 `flasher.html` 内置的 **Serial** 面板。该方式主要用于初次安装配置与故障排查。
+
+配置项采用类似命令行的点分路径进行读写（`get` 与 `set`）。在终端输入 `paths` 可列出设备支持的全部配置路径。
+
+```
+set net.ssid "MyNetwork"        # 配置 WiFi 名称
+set net.password secret         # 配置 WiFi 密码
+set net.wifi_enabled true
+
+set pin.modbus_tx 18            # 修改 GPIO 引脚
+get pin                         # 打印所有硬件引脚与时序配置
+
+set motor.bpm 45
+set motor.depth 0.8
+set motor.wave_func spline
+set motor.spline_points 0 0.5 1
+set motor.paused false
+
+reset                           # 重启开发板
 ```
 
-*   `version`（数字）：配置的单调递增因果时间戳。每次成功写入配置时递增；客户端应拒绝 `version` 回退的过期快照。可省略或传 `0`，由固件分配下一个版本号。
-*   `bpm`（数字）：每分钟往复次数（Beats Per Minute）。直接控制运动周期的快慢。
-*   `depth`（数字）：单次行程深度，范围从 `0.0`（完全静止不过推）至 `1.0`（全行程极限最大深度）。
-*   `depth_top`（布尔值）：设定行程缩放的锚定方向。
-    *   `true`：行程从完全收缩的最底层（`0.0`）起步，向顶端推至指定的 `depth`。例如，深度为 `0.8` 时，运动范围为 `[0.0, 0.8]`。
-    *   `false`：行程从 `1.0 - depth` 起步，向完全伸展的最顶端（`1.0`）推出。例如，深度为 `0.8` 时，运动范围为 `[0.2, 1.0]`。
-*   `reversed`（布尔值）：当设为 `true` 时，反转当前波形的往复方向。
-*   `wave_func`（字符串）：选定的波形算法模式。固件生成器支持 `"sine"`（正弦波）、`"thrust"`（推力波）或 `"spline"`（自定义样条曲线波形）。网页端另有 `"funscript"` 与 `"macro"`（宏）模式：由客户端按时间轴下发 `set-config` / 暂停命令驱动；若把这些标签直接作为 `wave_func` 提交，固件会回退为正弦波。
-*   `sharpness`（数字）：仅针对 `"thrust"` 推力波生效。用于控制冲刺推力的时间锐度，范围从 `0.01`（极速爆发最锐利）至 `0.99`（平顺缓慢最柔和）。
-*   `spline_points`（浮点数数组）：当启用 `"spline"` 波形时，该数组用于定义自定义运动轨迹的归一化控制点坐标系列（范围均在 `0.0` 至 `1.0` 之间）。
-*   `paused`（布尔值）：设为 `true` 时暂停电机运行，设为 `false` 时启动往复循环。
-*   `paused_position`（数字）：指定电机处于暂停状态时安全停靠的归一化绝对坐标位置（范围 `0.0` 至 `1.0`）。
-*   `streaming`（布尔值）：当设为 `true` 时，代表电机当前已开启实时流式控制模式，可通过 WebSocket (`/ws/command`) 接收上位机动态下发的连续轨迹点。
+每次执行 `set` 成功后，设备会回复 `<name> set to <value>`。使用 `get pin`、`get net` 或 `get motor` 可一次性输出对应模块的完整 JSON 配置。
 
-##### 控制宏（网页 UI + `ossm.py macro`）
+桌面版本（方案 A）在运行时，也支持在终端控制台中直接输入相同的 `motor.*` 命令进行控制（方案 A 无 `pin.*` 与 `net.*` 配置）。
 
-**宏**是可分享的 JSON 时间轴控制序列（`start` / `stop` / `set`）。播放完全在客户端完成：网页「波形」中的 **宏** 面板，或 `./scripts/ossm.py macro <file.json>`，在每个 `at`（相对开始的毫秒）到达时下发对应 REST/BLE/串口命令。
+完整的配置字段列表以及 HTTP / 蓝牙 API 详细文档，请参阅[开发者指南（Developer Guide）](DEVELOPERS.md#7-api-reference)。
 
-```json
-{
-  "version": 1,
-  "name": "Warm up",
-  "loop": false,
-  "instructions": [
-    { "at": 0, "action": "set", "params": { "bpm": 40, "depth": 0.6, "wave_func": "sine" } },
-    { "at": 0, "action": "start" },
-    { "at": 15000, "action": "set", "params": { "bpm": 90, "wave_func": "thrust", "sharpness": 0.2 } },
-    { "at": 60000, "action": "stop", "params": { "position": 0.0 } }
-  ]
-}
-```
+---
 
-*   `set` 的 `params` 可含：`bpm`、`depth`、`depth_top`、`reversed`、`wave_func`（`sine`|`thrust`|`spline`）、`sharpness`、`spline_points`。
-*   `stop` 可通过 `params.position`（0.0–1.0）可选停靠。
-*   可在网页导入/导出，或用 `./scripts/ossm.py macro --init example.json` 生成示例文件。
+## 7. 常见问题与排查
 
-#### `POST /config`
+**控制网页能够打开，但机器毫无动作。** 设备启动时默认处于暂停状态——点击界面上的“恢复（Resume）”按钮即可。如果界面上的位置数值始终为 0，说明单片机未能与电机建立通信，请参阅下方排查步骤。
 
-*   **请求方法：** `POST`
-*   **接口描述：** 整体更新电机的控制配置。请注意，请求时务必发送完整的配置对象，目前系统不支持局部字段增量更新。若请求中的 `version` 早于设备当前配置，服务器返回 **409 Conflict**（`Stale causal version`）。
-*   **请求消息体：** 数据结构与 `GET /config` 返回的 JSON 对象保持完全一致。
-*   **响应消息体：** 成功应用后，返回已生效的配置 JSON 对象，包含递增后的 `version`。
+**电机完全无响应 / 开机寻边回零始终无法完成。**
+- 检查 A/B 差分信号线是否接反；检查开发板的 TX 是否连接到了模块的 **DI**、RX 是否连接到了 **RO**（警惕标有 TXD/RXD 的模块可能反标）。
+- 确认电机后侧插座的 COM 端子与转换器或开发板的 GND 之间已经可靠共地。
+- 仔细确认 24 V 动力电源接在前侧端子，5 V 逻辑供电接在后侧插座。
+- 对于 ESP32，确认配置中填写的 GPIO 引脚编号与实际杜邦线连接的物理引脚完全一致。
 
-#### `POST /paused`
+**单独给电机重新上电后，电机不再动作。** 查看串口日志中是否提示通信波特率不匹配；若是，将电机前侧的 24 V 动力电源断电约 3 秒，随后重新接通即可。
 
-*   **请求方法：** `POST`
-*   **接口描述：** 专门用于实时控制电机的运行/暂停状态以及安全停靠位置。该接口非常适合在不开启完整往复循环的前提下，对电机轴进行精细的定位与微调。
-*   **请求消息体：** 包含以下一个或多个可选字段的 JSON 对象：
-    *   `paused`（布尔值）：设为 `true` 立即暂停电机，设为 `false` 恢复运行。
-    *   `position`（数字）：直接指定安全停靠的归一化绝对坐标位置（范围 `0.0` 至 `1.0`）。
-    *   `adjust`（数字）：在当前停靠位置的基础上进行相对偏移调整。例如，`0.1` 表示向前推进 10% 的行程，`-0.1` 表示向后回退 10%。
-*   **响应消息体：** 成功应用后，返回最新的配置 JSON 对象。
+**网页烧录器找不到开发板端口。** 请使用桌面端的 Chrome 或 Edge 浏览器；确认 USB-C 线缆具备数据传输功能（而非廉价的仅充电线）；并务必将线缆连接到开发板的 **USB / Native / JTAG** 接口。
 
-**示例请求：**
-```json
-{
-  "paused": true,
-  "adjust": -0.05
-}
-```
+**桌面版（方案 A）程序正常运行，但电机毫无反应。** 绝大多数情况下是 USB-RS485 转换器的问题：该适配器必须具备硬件自动收发方向切换（自动 DE/RE）。发送时带有自身数据回显（TX echo）或需要操作系统手动控制方向引脚的适配器均不受支持。
 
-#### `GET /state`
+**无法访问 `http://ossm.local`。** 并非所有路由器或局域网环境都支持 mDNS 域名解析。请使用串口日志中打印出来的实际数字 IP 地址进行访问。
 
-*   **请求方法：** `GET`
-*   **接口描述：** 获取控制器的实时遥测状态数据。非常适合 UI 控制面板实时高频拉取电机的当前坐标、速度及流缓冲状态。
-*   **响应消息体：** 包含完整的电机当前遥测数据的 JSON 对象。
+**配置完成后设备未能连上 WiFi。** 仔细核对 WiFi 名称与密码（区分大小写）；此外请确认您的路由器开启了 2.4 GHz 频段——ESP32 系列芯片不支持 5 GHz WiFi。
 
-```json
-{
-  "config": {
-    "version": 42,
-    "bpm": 60.0,
-    "depth": 1.0,
-    "depth_top": true,
-    "reversed": false,
-    "wave_func": "sine",
-    "sharpness": 0.5,
-    "spline_points": [0.0, 1.0],
-    "paused": true,
-    "paused_position": 0.5,
-    "streaming": false
-  },
-  "t": 123.45,
-  "x": 0.5,
-  "y": 1.0,
-  "shaped_y": 1.0,
-  "position": 10000,
-  "speed": 0.0,
-  "stream": {
-    "buffered": 0,
-    "stream_time": 0.0,
-    "underrun": false
-  }
-}
-```
+---
 
-*   `config`：此时的完整 `MotorControllerConfig` 配置对象。
-*   `t`：自运动启动以来的累计运行时间（秒）。
-*   `x`：当前波形周期内的归一化相位，范围从 `0.0` 到 `1.0`。
-*   `y`：波形生成器在当前相位的原始计算输出，范围从 `0.0` 到 `1.0`。
-*   `shaped_y`：结合行程深度（depth）与运动方向（depth_top）映射缩放后的最终目标位置。
-*   `position`：电机当前的绝对物理脉冲坐标（以驱动器原生编码器脉冲单位表示）。
-*   `speed`：电机当前的速度估算值。
-*   `stream`：外部流式实时控制的数据流状态（包含缓冲区剩余轨迹点总数 `buffered`、当前的流时间轴进度 `stream_time` 以及是否发生过缓冲区数据欠载 `underrun`）。
+## 8. 进阶探索
 
-#### `GET /pin-config`
-
-*   **请求方法：** `GET`
-*   **接口描述：** 获取当前的 RS-485 Modbus GPIO 引脚映射及串行通信时序参数。
-*   **响应消息体：** 表示硬件引脚与时序参数的 JSON 对象。
-
-```json
-{
-  "modbus_tx": 18,
-  "modbus_rx": 19,
-  "modbus_de_re": 20,
-  "modbus_timeout_ms": 0,
-  "modbus_scan_delay_us": 0,
-  "modbus_inter_frame_delay_us": 0,
-  "ble_enabled": true,
-  "modbus_debug": false
-}
-```
-
-*   `modbus_tx`（数字）：分配给 Modbus DI/TX（发送）的 GPIO 引脚编号。
-*   `modbus_rx`（数字）：分配给 Modbus RO/RX（接收）的 GPIO 引脚编号。
-*   `modbus_de_re`（数字）：分配给 Modbus DE/RE（收发方向控制）的 GPIO 引脚编号。
-*   `modbus_timeout_ms`（数字）：Modbus 单次总线响应超时时间（毫秒），`0` 表示由系统根据当前波特率自动匹配默认值（例如 115200 波特率默认为 **`10ms`**，最高支持 `1000`）。
-*   `modbus_rx_timeout_us`（数字）：Modbus 字节间超时时间（微秒，$t_{1.5}$），`0` 表示自动（115200 波特率默认为 **`750µs`**，符合 >19200 bps 的 Modbus RTU 规范）。
-*   `modbus_scan_delay_us`（数字）：Modbus 自动扫描时的帧间检测延迟（微秒），`0` 表示仅采用 Modbus 规范标准的 t3.5 间隙时序（最高支持 `200000`）。
-*   `modbus_inter_frame_delay_us`（数字）：Modbus 正常通信时的帧间静默延迟（微秒，$t_{3.5}$），`0` 表示自动（115200 波特率默认为 `350µs`，确保完整的往返控制时延于 <3ms 以支撑 >300Hz 的电机控制刷新率）。
-*   `ble_enabled`（布尔）：是否启用 BLE GATT 服务。
-*   `modbus_debug`（布尔）：Modbus RX 诊断模式——**5 ms** 接收截止（与生产相同的 **256 B** UHCI DMA 缓冲），对每帧分类（`empty` / `short` / `exact` / `long` / `long_resync` / `leading_junk` / `parse_fail`），并在 USB 控制台打印 `MODBUS_DBG` TX/RX 十六进制。**需重启生效。** 会显著增加 USB 日志量；稳态电机 `ups` 通常仅比非调试低几个百分点（ESP32-C6 上约 310 vs 320 Hz）。控制台 **TX/RX 公平性**（`CLI_OUT_CH`、CLI/日志独立 USB 环形缓冲）使串口 CLI 在洪泛下仍可响应。可用 `./scripts/test_console.py --only fairness` 验证；诊断后请关闭。也可通过 CLI `set pin.modbus_debug`、刷写器或 `ossm.py pins --modbus-debug` 设置。
-*   `operating_mode`（字符串）：`"servo"`（OSSM 运动）、`"rtu_relay"`（成帧 Modbus TCP `:502` + `/ws/modbus`）或 `"rs485"`（UART1 原始管道，USB ACM + `/ws/rs485`）。**在线切换，无需重启。** `rs485` 激活时 USB 无 CLI（经 HTTP/BLE 退出）。
-*   `modbus_baud`（数字）：UART1 启动波特率（默认 `115200`）。`rs485` 模式下实时波特率跟随 USB `SET_LINE_CODING`（ESP32-C6）以及 `/ws/rs485` CFG 包。
-
-#### `POST /pin-config`
-
-*   **请求方法：** `POST`
-*   **接口描述：** 更新 Modbus GPIO 引脚映射及通信时序配置。`operating_mode` 与 UART 引脚重映射立即生效（UART1 所有者重启当前角色）。WiFi/SSID 仍需重启。
-*   **请求消息体：** 结构与 `GET /pin-config` 返回的 JSON 对象相同。
-*   **响应消息体：** 成功更新后的配置 JSON 对象。
-
-### RTU 中继模式
-
-当 `operating_mode` 为 `"rtu_relay"`（设置面板、`POST /pin-config` 或串口 CLI `set pin.operating_mode rtu_relay`；**无需重启**）时，固件不运行电机控制环，而是作为 RS-485 Modbus RTU 桥：
-
-* **Modbus TCP** 端口 **502**
-* **WebSocket** `ws://<设备>/ws/modbus`（二进制完整 RTU 帧含 CRC）
-* 网页前端显示中继提示并隐藏电机控制面板
-* `release/motor-control.html` 支持 **Remote WebSocket** 连接
-* 测试：`./scripts/test_modbus_relay.py --switch-mode`、`./scripts/test_modbus_tcp.py`
-
-### RS-485 收发模式
-
-当 `operating_mode` 为 `"rs485"` 时，UART1 为原始字节管道（主机负责 RTU 时序）：
-
-* USB ACM 为数据面（无 CLI / USB 日志）。UART0/RTT 日志保留。经 HTTP/BLE 改回 `operating_mode` 退出。
-* WebSocket `ws://<设备>/ws/rs485` — 报文 `u8 type | u16le len | payload`（`0` TX，`1` RX，`2` CFG JSON `{"baud":115200}`）
-* ESP32-C6 将 USB `SET_LINE_CODING` 的 `dwDTERate` 应用到 UART1
-* 固件管道自行驱动 DE/RE。主机 `--serial` USB-RS485 适配器也必须自动切换方向（ossm-std 不剥离 TX 回显；环回适配器不受支持）。
-* `ossm-std --mode rtu-relay --serial …` 或 `--rs485-ws ws://HOST/ws/rs485` 可为 motor-control 提供 Modbus TCP
-* 测试：`./scripts/test_rs485_transceiver.py`
-
-#### `POST /restart`
-
-*   **请求方法：** `POST`
-*   **接口描述：** 触发软复位指令，立即重启 ESP32 微控制器。
-*   **响应消息体：** `{"ok":true}`
-
-#### `GET /ws/command`
-
-*   **请求方法：** `GET` (WebSocket 协议升级请求)
-*   **接口描述：** 专为超低延迟、实时流式运动控制打造的 WebSocket 交互端点。允许第三方上位机、游戏互动插件或 VR 应用程序高频动态下发运动轨迹点（waypoints）以及实时订阅遥测流。
-*   **协议与格式：** 同时兼容简单的扁平 JSON 指令帧（`{"cmd": "..."}`）以及标准规范的 JSON-RPC 2.0 请求消息（`{"jsonrpc": "2.0", "method": "...", "params": {...}, "id": 1}`）。如果在请求帧中指定了 `id` 标识，服务端将在执行完成后回应一个携带相同 `id` 的标准 JSON-RPC 回应结果（`{"jsonrpc": "2.0", "id": 1, "result": ...}`）。
-*   **支持的 JSON-RPC 2.0 命令与处理机制**：
-    *   **Append Waypoints（追加轨迹点）**：向底层流式缓冲区追加一组连续的目标运动轨迹点。
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "append-waypoints",
-  "params": [
-    { "ts": 1000, "pos": 0.5, "vel": 0.2 },
-    { "ts": 1050, "pos": 0.7 }
-  ],
-  "id": 1
-}
-```
-        *   `ts`（数字）：发送端时间戳（毫秒）。
-        *   `pos`（数字）：目标归一化坐标位置（范围 `0.0` 至 `1.0`）。
-        *   `vel`（可选数字）：目标归一化运动速度（单位/秒）。
-    *   **Set Waypoints（覆盖设置轨迹点）**：清空当前缓冲区剩余的旧轨迹点，并立即替换为新的一组目标轨迹点。可选在参数对象中传入 `reset-timestamp: true`，用于同步重置流式控制的时间基准，使新传入的第一个轨迹点重新作为时间轴起点。
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "set-waypoints",
-  "params": {
-    "waypoints": [
-      { "ts": 1000, "pos": 0.5, "vel": 0.2 }
-    ],
-    "reset-timestamp": true
-  },
-  "id": 2
-}
-```
-    *   **Reset Timestamp（重置流时间戳）**：清空缓冲区，并强制重置底层流式计时器的基准 epoch，下一个接收到的轨迹点将重新作为时间原点。
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "reset-timestamp",
-  "id": 2
-}
-```
-    *   **Status（查询流状态）**：实时查询当前底层流缓冲区的健康状态（`StreamStatus`，例如 `{"buffered": 0, "stream_time": 0.0, "underrun": false}`）。
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "status",
-  "id": 3
-}
-```
-    *   **Ping（心跳探测）**：应用层链路存活心跳探测，服务端接收后将即时回复 `"pong"`。
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "ping",
-  "id": 4
-}
-```
-    *   **Get State（获取当前状态）**：拉取系统当前完整的实时控制与遥测状态数据（`StateResponse`）。
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "get-state",
-  "id": 5
-}
-```
-    *   **Set Config（动态更新配置）**：实时修改电机控制器的各项运行参数（`MotorControllerConfig`）。返回已生效的配置，包含递增后的 `version`。若 `params.version` 过期，返回 JSON-RPC 错误 `-32001`（`Stale causal version`）。
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "set-config",
-  "params": {
-    "bpm": 60,
-    "depth": 0.8,
-    "paused": false
-  },
-  "id": 6
-}
-```
-    *   **Subscribe State（订阅状态推流）**：开启服务端周期性自动推送的实时遥测数据流。
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "subscribe-state",
-  "params": {
-    "interval_ms": 500
-  },
-  "id": 7
-}
-```
-        *   订阅生效后，服务器会依照设定的时间间隔（`interval_ms`）自动向连接的客户端持续推送 JSON-RPC 格式的遥测数据帧：`{"jsonrpc": "2.0", "method": "state", "params": { ...StateResponse... }}`。再次发送 `subscribe-state` 可直接调整推流间隔，无需先取消订阅。
-        *   **异步收发分离架构**：WebSocket 会话将底层 TCP 连结分离为独立读取（`ws_recv`）与写入（`ws_send`）任务，通过 Embassy 通道及堆分配字符串通信，确保高频推流不阻塞控制指令读入。
-        *   **BLE 遥测**：GATT 对 `CHAR_STATE` 的读/通知使用**精简** JSON（必要时分块）。完整 `StateResponse`（循环遥测、历史数组等）请通过 `CHAR_RPC` 上的 JSON-RPC `get-state` 获取。BLE 的 `subscribe-state` 在 `CHAR_STATE` 上推送精简格式，而非 WiFi WebSocket 的完整载荷。
-        *   **空闲自动断开**：为节省设备内存与 WebSocket 会话槽位（`WS_MAX` = 3 并发），嵌入式网页在无活动监听者时会于约 3 秒空闲后自动断开 WebSocket。
-    *   **Unsubscribe State（取消状态订阅）**：停止服务端的周期性状态自动推送工作。
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "unsubscribe-state",
-  "id": 8
-}
-```
-
+- [开发者指南（Developer Guide）](DEVELOPERS.md) — 架构设计、实现细节、源码编译说明，以及完整的 HTTP / WebSocket / 蓝牙 API 接口参考。
+- 发布包内置的 `motor-control.html` — 仿照电机厂商原厂软件打造的 57AIM30 专用寄存器调试诊断工具。支持通过 USB-RS485 转换器直连，或通过运行在 `rtu_relay` 模式下的 ESP32 进行远程连接。
+- [English Manual](README.md)

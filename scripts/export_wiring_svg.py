@@ -1,10 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "playwright",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """Export assets/wiring_diagram.html (+ _zh) to SVG via Playwright + html-to-image."""
 
 from __future__ import annotations

@@ -13,3 +13,4 @@ fixedvec = "0.2"
 libm = "0.2"
 log = "0.4"
 serde-json-core = "0.6"
+ossm-common = { path = "../ossm-common" }

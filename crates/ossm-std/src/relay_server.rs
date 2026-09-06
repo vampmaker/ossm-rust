@@ -14,26 +14,33 @@ use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::bus::ModbusBus;
+use crate::link_stats::{micros_now, SharedLinkStats};
 use ossm_core::modbus::{calc_crc16, verify_rtu_crc};
 
 #[derive(Clone)]
 struct RelayState {
     bus: Arc<Mutex<ModbusBus>>,
+    link: SharedLinkStats,
 }
 
 pub async fn run_relay_servers(
     bus: ModbusBus,
+    link: SharedLinkStats,
     http_bind: SocketAddr,
     modbus_bind: SocketAddr,
 ) -> Result<(), String> {
     let bus = Arc::new(Mutex::new(bus));
-    let http_state = RelayState { bus: bus.clone() };
+    let http_state = RelayState {
+        bus: bus.clone(),
+        link: link.clone(),
+    };
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
     let app = Router::new()
         .route("/ws/modbus", get(ws_upgrade))
+        .route("/link-stats", get(get_link_stats))
         .route("/health", get(|| async { "ok" }))
         .with_state(http_state)
         .layer(cors);
@@ -57,6 +64,14 @@ pub async fn run_relay_servers(
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<RelayState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| ws_session(socket, state))
+}
+
+async fn get_link_stats(State(state): State<RelayState>) -> impl IntoResponse {
+    let stats = state.link.poll(micros_now());
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&ossm_core::LinkStatsSer(&stats)).unwrap_or_else(|_| "{}".into()),
+    )
 }
 
 async fn ws_session(mut socket: WebSocket, state: RelayState) {

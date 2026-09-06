@@ -2,7 +2,6 @@ use crate::error::Result;
 
 #[allow(async_fn_in_trait)]
 pub trait Motor {
-    async fn cycle(&mut self) -> Result<()>;
     async fn homing(&mut self) -> Result<()>;
     async fn read_position(&mut self) -> Result<f32>;
     async fn write_position(&mut self, position: f32, speed: f32) -> Result<()>;

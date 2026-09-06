@@ -1,0 +1,9 @@
+[package]
+name = "ossm-common"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared no_std telemetry windows + link pacing"
+
+[dependencies]
+libm = "0.2"

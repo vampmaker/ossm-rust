@@ -1,18 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "websockets>=12.0",
-#     "python-dotenv>=1.0.0",
-#     "httpx>=0.27.0",
-#     "httpx2>=0.1.0",
-#     "pyserial>=3.5",
-#     "bleak>=0.21.0",
-#     "typer>=0.12.0",
-#     "rich>=13.7.0",
-#     "pydantic>=2.0.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """Live-switch `operating_mode=rs485` (no reboot) and exercise USB + /ws/rs485 via ossm-std."""
 
 from __future__ import annotations
@@ -80,9 +66,26 @@ def exchange_fc03(host: str, port: int, tid: int = 1, unit: int = 1, count: int 
         return body
 
 
+async def wait_http(ip: str, timeout_s: float = 45.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    url = f"http://{ip}/shell-config"
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.get(url)
+                last = r.status_code
+                if r.status_code == 200:
+                    return
+        except Exception as e:
+            last = e
+        await asyncio.sleep(0.5)
+    raise TimeoutError(f"HTTP {url} not ready (last={last!r})")
+
+
 async def wait_mode(ip: str, want: str, timeout_s: float = 15.0) -> None:
     deadline = time.monotonic() + timeout_s
-    url = f"http://{ip}/pin-config"
+    url = f"http://{ip}/shell-config"
     last = None
     while time.monotonic() < deadline:
         try:
@@ -200,6 +203,11 @@ DT_MAX_MS = 4.5
 
 
 async def restore_servo(wifi: DeviceBackend, ip: str) -> None:
+    print(" -> wait for HTTP after ACM (WiFi may drop on USB reset)")
+    await wait_http(ip)
+    if getattr(wifi, "_http_client", None) is not None:
+        await wifi._http_client.aclose()
+        wifi._http_client = None
     print(" -> set pin.operating_mode servo (no restart)")
     pin = await wifi.get_pin_config()
     pin["operating_mode"] = "servo"
@@ -214,8 +222,9 @@ async def restore_servo(wifi: DeviceBackend, ip: str) -> None:
                 r = await client.get(f"http://{ip}/state")
                 if r.status_code == 200:
                     last = r.json()
-                    ups = last.get("ups")
-                    dt_max = last.get("dt_max_ms")
+                    loop = last.get("loop_stats") or {}
+                    ups = loop.get("ups")
+                    dt_max = loop.get("dt_max_ms")
                     pos_min = last.get("pos_min")
                     pos_max = last.get("pos_max")
                     homed = (
@@ -232,7 +241,7 @@ async def restore_servo(wifi: DeviceBackend, ip: str) -> None:
                     ):
                         print(
                             f"servo /state ups={ups} dt_max_ms={dt_max:.3f} "
-                            f"dt_avg_ms={last.get('dt_avg_ms')} "
+                            f"dt_avg_ms={loop.get('dt_avg_ms')} "
                             f"pos_min={pos_min} pos_max={pos_max}"
                         )
                         print("✓ live switch back to servo (motor update rate recovered, homed)")
@@ -318,6 +327,33 @@ async def main() -> None:
         finally:
             stop_std(ws_proc)
     finally:
+        print(" -> magic-exit over USB ACM")
+        repo = Path(__file__).resolve().parents[1]
+        mag = subprocess.run(
+            [
+                "cargo",
+                "+stable",
+                "run",
+                "-p",
+                "ossm-std",
+                "--offline",
+                "--",
+                "--mode",
+                "console",
+                "--serial",
+                port,
+                "--exit-rs485",
+                "--timeout",
+                "20",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        print(mag.stdout)
+        print(mag.stderr)
+        if mag.returncode == 0 and "shell.operating_mode set to servo" in (mag.stdout + mag.stderr):
+            print("✓ ACM magic-exit ACK")
         await restore_servo(wifi, ip)
 
     print("✓ All RS-485 transceiver tests PASSED")

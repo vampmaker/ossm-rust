@@ -91,7 +91,7 @@ pub fn set(engine: &mut Engine, path: &str, value: &str) -> Result<String, PathE
             let Some(key) = key else {
                 return Err(PathError::BulkJsonRequired);
             };
-            let mut cfg = engine.snapshot().config.clone();
+            let mut cfg = engine.snapshot().config;
             apply_motor_field(&mut cfg, key, value)?;
             match engine.try_set_config(cfg) {
                 Ok(_) => Ok(String::from(value)),
@@ -112,10 +112,10 @@ pub fn motor_field(cfg: &MotorControllerConfig, key: &str) -> Result<String, Pat
         "reversed" => Ok(bool_str(cfg.reversed)),
         "paused" => Ok(bool_str(cfg.paused)),
         "streaming" => Ok(bool_str(cfg.streaming)),
-        "wave_func" => Ok(cfg.wave_func.clone()),
+        "wave_func" => Ok(alloc::string::String::from(cfg.wave_func.as_str())),
         "sharpness" => Ok(format!("{}", cfg.sharpness)),
         "paused_position" => Ok(format!("{}", cfg.paused_position)),
-        "spline_points" => Ok(format_spline(&cfg.spline_points)),
+        "spline_points" => Ok(format_spline(cfg.spline_points.as_slice())),
         _ => Err(PathError::UnknownKey),
     }
 }
@@ -160,10 +160,7 @@ pub fn apply_motor_field(
             Ok(())
         }
         "wave_func" => {
-            if !matches!(value, "sine" | "thrust" | "spline") {
-                return Err(PathError::InvalidValue);
-            }
-            cfg.wave_func = String::from(value);
+            cfg.wave_func = value.parse().map_err(|_| PathError::InvalidValue)?;
             Ok(())
         }
         "sharpness" => {
@@ -185,7 +182,11 @@ pub fn apply_motor_field(
         "spline_points" => {
             let parsed: Result<Vec<f32>, _> =
                 value.split_whitespace().map(|s| s.parse::<f32>()).collect();
-            cfg.spline_points = parsed.map_err(|_| PathError::InvalidValue)?;
+            let pts = parsed.map_err(|_| PathError::InvalidValue)?;
+            if pts.len() < 2 {
+                return Err(PathError::InvalidValue);
+            }
+            cfg.spline_points = crate::config::SplinePoints::from_slice(&pts);
             Ok(())
         }
         _ => Err(PathError::UnknownKey),

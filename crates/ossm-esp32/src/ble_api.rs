@@ -3,8 +3,6 @@
 
 use alloc::string::String;
 
-use serde::Serialize;
-
 use bt_hci::controller::ExternalController;
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -62,50 +60,8 @@ fn to_vec<const N: usize>(data: &[u8]) -> heapless::Vec<u8, N> {
     out
 }
 
-fn round_mult(v: f32, mult: f32) -> f32 {
-    (v * mult) as i32 as f32 / mult
-}
-
-#[derive(Serialize)]
-struct CompactConfig {
-    bpm: f32,
-    depth: f32,
-    paused: bool,
-    paused_position: f32,
-}
-
-#[derive(Serialize)]
-struct CompactState {
-    config: CompactConfig,
-    y: f32,
-    shaped_y: f32,
-    position: f32,
-    speed: f32,
-    ups: u32,
-    motor_connected: bool,
-}
-
-/// Build a compact JSON string of the state for GATT attribute reads.
-/// Excludes large arrays (update_history, position_history) and redundant
-/// config fields to fit within the 512-byte GATT attribute value limit.
 fn format_compact_state(state: &crate::motion::StateResponse, out: &mut [u8]) -> Result<usize, ()> {
-    // Keep a Web-Bluetooth-usable subset: include normalized y/shaped_y so the UI
-    // can pause in-place and render the diagram without a full get-state RPC.
-    let compact = CompactState {
-        config: CompactConfig {
-            bpm: round_mult(state.config.bpm, 10.0),
-            depth: round_mult(state.config.depth, 100.0),
-            paused: state.config.paused,
-            paused_position: round_mult(state.config.paused_position, 1000.0),
-        },
-        y: round_mult(state.y, 1000.0),
-        shaped_y: round_mult(state.shaped_y, 1000.0),
-        position: round_mult(state.position, 1000.0),
-        speed: round_mult(state.speed, 100.0),
-        ups: state.ups,
-        motor_connected: state.motor_connected,
-    };
-    serde_json_core::to_slice(&compact, out).map_err(|_| ())
+    state.write_compact(out).ok_or(())
 }
 
 /// Update CHAR_STATE without awaiting. GattEvent handlers must never `.await`
@@ -424,7 +380,7 @@ async fn handle_gatt_events<C: Controller>(
                         if crate::modbus_relay::is_active() {
                             // Pause control disabled in RTU relay mode.
                         } else if let Ok(control) = serde_json::from_slice::<PausedControl>(&data) {
-                            let mut config = app_context.load_snapshot().config.clone();
+                            let mut config = app_context.load_snapshot().config;
                             if let Some(paused) = control.paused {
                                 config.paused = paused;
                             }
@@ -438,7 +394,10 @@ async fn handle_gatt_events<C: Controller>(
                                 config.paused_position =
                                     (config.paused_position + adjust).clamp(0.0, 1.0);
                             }
-                            if let Ok(applied) = app_context.try_enqueue_config(config).await {
+                            if let Ok(applied) = app_context
+                                .try_enqueue_paused(config.paused, Some(config.paused_position))
+                                .await
+                            {
                                 let _ = crate::buffers::try_with_scratchpad(|buf| {
                                     if let Ok(len) = serde_json_core::to_slice(&applied, buf) {
                                         let _ = server
@@ -562,11 +521,13 @@ async fn push_telemetry(
             continue;
         }
 
-        let state = app_context.load_snapshot();
-
-        let mut lease = crate::buffers::NET_BUFFER_POOL.acquire().await;
-        if let Ok(len) = format_compact_state(state.as_ref(), &mut *lease) {
-            match chunked_notify_state(conn, server, &lease[..len]).await {
+        let mut compact = [0u8; 256];
+        let len = {
+            let state = app_context.load_snapshot();
+            format_compact_state(state.as_ref(), &mut compact)
+        };
+        if let Ok(len) = len {
+            match chunked_notify_state(conn, server, &compact[..len]).await {
                 Ok(_) => {
                     consecutive_errors = 0;
                 }

@@ -2,15 +2,18 @@ use crate::command::Command;
 use crate::engine::Engine;
 use crate::error::CoreError;
 use crate::motion::sine_evaluate;
+use crate::state::StateResponse;
 use crate::MotorControllerConfig;
 
 fn homed_paused_at(depth: f32, waveform_y: f32, t0: u64) -> Engine {
-    let mut cfg = MotorControllerConfig::default();
-    cfg.paused = true;
-    cfg.depth = depth;
-    cfg.depth_top = false;
-    cfg.reversed = false;
-    cfg.paused_position = waveform_y;
+    let cfg = MotorControllerConfig {
+        paused: true,
+        depth,
+        depth_top: false,
+        reversed: false,
+        paused_position: waveform_y,
+        ..MotorControllerConfig::default()
+    };
     let mut engine = Engine::new(cfg);
     engine.reset_cycle_clock(t0);
     let shaped = waveform_y * depth + (1.0 - depth);
@@ -49,8 +52,10 @@ fn tick_clamps_dt_to_12ms_on_paused_source() {
 
 #[test]
 fn homing_complete_pauses_and_bumps_version() {
-    let mut cfg = MotorControllerConfig::default();
-    cfg.paused = false;
+    let cfg = MotorControllerConfig {
+        paused: false,
+        ..MotorControllerConfig::default()
+    };
     let mut engine = Engine::new(cfg);
     let applied = engine
         .try_set_config(MotorControllerConfig::default())
@@ -76,11 +81,15 @@ fn try_set_config_rejects_stale_version() {
     let first = engine
         .try_set_config(MotorControllerConfig::default())
         .unwrap();
-    let mut next = MotorControllerConfig::default();
-    next.version = first.version;
+    let next = MotorControllerConfig {
+        version: first.version,
+        ..MotorControllerConfig::default()
+    };
     let second = engine.try_set_config(next).unwrap();
-    let mut stale = MotorControllerConfig::default();
-    stale.version = first.version;
+    let stale = MotorControllerConfig {
+        version: first.version,
+        ..MotorControllerConfig::default()
+    };
     assert!(stale.version > 0 && stale.version < second.version);
     let err = engine.try_set_config(stale).unwrap_err();
     assert_eq!(err, CoreError::StaleVersion);
@@ -92,7 +101,7 @@ fn reverse_toggle_holds_position_at_stroke_end() {
     let mut engine = homed_paused_at(1.0, 0.0, t0);
     let before_pos = engine.snapshot().position;
     let before_shaped = engine.snapshot().shaped_y;
-    let mut cfg = engine.snapshot().config.clone();
+    let mut cfg = engine.snapshot().config;
     cfg.reversed = true;
     engine.try_set_config(cfg).unwrap();
     let _ = engine.tick(t0 + 3_000);
@@ -117,7 +126,7 @@ fn reverse_toggle_holds_position_at_midstroke_and_partial_depth() {
     for (depth, y) in [(1.0, 0.5), (0.5, 0.0), (0.5, 0.4)] {
         let mut engine = homed_paused_at(depth, y, t0);
         let before = engine.snapshot().position;
-        let mut cfg = engine.snapshot().config.clone();
+        let mut cfg = engine.snapshot().config;
         cfg.reversed = true;
         engine.try_set_config(cfg).unwrap();
         let _ = engine.tick(t0 + 3_000);
@@ -134,7 +143,7 @@ fn depth_top_toggle_does_not_teleport() {
     let t0 = 1_000_000;
     let mut engine = homed_paused_at(0.5, 0.4, t0);
     let before = engine.snapshot().position;
-    let mut cfg = engine.snapshot().config.clone();
+    let mut cfg = engine.snapshot().config;
     cfg.depth_top = true;
     engine.try_set_config(cfg).unwrap();
     let _ = engine.tick(t0 + 3_000);
@@ -149,10 +158,12 @@ fn depth_top_toggle_does_not_teleport() {
 #[test]
 fn homing_at_mid_with_partial_depth_stays_at_mid() {
     let t0 = 1_000_000;
-    let mut cfg = MotorControllerConfig::default();
-    cfg.paused = true;
-    cfg.depth = 0.6;
-    cfg.depth_top = false;
+    let cfg = MotorControllerConfig {
+        paused: true,
+        depth: 0.6,
+        depth_top: false,
+        ..MotorControllerConfig::default()
+    };
     let mut engine = Engine::new(cfg);
     engine.reset_cycle_clock(t0);
     engine.apply(Command::HomingComplete {
@@ -171,10 +182,12 @@ fn homing_at_mid_with_partial_depth_stays_at_mid() {
 #[test]
 fn homing_outside_depth_window_holds_pose() {
     let t0 = 1_000_000;
-    let mut cfg = MotorControllerConfig::default();
-    cfg.paused = true;
-    cfg.depth = 0.3;
-    cfg.depth_top = false;
+    let cfg = MotorControllerConfig {
+        paused: true,
+        depth: 0.3,
+        depth_top: false,
+        ..MotorControllerConfig::default()
+    };
     let mut engine = Engine::new(cfg);
     engine.reset_cycle_clock(t0);
     engine.apply(Command::HomingComplete {
@@ -195,4 +208,38 @@ fn homing_outside_depth_window_holds_pose() {
         first.position,
         second.position
     );
+}
+
+#[test]
+fn config_copy_from_skips_equal_heap_fields() {
+    let mut dst = MotorControllerConfig::default();
+    let src = MotorControllerConfig::default();
+    dst.copy_from(&src);
+    assert_eq!(dst, src);
+    dst.bpm = 40.0;
+    dst.copy_from(&src);
+    assert_eq!(dst.bpm, 36.0);
+    assert_eq!(dst.wave_func, crate::config::WaveFunc::Sine);
+    dst.wave_func = crate::config::WaveFunc::Spline;
+    dst.copy_from(&src);
+    assert_eq!(dst.wave_func, crate::config::WaveFunc::Sine);
+}
+
+#[test]
+fn state_copy_from_copies_all_fields() {
+    let mut dst = StateResponse::default();
+    let mut src = StateResponse {
+        position: 12.5,
+        speed: 3.0,
+        stats_gen: 1,
+        ..StateResponse::default()
+    };
+    src.config.bpm = 99.0;
+    src.config.version = 1;
+    src.loop_stats.ups = 321;
+    dst.copy_from(&src);
+    assert_eq!(dst.position, 12.5);
+    assert_eq!(dst.speed, 3.0);
+    assert_eq!(dst.config.bpm, 99.0);
+    assert_eq!(dst.loop_stats.ups, 321);
 }

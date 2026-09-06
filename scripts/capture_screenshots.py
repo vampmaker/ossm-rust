@@ -1,20 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "playwright",
-#     "httpx",
-#     "python-dotenv>=1.0.0",
-#     "bleak>=0.21.0",
-#     "requests>=2.31.0",
-#     "pyserial>=3.5",
-#     "typer>=0.12.0",
-#     "rich>=13.7.0",
-#     "pydantic>=2.0.0",
-#     "websockets>=12.0",
-#     "aiohttp>=3.9.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """Take high-resolution Playwright screenshots of the OSSM Macro Player (`MacroPlayer.vue`)
 
 Captures:

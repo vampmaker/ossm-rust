@@ -19,7 +19,7 @@ fn main() {
         println!("cargo:rustc-link-arg=-Tlinkall.x");
     }
 
-    let html_path = Path::new(&manifest_dir).join("../../frontend/dist/index.html");
+    let html_path = Path::new(&manifest_dir).join("../../web/apps/webui-esp32/dist/index.html");
     println!("cargo:rerun-if-changed={}", html_path.display());
 
     let out_dir = std::env::var("OUT_DIR").unwrap();

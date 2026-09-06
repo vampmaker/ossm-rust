@@ -106,7 +106,7 @@ pub fn parse_fc03_u16(frame: &[u8]) -> Option<Vec<u16>> {
         return None;
     }
     let n = frame[2] as usize;
-    if n % 2 != 0 || frame.len() < 3 + n + 2 {
+    if !n.is_multiple_of(2) || frame.len() < 3 + n + 2 {
         return None;
     }
     let mut out = Vec::with_capacity(n / 2);

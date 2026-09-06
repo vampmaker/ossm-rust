@@ -1,7 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# ///
+#!/usr/bin/env -S uv run
 """Host-side mirror of ossm-core Modbus CRC + find_modbus_response (see crates/ossm-core/src/modbus/mod.rs)."""
 
 from __future__ import annotations

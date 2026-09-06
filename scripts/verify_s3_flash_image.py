@@ -1,8 +1,4 @@
-#!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
+#!/usr/bin/env -S uv run
 """Fail if an ESP32-S3 merged image has multiple DROM segments (bootloader error)."""
 
 from __future__ import annotations

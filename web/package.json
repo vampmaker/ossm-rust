@@ -1,0 +1,15 @@
+{
+  "name": "ossm-web",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+    "scripts": {
+        "build:webui-esp32": "npm run build -w webui-esp32",
+        "build:webui-std": "npm run build -w webui-std",
+        "build:flasher": "npm run build -w ossm-flasher",
+        "build:motor-control": "npm run build -w ossm-motor-control",
+        "build:webui-wasm": "npm run build -w webui-wasm"
+    }
+}

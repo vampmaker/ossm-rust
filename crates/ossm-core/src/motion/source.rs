@@ -1,10 +1,9 @@
-use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 
 use crate::state::{MotionCommand, StreamStatus, StreamWaypoint};
 use crate::time::{dt_seconds, seconds_to_micros, Micros};
 
-use super::waveform::WaveformGenerator;
+use super::waveform::WaveformKind;
 
 pub(crate) const PAUSE_SPEED: f32 = 0.3;
 pub(crate) const TRANSITION_THRESHOLD: f32 = 0.01;
@@ -18,13 +17,13 @@ pub(crate) trait MotionSource: Send {
 // ===== Motion Source Implementations =====
 
 pub(crate) struct WaveformMotionSource {
-    generator: Box<dyn WaveformGenerator>,
+    generator: WaveformKind,
     bpm: f32,
     t0: Micros,
 }
 
 impl WaveformMotionSource {
-    pub(crate) fn new(generator: Box<dyn WaveformGenerator>, bpm: f32) -> Self {
+    pub(crate) fn new(generator: WaveformKind, bpm: f32) -> Self {
         Self {
             generator,
             bpm,
@@ -277,8 +276,8 @@ impl StreamingMotionSource {
                     self.ingest_waypoint(wp);
                 }
             }
-            MotionCommand::SetConfig(_) => {
-                // Applied by MotorController::apply_motion; unreachable here.
+            MotionCommand::SetConfig(_) | MotionCommand::SetPaused { .. } => {
+                // Applied by MotorController::apply_motion / Engine::apply.
             }
         }
     }

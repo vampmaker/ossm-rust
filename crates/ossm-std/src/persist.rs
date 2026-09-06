@@ -6,11 +6,36 @@ use ossm_core::MotorControllerConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StdShellConfig {
+    #[serde(default)]
+    pub serial: Option<String>,
+    #[serde(default)]
+    pub baud: Option<u32>,
+    #[serde(default)]
+    pub bind: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub slave_id: Option<u8>,
+    #[serde(default)]
+    pub relay_tcp: Option<String>,
+    #[serde(default)]
+    pub relay_ws: Option<String>,
+    #[serde(default)]
+    pub rs485_ws: Option<String>,
+    #[serde(default)]
+    pub modbus_bind: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SavedConfig {
     #[serde(default)]
     pub motor: MotorControllerConfig,
+    #[serde(default)]
+    pub shell: StdShellConfig,
 }
 
+#[derive(Clone)]
 pub struct Persist {
     path: PathBuf,
 }
@@ -25,6 +50,12 @@ impl Persist {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => SavedConfig::default(),
         }
+    }
+
+    pub fn save_motor(&self, motor: MotorControllerConfig) -> io::Result<()> {
+        let mut saved = self.load();
+        saved.motor = motor;
+        self.save(&saved)
     }
 
     /// Write `path.tmp` in the same directory, `sync_all`, then `rename` over `path`.
@@ -56,14 +87,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 }
 
 pub fn persistent_motor_changed(a: &MotorControllerConfig, b: &MotorControllerConfig) -> bool {
-    a.bpm != b.bpm
-        || a.depth != b.depth
-        || a.depth_top != b.depth_top
-        || a.reversed != b.reversed
-        || a.wave_func != b.wave_func
-        || (a.sharpness - b.sharpness).abs() > f32::EPSILON
-        || a.spline_points != b.spline_points
-        || a.streaming != b.streaming
+    a.persistent_motor_changed(b)
 }
 
 #[cfg(test)]
@@ -128,6 +152,23 @@ mod tests {
         .unwrap();
         let loaded = Persist::new(&path).load();
         assert_eq!(loaded.motor.bpm, 22.0);
+        assert!(loaded.shell.serial.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_motor_and_shell() {
+        let dir = unique_dir();
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"motor":{"version":0,"bpm":18.0,"depth":1.0,"depth_top":false,"reversed":false,"wave_func":"sine","sharpness":0.3,"paused":true,"paused_position":0.0,"streaming":false},"shell":{"serial":"/dev/ttyUSB0","baud":115200}}"#,
+        )
+        .unwrap();
+        let loaded = Persist::new(&path).load();
+        assert_eq!(loaded.motor.bpm, 18.0);
+        assert_eq!(loaded.shell.serial.as_deref(), Some("/dev/ttyUSB0"));
+        assert_eq!(loaded.shell.baud, Some(115200));
         let _ = fs::remove_dir_all(&dir);
     }
 }

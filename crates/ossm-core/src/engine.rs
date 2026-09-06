@@ -31,7 +31,7 @@ impl Engine {
                 }
             }
             Command::SetPaused { paused, position } => {
-                let mut cfg = self.motion.snapshot().config.clone();
+                let mut cfg = self.motion.snapshot().config;
                 cfg.paused = paused;
                 if let Some(p) = position {
                     cfg.paused_position = p;
@@ -50,8 +50,11 @@ impl Engine {
             Command::SetMotorConnected(connected) => {
                 self.motion.set_motor_connected(connected);
             }
-            Command::SetModbusStats(stats) => {
-                self.motion.set_modbus_stats(stats);
+            Command::SetLoopStats(stats) => {
+                self.motion.set_loop_stats(stats);
+            }
+            Command::SetLinkStats(stats) => {
+                self.motion.set_link_stats(stats);
             }
         }
     }
@@ -63,10 +66,6 @@ impl Engine {
 
     pub fn snapshot(&self) -> &StateResponse {
         self.motion.snapshot()
-    }
-
-    pub fn last_loop_stats(&self) -> crate::state::LoopStats {
-        self.motion.last_loop_stats()
     }
 
     pub fn flush_snapshot(&mut self) {
@@ -88,8 +87,8 @@ impl Engine {
         if cfg.version == 0 || cfg.version == current_version {
             cfg.version = current_version.wrapping_add(1);
         }
-        self.motion.set_config(cfg.clone());
+        self.motion.set_config(cfg);
         self.motion.flush_snapshot();
-        Ok(self.motion.snapshot().config.clone())
+        Ok(self.motion.snapshot().config)
     }
 }

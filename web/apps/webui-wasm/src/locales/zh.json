@@ -1,0 +1,24 @@
+{
+  "app": {
+    "title": "OSSM WASM"
+  },
+  "connection": {
+    "mode": "模式",
+    "serial": "本地串口",
+    "rs485": "RS-485 WebSocket",
+    "modbusWs": "Modbus WebSocket",
+    "remoteApi": "远程 API",
+    "mock": "模拟",
+    "baud": "波特率",
+    "wsUrl": "WebSocket",
+    "modbusWsUrl": "Modbus WebSocket",
+    "apiUrl": "API 地址",
+    "connect": "连接",
+    "disconnect": "断开",
+    "homing": "回零中…",
+    "motorReady": "电机就绪"
+  },
+  "telemetry": {
+    "title": "实时遥测"
+  }
+}

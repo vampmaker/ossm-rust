@@ -32,6 +32,15 @@ STD_TARGETS: list[tuple[str, str, str]] = [
     ("ossm-std-macos-arm64", "aarch64-apple-darwin", "ossm-std"),
 ]
 
+ARTIFACTS: tuple[str, ...] = (
+    "flasher.html",
+    "motor-control.html",
+    "ossm-wasm.html",
+    "ossm-esp32c6.bin",
+    "ossm-esp32s3.bin",
+    *(dest for dest, _, _ in STD_TARGETS),
+)
+
 
 def run(cmd: list[str] | str, *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     printable = cmd if isinstance(cmd, str) else " ".join(cmd)
@@ -39,8 +48,22 @@ def run(cmd: list[str] | str, *, cwd: Path | None = None, env: dict[str, str] | 
     subprocess.check_call(cmd, cwd=cwd or ROOT, env=env, shell=isinstance(cmd, str))
 
 
+def rustup_installed_targets() -> set[str]:
+    out = subprocess.check_output(
+        ["rustup", "+stable", "target", "list", "--installed"],
+        text=True,
+    )
+    return {line.strip() for line in out.splitlines() if line.strip()}
+
+
 def rustup_add(*targets: str) -> None:
-    run(["rustup", "+stable", "target", "add", *targets])
+    installed = rustup_installed_targets()
+    missing = [t for t in targets if t not in installed]
+    skipped = [t for t in targets if t in installed]
+    if skipped:
+        print(f"==> rustup targets already installed: {' '.join(skipped)}", flush=True)
+    if missing:
+        run(["rustup", "+stable", "target", "add", *missing])
 
 
 def ensure_wasm_bindgen() -> None:
@@ -69,6 +92,14 @@ def firmware_bash(inner: str) -> None:
     export = Path.home() / "export-esp.sh"
     prefix = f"source '{export}' 2>/dev/null || true; " if export.exists() else ""
     run(["bash", "-lc", prefix + inner])
+
+
+def prepare_release_dir() -> None:
+    RELEASE.mkdir(parents=True, exist_ok=True)
+    for name in ARTIFACTS:
+        path = RELEASE / name
+        if path.is_file() or path.is_symlink():
+            path.unlink()
 
 
 def zig_bin_dir() -> Path:
@@ -288,9 +319,7 @@ def main() -> None:
     args = parser.parse_args()
 
     os.chdir(ROOT)
-    if RELEASE.exists():
-        shutil.rmtree(RELEASE)
-    RELEASE.mkdir(parents=True)
+    prepare_release_dir()
 
     if not args.skip_web:
         build_web()

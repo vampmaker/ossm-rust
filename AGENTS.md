@@ -133,6 +133,7 @@ Two RPC dispatchers is deliberate: core is sync (`&mut Engine`); firmware cannot
 - `--serial termux-usb:/dev/bus/usb/…` re-execs `termux-usb` (keep the prefix in argv after `TERMUX_USB_FD`). Bare `/dev/bus/usb/…` is direct usbfs (no `termux-usb`). Motor path deasserts DTR/RTS. Do **not** enable `android-usb-serial` `serialport-compat` (pulls `libudev`, breaks musl zigbuild). `--mode flash` keeps DTR/RTS controllable for the USB-Serial-JTAG reset sequence. Workspace `[patch.crates-io] nusb` (`vendor/nusb`) skips USBDEVFS mmap after `EPERM` (Termux); upstream nusb warns on every zero-copy allocate.
 - Real `--serial` / relay bus always homes; `--mock` only uses a virtual `0..100` range. There is no `--no-homing`.
 - Motor TX is paced by `ossm_common::Pll` on every `ossm-std` bus (kernel tty, USB-host, TCP `:502`, `/ws/modbus`, `/ws/rs485`). Homing still uses blocking `exchange_rtu` (200 ms). Streaming CRC deadline is 12 ms on kernel tty and 6 ms on USB-host.
+- Motor loop runs on the dedicated `ossm-motor` std thread (`motor_thread.rs`), never on a tokio worker; wake via `precise_wait` (Windows high-resolution waitable timer + event, Unix Condvar + 10 us timer slack); HTTP/CLI reach it only through `EngineHandle::send`.
 - One bus owner: Engine (`--mode servo`) **or** RTU relay server (`--mode rtu-relay` serves `:502` + `/ws/modbus`) **or** `--mode flash` / `--mode console`. Never two of these on the same bus.
 
 **Files (all hold)**
@@ -142,7 +143,9 @@ Two RPC dispatchers is deliberate: core is sync (`&mut Engine`); firmware cannot
 | `main.rs` | Tokio runtime; flash/console branch before engine; else spawn engine + HTTP + optional REPL |
 | `build.rs` | Embed `web/apps/webui-std/dist/index.html` |
 | `args.rs` | CLI / env / defaults |
-| `engine_task.rs` | Owns `Engine`; tick + homing + persist; `ossm_common::Pll` wake |
+| `engine_task.rs` | Async setup + homing, then hands `Engine` to the motor thread |
+| `motor_thread.rs` | Dedicated `ossm-motor` std thread: PLL wake, tick, stream submit |
+| `precise_wait.rs` | Platform waiter (Windows waitable timer + event; Unix Condvar) |
 | `http.rs` | axum `/` (bundled webui-std) `/config` `/state` `/link-stats` `/paused` `/restart` `/ws/command`; CORS `*` |
 | `cli.rs` | Stdin REPL (`ossm_core::paths`) |
 | `persist.rs` | `{ motor }` atomic JSON |
@@ -530,7 +533,7 @@ Firmware (`ossm-esp32`) unless a subsection says otherwise. `ossm-core` has no I
 - **RX inter-byte timeout ($t_{1.5}$):** default `750 µs` (`compute_rx_inter_byte_timeout`) — Modbus RTU spec for >19200 bps. This is the SOFTWARE `with_timeout()` guard per `read_async`. Whole-frame timeout default at 115200 is **10 ms**.
 - **Hardware UART FIFO idle (`timeout_symbols`):** when `modbus_rx_timeout_us == 0`, default symbols cover $t_{3.5}$ (**5** at 115200, ~**434 µs**) so software IFD is 0. Production `pkt_thres` is set once to FC16 ACK length **8**; FC03 reads raise it for that exchange then restore. Debug mode uses `pkt_thres=256` plus idle-EOF.
 - **Re-arm race:** CPU two-phase reads (`uart_read_exactly(&resp[..3])` then `resp[3..len]`) could drop bytes in the re-arm gap. GDMA captures continuously between phases so high-rate polling (>330 Hz) does not lose frames.
-- **Inter-frame quiet ($t_{3.5}$):** default `350 µs` at `115200` (`get_default_inter_frame_delay`). Hardware idle covers that silence; remaining software `Delay` is 0 unless the user shortened RX timeout. End-to-end RTU cycle **< 3 ms** for **> 330 Hz** `ups` while moving. Paused loops may skip unchanged FC16 (2 Hz keepalive).
+- **Inter-frame quiet ($t_{3.5}$):** default `350 µs` at `115200` (`get_default_inter_frame_delay`). Hardware idle covers that silence; remaining software `Delay` is 0 unless the user shortened RX timeout. End-to-end RTU cycle **< 3 ms** for **> 330 Hz** `ups` while moving. Paused loops still write FC16 every cycle (same rate as moving).
 - **`modbus_debug`:** keep DMA at **`dma_buffers!(256, 256)`**. Do **not** raise production `pkt_thres` to capture capacity (false `empty` after cancel). Debug only: 5 ms software RX deadline, CRC-resync (`exact` / `long` / `long_resync` / `leading_junk` / `parse_fail` in `ossm-core` `find_modbus_response`), `MODBUS_DBG` logs (`skip`/`trim`; throttle `exact` when inject off). Raises USB log volume; `ups` modestly lower; leave off in production.
 - RAM inject (firmware `modbus_rtu.rs`, not the bus): `set inject` or **`POST /modbus-inject`** `{"mode":"leading|trailing|both|off","nbytes":N}`. Host: `scripts/test_modbus_resync.py`. Live C6: `scripts/test_modbus_debug_device.py`. Console fairness: `scripts/test_console.py`.
 - `ossm-std` cannot use t1.5/t3.5 on PC USB-serial; its RX is `modbus_rx.rs` (unbounded stream, emit on header+CRC). Same `aim30` literals as firmware.
@@ -539,7 +542,7 @@ Firmware (`ossm-esp32`) unless a subsection says otherwise. `ossm-core` has no I
 
 - `edge-http`: 4 signal-gated acceptors, socket queue, up to 3 concurrent WebSocket sessions. Embassy net **`StackResources<20>`** (DHCP + HTTP + Modbus TCP `:502` + concurrent TCP).
 - **`REST_GATE` serializes mutating POSTs only.** GETs, `/state`, and `/restart` must not hold the gate for the whole request (starves acceptors; port 80 looks dead under burst).
-- JSON REST: `"Connection": "close"`. Gzip HTML `/` does not need it. WebSocket: `FrameType::Text(false)` (final text). End WS sessions with **`drop(socket)`**, not `close(Both).await` (smoltcp Load-fault after peer/WiFi teardown). REST may still `finish_connection` → `close(Both)`.
+- JSON REST: `"Connection": "close"`. Gzip HTML `/` sends `Content-Length` (not chunked) and does not need `Connection: close`. WebSocket: `FrameType::Text(false)` (final text). End WS sessions with **`drop(socket)`**, not `close(Both).await` (smoltcp Load-fault after peer/WiFi teardown). REST may still `finish_connection` → `close(Both)`.
 - Prefer **`GET/POST /modbus-inject`** over serial `set inject` when `MODBUS_DBG` floods USB. `rtu_relay` serves `/ws/modbus` and Modbus TCP `:502`. `rs485` serves `/ws/rs485` (binary `u8 type | u16le len | payload`: 0 TX, 1 RX, 2 CFG). A TX payload equal to `EXIT_MAGIC` (`F0 0F OSSM ESC q`) exits rs485 the same way USB does. Wrong-mode WS paths return 404.
 - `ossm-std` HTTP is axum: `--mode servo` → `/` (embedded webui-std) `/config` `/state` `/link-stats` `/paused` `/restart` `/ws/command` (CORS `*`); `--mode rtu-relay` → `/ws/modbus` + Modbus TCP `--modbus-bind` + `GET /link-stats`. `restart` exits the process.
 
@@ -588,13 +591,13 @@ Firmware (`ossm-esp32`) unless a subsection says otherwise. `ossm-core` has no I
 When adding a command or configuration property, update the crate that owns it, then every consumer:
 
 - **Motion / causal version / RPC catalog:** `ossm-core` (`config`, `state`, `command`, `rpc`, `rpc_types`, `paths`, `engine`) plus tests.
-- **Telemetry windows, wire structs, and link PLL** — `ossm-common`; shell drivers in `motor_57aim30.rs` / `engine_task.rs` / `shell.rs` / `bus.rs`.
+- **Telemetry windows, wire structs, and link PLL** — `ossm-common`; shell drivers in `motor_57aim30.rs` / `engine_task.rs` / `motor_thread.rs` / `shell.rs` / `bus.rs`.
 - **Firmware SPSC / enqueue:** `crates/ossm-esp32/src/motion.rs`, `context.rs` (`try_enqueue_config`).
 - **Firmware HTTP/WS:** `http_api.rs`. Pin/net/inject live here, not in core.
 - **Firmware BLE:** `ble_api.rs`.
 - **Firmware async RPC adapter:** `crates/ossm-esp32/src/rpc.rs` (enqueue; still handles get/set-shell-config on storage).
 - **Firmware CLI:** `command.rs` + `hw_paths.rs` (pin/net/inject). Motor paths stay in `ossm_core::paths`.
-- **Desktop shell:** `ossm-std` `http.rs` / `cli.rs` / `engine_task.rs` / `bus.rs` / `relay_server.rs` / `flash_port.rs` / `esptool/` / `console_mode.rs` (motor + motion RPC, rtu-relay, or flash/console). CORS `*` on REST. Bundled webui-std.
+- **Desktop shell:** `ossm-std` `http.rs` / `cli.rs` / `engine_task.rs` / `motor_thread.rs` / `precise_wait.rs` / `bus.rs` / `relay_server.rs` / `flash_port.rs` / `esptool/` / `console_mode.rs` (motor + motion RPC, rtu-relay, or flash/console). CORS `*` on REST. Bundled webui-std.
 - **webuis:** `web/packages/shared` + `web/packages/client` + `web/apps/webui-esp32` / `webui-std` / `webui-wasm`.
 - **WASM harness:** `web/apps/webui-wasm` + `crates/ossm-wasm`; rebuild `release/ossm-wasm.html`.
 - **57AIM30 PC tool:** `web/apps/motor-control/src/lib/registers.ts`, `send-options.ts`, panels; rebuild `release/motor-control.html`.

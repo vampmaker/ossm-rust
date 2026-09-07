@@ -53,8 +53,8 @@ fn open_tty(
 ) -> Result<Box<dyn FlashPort>, String> {
     // Linux cdc-acm still asserts DTR in the kernel on activate; `dtr_on_open(false)`
     // only clears it after that pulse. USB-Serial/JTAG may reset once on first open.
-    let mut builder = serialport::new(path.to_string_lossy().as_ref(), baud)
-        .timeout(Duration::from_millis(1));
+    let mut builder =
+        serialport::new(path.to_string_lossy().as_ref(), baud).timeout(Duration::from_millis(1));
     if deassert_dtr_rts {
         builder = builder.dtr_on_open(false);
     }

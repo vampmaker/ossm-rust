@@ -229,12 +229,10 @@ fn format_path_err(path: &str, err: PathError) -> String {
 async fn path_get(engine: &EngineHandle, path: &str) -> Result<String, String> {
     let (tx, rx) = oneshot::channel();
     engine
-        .tx
         .send(EngineMsg::PathGet {
             path: path.to_string(),
             reply: tx,
         })
-        .await
         .map_err(|_| "engine task stopped".to_string())?;
     rx.await
         .map_err(|_| "engine task stopped".to_string())?
@@ -244,13 +242,11 @@ async fn path_get(engine: &EngineHandle, path: &str) -> Result<String, String> {
 async fn path_set(engine: &EngineHandle, path: &str, value: &str) -> Result<String, String> {
     let (tx, rx) = oneshot::channel();
     engine
-        .tx
         .send(EngineMsg::PathSet {
             path: path.to_string(),
             value: value.to_string(),
             reply: tx,
         })
-        .await
         .map_err(|_| "engine task stopped".to_string())?;
     rx.await
         .map_err(|_| "engine task stopped".to_string())?
@@ -259,9 +255,7 @@ async fn path_set(engine: &EngineHandle, path: &str, value: &str) -> Result<Stri
 
 async fn apply(engine: &EngineHandle, cmd: Command) -> Result<(), String> {
     engine
-        .tx
         .send(EngineMsg::Apply(cmd))
-        .await
         .map_err(|_| "engine task stopped".to_string())
 }
 

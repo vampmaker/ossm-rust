@@ -15,18 +15,14 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{client_async, WebSocketStream};
 
-use crate::link_stats::{instant_to_mono, micros_now, SharedLinkStats};
+use crate::link_stats::{micros_now, SharedLinkStats};
 use crate::modbus_rx::{expected_response_len, parse_fc03_u16, RxAccumulator};
+use crate::precise_wait::{AckWaker, Waker};
 use crate::serial::{encode_position, is_crc_miss, AckSample, LatestWins, SerialPort};
 
 const RS485_TX: u8 = 0;
 const RS485_RX: u8 = 1;
 const RS485_CFG: u8 = 2;
-
-pub struct WriteTiming {
-    pub t_tx_us: u64,
-    pub t_rx_us: Option<u64>,
-}
 
 #[allow(clippy::large_enum_variant)]
 enum ModbusBusInner {
@@ -44,8 +40,19 @@ struct NetStream {
     slot: Arc<LatestWins>,
     wakeup: Arc<Notify>,
     ack: Arc<Mutex<Option<AckSample>>>,
-    notify: Arc<Notify>,
+    ack_waker: Arc<AckWaker>,
     alive: Arc<AtomicBool>,
+}
+
+enum StreamInner {
+    Net(NetStream),
+    #[cfg(target_os = "linux")]
+    UsbHost(crate::serial::UsbStreamParts),
+}
+
+/// Sync handle the motor thread uses after `spawn_stream_worker`.
+pub struct StreamHandle {
+    inner: StreamInner,
 }
 
 pub struct ModbusBus {
@@ -144,33 +151,6 @@ impl ModbusBus {
             Err(_e) => self.link.record_failure(now_us),
         }
         result
-    }
-
-    pub async fn write_position_radians(&mut self, position: f32) -> Result<WriteTiming, String> {
-        if let Some(p) = self.as_serial_mut() {
-            let t = p.write_position_radians(position).await?;
-            return Ok(WriteTiming {
-                t_tx_us: instant_to_mono(t.t_tx),
-                t_rx_us: t.t_rx.map(instant_to_mono),
-            });
-        }
-        let counts = aim30::write_counts_for_radians(position);
-        let regs = aim30::pack_position_i32(counts);
-        let t_tx_us = instant_to_mono(Instant::now());
-        match self.write_holdings(aim30::REG_POSITION, &regs).await {
-            Ok(()) => Ok(WriteTiming {
-                t_tx_us,
-                t_rx_us: Some(instant_to_mono(Instant::now())),
-            }),
-            Err(e) if e.starts_with("no CRC-valid response") => {
-                tracing::debug!("{e}");
-                Ok(WriteTiming {
-                    t_tx_us,
-                    t_rx_us: None,
-                })
-            }
-            Err(e) => Err(e),
-        }
     }
 
     pub async fn write_position_radians_strict(&mut self, position: f32) -> Result<(), String> {
@@ -352,23 +332,8 @@ impl ModbusBus {
         }
     }
 
-    pub fn as_serial_mut(&mut self) -> Option<&mut SerialPort> {
-        match &mut self.inner {
-            ModbusBusInner::Serial(p) => Some(p),
-            _ => None,
-        }
-    }
-
     pub fn is_usb_host(&self) -> bool {
         self.as_serial().is_some_and(|p| p.is_usb_host())
-    }
-
-    pub fn pll_config(&self) -> PllConfig {
-        match &self.inner {
-            ModbusBusInner::Serial(_) => PllConfig::usb_serial(),
-            ModbusBusInner::Stream(s) if s.usb_serial_pll => PllConfig::usb_serial(),
-            _ => PllConfig::network(),
-        }
     }
 
     /// After homing: move the bus into a tokio task so engine ticks do not await RTT.
@@ -388,7 +353,7 @@ impl ModbusBus {
             slot: Arc::new(LatestWins::new()),
             wakeup: Arc::new(Notify::new()),
             ack: Arc::new(Mutex::new(None)),
-            notify: Arc::new(Notify::new()),
+            ack_waker: Arc::new(AckWaker::new()),
             alive: Arc::new(AtomicBool::new(true)),
         };
         let worker = stream.clone();
@@ -400,48 +365,83 @@ impl ModbusBus {
         });
     }
 
-    pub fn has_async_stream(&self) -> bool {
-        self.is_usb_host() || matches!(self.inner, ModbusBusInner::Stream(_))
-    }
-
-    pub fn stream_worker_alive(&self) -> bool {
+    pub fn stream_handle(&self) -> Option<StreamHandle> {
         match &self.inner {
-            ModbusBusInner::Stream(s) => s.alive.load(Ordering::Relaxed),
-            ModbusBusInner::Serial(p) => p.usb_worker_alive(),
-            _ => true,
+            ModbusBusInner::Stream(s) => Some(StreamHandle {
+                inner: StreamInner::Net(s.clone()),
+            }),
+            ModbusBusInner::Serial(p) => {
+                #[cfg(target_os = "linux")]
+                {
+                    p.usb_stream_parts().map(|parts| StreamHandle {
+                        inner: StreamInner::UsbHost(parts),
+                    })
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = p;
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl StreamHandle {
+    pub fn set_ack_waker(&self, waker: Waker) {
+        match &self.inner {
+            StreamInner::Net(s) => s.ack_waker.set(waker),
+            #[cfg(target_os = "linux")]
+            StreamInner::UsbHost(p) => p.ack_waker.set(waker),
         }
     }
 
-    pub fn ack_notify(&self) -> Option<Arc<Notify>> {
+    pub fn submit_position(&self, position: f32) -> Result<(), String> {
         match &self.inner {
-            ModbusBusInner::Stream(s) => Some(s.notify.clone()),
-            ModbusBusInner::Serial(p) => p.ack_notify(),
-            _ => None,
+            StreamInner::Net(s) => {
+                if !s.alive.load(Ordering::Relaxed) {
+                    return Err("stream worker ended".into());
+                }
+                let tx = encode_position(s.slave, position)?;
+                s.slot.submit(tx);
+                s.wakeup.notify_one();
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            StreamInner::UsbHost(p) => {
+                if !p.alive.load(Ordering::Relaxed) {
+                    return Err("usb host thread ended".into());
+                }
+                p.stream.submit(encode_position(p.slave, position)?);
+                Ok(())
+            }
         }
     }
 
     pub fn take_ack_sample(&self) -> Option<AckSample> {
         match &self.inner {
-            ModbusBusInner::Stream(s) => s.ack.lock().ok().and_then(|mut g| g.take()),
-            ModbusBusInner::Serial(p) => p.take_ack_sample(),
-            _ => None,
+            StreamInner::Net(s) => s.ack.lock().ok().and_then(|mut g| g.take()),
+            #[cfg(target_os = "linux")]
+            StreamInner::UsbHost(p) => p.ack.lock().ok().and_then(|mut g| g.take()),
         }
     }
 
-    pub fn submit_position(&mut self, position: f32) -> Result<(), String> {
-        if let ModbusBusInner::Serial(p) = &mut self.inner {
-            return p.submit_position(position);
+    pub fn alive(&self) -> bool {
+        match &self.inner {
+            StreamInner::Net(s) => s.alive.load(Ordering::Relaxed),
+            #[cfg(target_os = "linux")]
+            StreamInner::UsbHost(p) => p.alive.load(Ordering::Relaxed),
         }
-        let ModbusBusInner::Stream(s) = &self.inner else {
-            return Err("submit_position requires a stream worker".into());
-        };
-        if !s.alive.load(Ordering::Relaxed) {
-            return Err("stream worker ended".into());
+    }
+
+    pub fn pll_config(&self) -> PllConfig {
+        match &self.inner {
+            StreamInner::Net(s) if s.usb_serial_pll => PllConfig::usb_serial(),
+            StreamInner::Net(_) => PllConfig::network(),
+            #[cfg(target_os = "linux")]
+            StreamInner::UsbHost(_) => PllConfig::usb_serial(),
         }
-        let tx = encode_position(s.slave, position)?;
-        s.slot.submit(tx);
-        s.wakeup.notify_one();
-        Ok(())
     }
 }
 
@@ -475,7 +475,7 @@ fn publish_net_ack(stream: &NetStream, t_tx: Instant, t_rx: Option<Instant>) {
     if let Ok(mut g) = stream.ack.lock() {
         *g = Some(AckSample { t_tx, t_rx });
     }
-    stream.notify.notify_one();
+    stream.ack_waker.notify();
 }
 
 impl RelayTcp {

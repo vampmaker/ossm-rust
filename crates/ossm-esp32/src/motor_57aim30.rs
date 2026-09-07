@@ -28,8 +28,6 @@ use ossm_core::{Command, Engine, Micros, StateResponse, StreamStatus};
 pub const TARGET_BAUD_RATE: u32 = 115200;
 /// FC16/FC06 ACK length; production UHCI pkt_thres is set once to this.
 const FC16_ACK_LEN: u16 = 8;
-/// While paused, refresh position at 2 Hz so AIM30 hold can be measured.
-const PAUSE_FC16_KEEPALIVE_US: u64 = 500_000;
 
 fn now_us() -> Micros {
     Instant::now().as_micros()
@@ -1233,9 +1231,6 @@ pub async fn run_motor(
         pos_max: f32::NAN,
         stream: StreamStatus::default(),
     };
-    let mut last_fc16_counts: Option<i32> = None;
-    let mut last_fc16_us: Micros = 0;
-
     loop {
         if uart_owner::stop_requested() {
             engine.apply(Command::SetPaused {
@@ -1317,15 +1312,6 @@ pub async fn run_motor(
             }
         }
 
-        let counts = aim30::write_counts_for_radians(position);
-        let skip_fc16 = snap.config.paused
-            && last_fc16_counts == Some(counts)
-            && now.saturating_sub(last_fc16_us) < PAUSE_FC16_KEEPALIVE_US;
-        if skip_fc16 {
-            // Yield so skipping the ~3 ms FC16 does not spin the interrupt executor.
-            Timer::after(Duration::from_micros(250)).await;
-            continue;
-        }
         if let Err(e) = motor.write_position(position, speed).await {
             if Instant::now().duration_since(last_error_log) >= Duration::from_secs(1) {
                 last_error_log = Instant::now();
@@ -1334,8 +1320,6 @@ pub async fn run_motor(
             Timer::after_millis(10).await;
             continue;
         }
-        last_fc16_counts = Some(counts);
-        last_fc16_us = now;
     }
 }
 

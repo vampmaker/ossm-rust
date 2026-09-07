@@ -77,7 +77,7 @@ The corollary: `Engine::apply` returns `()`. Persisting a config change is the s
 
 `Engine::apply(cmd)` and `Engine::tick(now)` are plain synchronous calls that take `&mut Engine`. Only one task may hold that reference, and it is always the task that owns the motor bus.
 
-Everything else — HTTP handlers, WebSocket sessions, BLE GATT callbacks, the serial CLI — reaches the engine by enqueuing a command, never by borrowing it. On the firmware this is a capacity-3 SPSC queue (`crates/ossm-esp32/src/motion.rs`); on the desktop it is a tokio mpsc channel to `engine_task`. That is also why there are two RPC dispatchers: `ossm-core::rpc` is the synchronous one that mutates the engine, and `crates/ossm-esp32/src/rpc.rs` is a thin async adapter that enqueues and then encodes the reply using core.
+Everything else — HTTP handlers, WebSocket sessions, BLE GATT callbacks, the serial CLI — reaches the engine by enqueuing a command, never by borrowing it. On the firmware this is a capacity-3 SPSC queue (`crates/ossm-esp32/src/motion.rs`); on the desktop it is a bounded tokio mpsc plus a wake signal into the dedicated `ossm-motor` std thread (`EngineHandle::send`). That is also why there are two RPC dispatchers: `ossm-core::rpc` is the synchronous one that mutates the engine, and `crates/ossm-esp32/src/rpc.rs` is a thin async adapter that enqueues and then encodes the reply using core.
 
 ### Config writes carry a causal version
 
@@ -141,7 +141,7 @@ These are the non-obvious decisions. Most of them were forced by hardware behavi
 
 **Two serial backends.** `/dev/tty*` goes through `tokio-serial`. `/dev/bus/usb/…` goes through `usb_host.rs` (`android-usb-serial`, covering CH340 / CDC / CP210x / FTDI / PL2303) for Termux and Linux usbfs; when `TERMUX_USB_FD` is unset it re-execs itself under `termux-usb -r -e`. The motor path deasserts DTR/RTS. `--mode flash` and `--mode console` use `flash_port.rs` instead of the Modbus parser: flash drives the ESP ROM loader (USB-Serial-JTAG reset, SLIP, compressed write); console is a UART CLI (`--send`, `--until`, `--exit-rs485`). Do not enable `android-usb-serial`'s `serialport-compat` feature (it pulls libudev and breaks the musl zigbuild).
 
-**Transmit scheduling.** Motor TX is paced by `ossm_common::Pll` on every bus: probe-freq measures max ACK rate, then probe-phase snaps the period (USB FS 1 ms slot) and hill-climbs TX delay to cut RTT. USB-host streaming still uses latest-wins plus a 6 ms stream CRC deadline. Homing stays blocking.
+**Transmit scheduling.** Motor TX is paced by `ossm_common::Pll` on every bus: probe-freq measures max ACK rate, then probe-phase snaps the period (USB FS 1 ms slot) and hill-climbs TX delay to cut RTT. USB-host streaming still uses latest-wins plus a 6 ms stream CRC deadline. Homing stays blocking. The motion loop itself runs on a dedicated `ossm-motor` OS thread (`motor_thread.rs`), not a tokio worker, so HTTP/WS serialization cannot inflate `dt_max_ms`. Wakes go through `precise_wait`: Windows uses `CreateWaitableTimerExW` with `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (falling back to `timeBeginPeriod(1)`) so a 2.5 ms PLL period is not quantized to the 15.625 ms system tick; Unix uses a Condvar/futex and sets 10 µs `PR_SET_TIMERSLACK` on that thread. HTTP and the CLI reach the engine only through `EngineHandle::send` (try-send + wake).
 
 **Persistence.** `{ motor }` JSON written temp → fsync → rename. Leftover `pin` / `net` keys from a firmware config file are ignored.
 
@@ -303,7 +303,7 @@ npm run build:motor-control
 uv run scripts/release.py
 ```
 
-Builds all five web apps, the wasm harness, the `ossm-std` binaries for five targets, and merged firmware images for both chips, into a freshly emptied `release/`. Skips: `--skip-web`, `--skip-std`, `--skip-firmware`, `--skip-macos`. `webui-std` is always built before the zigbuild step so the embedded HTML is current.
+Builds all five web apps, the wasm harness, the `ossm-std` binaries for five targets, and merged firmware images for both chips, into `release/` (known artifact files are deleted first; the directory itself is kept). Skips: `--skip-web`, `--skip-std`, `--skip-firmware`, `--skip-macos`. `webui-std` is always built before the zigbuild step so the embedded HTML is current.
 
 Artifacts: `ossm-esp32c6.bin`, `ossm-esp32s3.bin`, `flasher.html`, `motor-control.html`, `ossm-wasm.html`, and `ossm-std-{linux-x64,linux-arm64,linux-armel,win-x64.exe,macos-arm64}`.
 
@@ -690,10 +690,10 @@ One client for all three transports: `-m wifi` (REST + WebSocket), `-m ble` (per
 Adding a command or a config field touches several layers. Update the crate that owns it, then every consumer:
 
 - **Motion, causal version, RPC and CLI catalog** — `ossm-core`: `config.rs`, `state.rs`, `command.rs`, `rpc.rs`, `rpc_types.rs`, `paths.rs`, `engine.rs`, plus `engine_tests.rs` / `rpc_tests.rs`.
-- **Telemetry windows, wire structs, and link PLL** — `ossm-common`; shell drivers in `motor_57aim30.rs` / `engine_task.rs` / `shell.rs` / `bus.rs`.
+- **Telemetry windows, wire structs, and link PLL** — `ossm-common`; shell drivers in `motor_57aim30.rs` / `engine_task.rs` / `motor_thread.rs` / `shell.rs` / `bus.rs`.
 - **Firmware queue and enqueue path** — `crates/ossm-esp32/src/motion.rs`, `context.rs` (`try_enqueue_config`).
 - **Firmware transports** — `http_api.rs` (pin / net / inject live here, not in core), `ble_api.rs`, `rpc.rs`, `command.rs` + `hw_paths.rs`.
-- **Desktop shell** — `crates/ossm-std/src/`: `http.rs` (`GET /link-stats`), `cli.rs`, `engine_task.rs`, `link_stats.rs`, and `bus.rs` / `relay_server.rs` for relay modes.
+- **Desktop shell** — `crates/ossm-std/src/`: `http.rs` (`GET /link-stats`), `cli.rs`, `engine_task.rs`, `motor_thread.rs`, `precise_wait.rs`, `link_stats.rs`, and `bus.rs` / `relay_server.rs` for relay modes.
 - **Browser shell** — `crates/ossm-wasm/src/shell.rs`, `wasm_api.rs`; rebuild `release/ossm-wasm.html`.
 - **Frontend** — `web/packages/shared` (types, `mapper.ts`, components) and `web/packages/client` (transports), then each of the three webui apps.
 - **57AIM30 tool** — `web/apps/motor-control/src/lib/registers.ts`, `send-options.ts`, panels; rebuild `release/motor-control.html`. Keep the E2E ids `#motor-control-connection`, `#mc-connection-type`, `#mc-baud`, `#mc-ws-url` stable.

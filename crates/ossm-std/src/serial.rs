@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ossm_core::modbus::aim30;
@@ -10,14 +12,15 @@ use tokio_serial::{SerialPort as SerialPortExt, SerialPortBuilderExt};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::oneshot;
 
-use crate::link_stats::SharedLinkStats;
 #[cfg(target_os = "linux")]
 use crate::link_stats::micros_now;
+use crate::link_stats::SharedLinkStats;
 use crate::modbus_rx::RxAccumulator;
+#[cfg(target_os = "linux")]
+use crate::precise_wait::AckWaker;
 
-const STREAM_DEADLINE: Duration = Duration::from_millis(12);
 #[cfg(target_os = "linux")]
 const HOST_STREAM_DEADLINE: Duration = Duration::from_millis(6);
 const RX_DEADLINE: Duration = Duration::from_millis(200);
@@ -48,11 +51,6 @@ struct ParsedFrame {
     t_rx: Instant,
 }
 
-pub struct WriteTiming {
-    pub t_tx: Instant,
-    pub t_rx: Option<Instant>,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct AckSample {
     pub t_tx: Instant,
@@ -72,7 +70,16 @@ struct UsbHostWriter {
     link: Arc<Mutex<Option<SharedLinkStats>>>,
     alive: Arc<AtomicBool>,
     ack: Arc<Mutex<Option<AckSample>>>,
-    notify: Arc<Notify>,
+    ack_waker: Arc<AckWaker>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct UsbStreamParts {
+    pub stream: Arc<LatestWins>,
+    pub alive: Arc<AtomicBool>,
+    pub ack: Arc<Mutex<Option<AckSample>>>,
+    pub ack_waker: Arc<AckWaker>,
+    pub slave: u8,
 }
 
 #[cfg(target_os = "linux")]
@@ -125,12 +132,12 @@ impl SerialPort {
         let link = Arc::new(Mutex::new(None::<SharedLinkStats>));
         let alive = Arc::new(AtomicBool::new(true));
         let ack = Arc::new(Mutex::new(None::<AckSample>));
-        let notify = Arc::new(Notify::new());
+        let ack_waker = Arc::new(AckWaker::new());
         let stream_thread = stream.clone();
         let link_thread = link.clone();
         let alive_thread = alive.clone();
         let ack_thread = ack.clone();
-        let notify_thread = notify.clone();
+        let ack_waker_thread = ack_waker.clone();
         let slave_thread = slave;
         std::thread::Builder::new()
             .name("ossm-usb-host".into())
@@ -143,7 +150,7 @@ impl SerialPort {
                     link_thread,
                     alive_thread,
                     ack_thread,
-                    notify_thread,
+                    ack_waker_thread,
                     slave_thread,
                 )
             })
@@ -155,7 +162,7 @@ impl SerialPort {
                 link,
                 alive,
                 ack,
-                notify,
+                ack_waker,
             }),
             slave,
             frames,
@@ -178,33 +185,17 @@ impl SerialPort {
         }
     }
 
-    pub fn ack_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
-        #[cfg(target_os = "linux")]
-        {
-            match &self.writer {
-                PortWriter::UsbHost(w) => Some(w.notify.clone()),
-                PortWriter::Tty(_) => None,
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = self;
-            None
-        }
-    }
-
-    pub fn take_ack_sample(&self) -> Option<AckSample> {
-        #[cfg(target_os = "linux")]
-        {
-            match &self.writer {
-                PortWriter::UsbHost(w) => w.ack.lock().ok().and_then(|mut g| g.take()),
-                PortWriter::Tty(_) => None,
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = self;
-            None
+    #[cfg(target_os = "linux")]
+    pub(crate) fn usb_stream_parts(&self) -> Option<UsbStreamParts> {
+        match &self.writer {
+            PortWriter::UsbHost(w) => Some(UsbStreamParts {
+                stream: w.stream.clone(),
+                alive: w.alive.clone(),
+                ack: w.ack.clone(),
+                ack_waker: w.ack_waker.clone(),
+                slave: self.slave,
+            }),
+            PortWriter::Tty(_) => None,
         }
     }
 
@@ -217,53 +208,11 @@ impl SerialPort {
         let _ = stats;
     }
 
-    pub fn usb_worker_alive(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        if let PortWriter::UsbHost(w) = &self.writer {
-            return w.alive.load(Ordering::Relaxed);
-        }
-        true
-    }
-
-    /// Non-blocking USB-host streaming write. Replaces an unsent setpoint.
-    pub fn submit_position(&mut self, position: f32) -> Result<(), String> {
-        match &self.writer {
-            PortWriter::Tty(_) => {
-                let _ = position;
-                Err("submit_position requires USB-host".into())
-            }
-            #[cfg(target_os = "linux")]
-            PortWriter::UsbHost(w) => {
-                if !w.alive.load(Ordering::Relaxed) {
-                    return Err("usb host thread ended".into());
-                }
-                w.stream.submit(encode_position(self.slave, position)?);
-                Ok(())
-            }
-        }
-    }
-
     pub async fn exchange_rtu(&mut self, frame: &[u8]) -> Result<Vec<u8>, String> {
         self.transact(frame, RX_DEADLINE)
             .await
             .map(|(rsp, _, _)| rsp)
             .map_err(|(e, _)| e)
-    }
-
-    /// Streaming position write: CRC miss is logged, not an error.
-    pub async fn write_position_radians(&mut self, position: f32) -> Result<WriteTiming, String> {
-        let tx = encode_position(self.slave, position)?;
-        match self.transact(&tx, STREAM_DEADLINE).await {
-            Ok((_, t_tx, t_rx)) => Ok(WriteTiming {
-                t_tx,
-                t_rx: Some(t_rx),
-            }),
-            Err((e, t_tx)) if is_crc_miss(&e) => {
-                tracing::debug!("{e}");
-                Ok(WriteTiming { t_tx, t_rx: None })
-            }
-            Err((e, _)) => Err(e),
-        }
     }
 
     async fn write_frame(&mut self, tx: &[u8]) -> Result<(), String> {
@@ -400,7 +349,7 @@ fn usb_host_thread(
     link: Arc<Mutex<Option<SharedLinkStats>>>,
     alive: Arc<AtomicBool>,
     ack: Arc<Mutex<Option<AckSample>>>,
-    notify: Arc<Notify>,
+    ack_waker: Arc<AckWaker>,
     slave: u8,
 ) {
     let mut acc = RxAccumulator::new();
@@ -431,7 +380,7 @@ fn usb_host_thread(
             if let Err(e) = usb_write_all(&mut handle, &data) {
                 tracing::debug!("usb host stream tx: {e}");
                 record_stream_failure(&link, Some("usb host write"));
-                publish_ack(&ack, &notify, t_tx, None);
+                publish_ack(&ack, &ack_waker, t_tx, None);
                 continue;
             }
             let t_rx = usb_wait_stream_ack(
@@ -446,7 +395,7 @@ fn usb_host_thread(
                 usb_discard_rx(&mut handle, &mut acc, &mut buf);
             }
             record_stream_result(&link, t_tx, t_rx, data.len() as u32);
-            publish_ack(&ack, &notify, t_tx, t_rx);
+            publish_ack(&ack, &ack_waker, t_tx, t_rx);
             continue;
         }
         match writes.recv_timeout(Duration::from_micros(200)) {
@@ -464,14 +413,14 @@ fn usb_host_thread(
 #[cfg(target_os = "linux")]
 fn publish_ack(
     ack: &Mutex<Option<AckSample>>,
-    notify: &Notify,
+    ack_waker: &AckWaker,
     t_tx: Instant,
     t_rx: Option<Instant>,
 ) {
     if let Ok(mut g) = ack.lock() {
         *g = Some(AckSample { t_tx, t_rx });
     }
-    notify.notify_one();
+    ack_waker.notify();
 }
 
 #[cfg(target_os = "linux")]

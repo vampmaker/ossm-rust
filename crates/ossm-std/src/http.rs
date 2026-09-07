@@ -181,9 +181,7 @@ async fn try_set(
     let (tx, rx) = oneshot::channel();
     state
         .engine
-        .tx
         .send(EngineMsg::TrySetConfig { cfg, reply: tx })
-        .await
         .map_err(|_| CoreError::InvalidConfig)?;
     rx.await.map_err(|_| CoreError::InvalidConfig)?
 }
@@ -196,13 +194,11 @@ async fn try_pause(
     let (tx, rx) = oneshot::channel();
     state
         .engine
-        .tx
         .send(EngineMsg::SetPaused {
             paused,
             position,
             reply: tx,
         })
-        .await
         .map_err(|_| CoreError::InvalidConfig)?;
     rx.await.map_err(|_| CoreError::InvalidConfig)
 }
@@ -239,9 +235,7 @@ async fn run_ws(mut socket: WebSocket, state: AppState) {
                 let (tx, rx) = oneshot::channel();
                 if state
                     .engine
-                    .tx
                     .send(EngineMsg::Rpc { req: data, reply: tx })
-                    .await
                     .is_err()
                 {
                     break;

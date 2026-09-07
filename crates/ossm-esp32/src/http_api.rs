@@ -1,5 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 use core::net::{Ipv4Addr, SocketAddr};
 
 use edge_http::io::server::Connection;
@@ -257,25 +258,31 @@ async fn finish_connection(conn: &mut HttpConn<'_>) {
 }
 
 async fn serve_html(conn: &mut HttpConn<'_>) -> Result<(), HttpError<edge_nal_embassy::TcpError>> {
-    let headers = conn.headers()?;
-    if accepts_gzip(headers) {
+    let gzip = accepts_gzip(conn.headers()?);
+    if gzip {
+        let mut len_buf = heapless::String::<11>::new();
+        let _ = write!(len_buf, "{}", APP_HTML_GZ.len());
         conn.initiate_response(
             200,
             Some("OK"),
             &[
                 ("Content-Type", "text/html"),
                 ("Content-Encoding", "gzip"),
+                ("Content-Length", len_buf.as_str()),
                 ("Access-Control-Allow-Origin", "*"),
             ],
         )
         .await?;
         write_all_conn_yielding(conn, APP_HTML_GZ).await
     } else {
+        let mut len_buf = heapless::String::<11>::new();
+        let _ = write!(len_buf, "{}", NO_GZIP_HTML.len());
         conn.initiate_response(
             200,
             Some("OK"),
             &[
                 ("Content-Type", "text/html"),
+                ("Content-Length", len_buf.as_str()),
                 ("Access-Control-Allow-Origin", "*"),
                 ("Connection", "close"),
             ],

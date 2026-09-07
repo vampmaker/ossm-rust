@@ -8,7 +8,9 @@ mod flash_port;
 mod http;
 mod link_stats;
 mod modbus_rx;
+mod motor_thread;
 mod persist;
+mod precise_wait;
 mod relay_server;
 mod runtime_config;
 mod serial;
@@ -24,20 +26,8 @@ use runtime_config::RuntimeConfigResponse;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 
-#[cfg(target_os = "linux")]
-fn tighten_timer_slack() {
-    // Default slack is often 4–10 ms on Android; that becomes dt_max on a 5 ms grid.
-    let rc = unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 10_000u64) };
-    if rc != 0 {
-        tracing::debug!("PR_SET_TIMERSLACK: {rc}");
-    }
-}
-
 #[tokio::main]
 async fn main() {
-    #[cfg(target_os = "linux")]
-    tighten_timer_slack();
-
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
@@ -92,8 +82,10 @@ async fn main() {
 
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (snap_tx, snap_rx) = watch::channel(ossm_core::StateResponse::default());
+    let (wake, waiter) = precise_wait::pair();
     let handle = EngineHandle {
         tx: cmd_tx,
+        wake: wake.clone(),
         snap: snap_rx,
     };
 
@@ -103,6 +95,8 @@ async fn main() {
         mock: args.is_mock() || bus.is_none(),
         serial: bus,
         link: link.clone(),
+        wake,
+        waiter,
     };
     tokio::spawn(run_engine_task(cmd_rx, snap_tx, opts));
 
@@ -273,8 +267,10 @@ mod http_tests {
         let persist = Persist::new(dir.join("config.json"));
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let (snap_tx, snap_rx) = watch::channel(ossm_core::StateResponse::default());
+        let (wake, waiter) = crate::precise_wait::pair();
         let handle = EngineHandle {
             tx: cmd_tx,
+            wake: wake.clone(),
             snap: snap_rx,
         };
         tokio::spawn(run_engine_task(
@@ -286,6 +282,8 @@ mod http_tests {
                 mock: true,
                 serial: None,
                 link: SharedLinkStats::new(),
+                wake,
+                waiter,
             },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -478,15 +476,13 @@ mod http_tests {
     async fn rpc_ping_pong() {
         let state = mock_app().await;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        state
+        assert!(state
             .engine
-            .tx
             .send(engine_task::EngineMsg::Rpc {
                 req: br#"{"jsonrpc":"2.0","method":"ping","id":1}"#.to_vec(),
                 reply: tx,
             })
-            .await
-            .unwrap();
+            .is_ok());
         let (action, body) = rx.await.unwrap();
         assert_eq!(action, RpcAction::Respond);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
